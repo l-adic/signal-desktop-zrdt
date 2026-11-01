@@ -454,6 +454,68 @@ describe('zrdt/send: freeze once', () => {
     );
   });
 
+  it('rich content (attachments, quote, preview, mentions) re-encodes byte for byte', async () => {
+    const aci = generateAci();
+    const attachment: Proto.AttachmentPointer.Params = {
+      attachmentIdentifier: { cdnKey: 'abc123' },
+      clientUuid: fill(0x11, 16),
+      contentType: 'image/jpeg',
+      key: fill(0x12, 64),
+      size: 12345,
+      thumbnail: null,
+      digest: fill(0x13),
+      incrementalMac: null,
+      chunkSize: null,
+      fileName: 'cat.jpg',
+      flags: 0,
+      width: 640,
+      height: 480,
+      caption: null,
+      blurHash: 'LEHV6nWB2yk8pyo0adR*.7kCMdnj',
+      uploadTimestamp: 1_700_000_000_000n,
+      cdnNumber: 3,
+      audioWaveform: null,
+      audioDurationSeconds: null,
+    };
+    const content = await messageSender.getContentMessage({
+      timestamp: 1_700_000_123_456,
+      body: '\uFFFC look at this https://signal.org',
+      bodyRanges: [{ start: 0, length: 1, mentionAci: aci }],
+      attachments: [attachment],
+      quote: {
+        id: 1_700_000_000_001,
+        authorAci: aci,
+        text: 'earlier',
+        attachments: [],
+        bodyRanges: [],
+      },
+      preview: [
+        { url: 'https://signal.org', title: 'Signal', date: 1_600_000_000_000 },
+      ],
+      expireTimer: undefined,
+      groupV2: { masterKey: MASTER_KEY, revision: 4, members: [] },
+      profileKey: fill(5),
+      recipients: [],
+      zrdt: {
+        links: [fill(1)],
+        nonce: fill(2),
+        version: ZRDT_META_VERSION,
+        disown: [],
+      },
+    });
+    const once = Proto.Content.encode(content);
+    const twice = Proto.Content.encode(Proto.Content.decode(once));
+    assert.deepEqual(twice, once);
+    const { dataMessage, dataMessageBytes } = getFrozenDataMessage(once);
+    assert.deepEqual(
+      Proto.DataMessage.encode(Proto.DataMessage.decode(dataMessageBytes)),
+      dataMessageBytes
+    );
+    assert.strictEqual(dataMessage.attachments.length, 1);
+    assert.isOk(dataMessage.quote);
+    assert.isOk(dataMessage.zrdt);
+  });
+
   it('rejects a bad group id or ACI', async () => {
     for (const [groupId, ourAci] of [
       [fill(1, 31), OUR_ACI],

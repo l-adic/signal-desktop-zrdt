@@ -448,6 +448,13 @@ export async function getZrdtGroupSendContent({
   messaging: MessageSender;
   log: LoggerType;
 }>): Promise<Proto.Content.Params> {
+  // Fail closed (APP.md §2): no backend, or not initialised yet (resumed
+  // jobs can run before zrdtService.init() finishes), fails this attempt and
+  // the job retries. A group record never goes out unlinked.
+  const backend = zrdtService.backendInfo();
+  if (!backend.available) {
+    throw new Error(`zrdt unavailable (${backend.kind}); will retry`);
+  }
   const groupId = getGroupIdBytes(conversation);
   await zrdtService.ensureConversation(conversation.id, groupId);
   await reacceptOutgoingForConversation(conversation, log);
