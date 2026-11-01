@@ -1491,13 +1491,23 @@ export class StubBackend implements ZrdtBackend {
    * MERGE a `zrdtS3` blob. Into a closed store: the blob's records part, as
    * a closed store (a relative blob's records that link its boundary are
    * unverifiable). Into a relative store: the blob as a store of this chat,
-   * its boundary, then its records. The blob's audiences are not read.
+   * its boundary, then its records. Then the blob's audience of each record
+   * stored in the merged store that has none recorded is recorded; a
+   * recorded audience stays (Lean `mergeAudiences`, `run_merge_audiences`).
+   * The blob's audiences are those of Lean `mergeChat`: into a closed store,
+   * every audience entry of the blob (the last of a digest wins); into a
+   * relative store, those of the records the blob itself stores.
    */
   async merge(chat: ChatKey, blob: Bytes): Promise<OpenResult> {
     const store = this.#store(chat);
     let opened: Opened;
+    let blobAudiences: ReadonlyArray<{
+      digest: Digest;
+      seats: ReadonlyArray<Seat>;
+    }>;
     if (store.relative) {
       opened = openInput(store.group, blob, this.#hash);
+      blobAudiences = opened.kind === 'ok' ? opened.store.audiences() : [];
     } else {
       const framed = decodeBlob3(blob);
       if (framed === undefined) {
@@ -1513,6 +1523,7 @@ export class StubBackend implements ZrdtBackend {
         false,
         []
       );
+      blobAudiences = framed.audiences;
     }
     if (opened.kind !== 'ok') {
       return opened;
@@ -1540,6 +1551,17 @@ export class StubBackend implements ZrdtBackend {
       // Both stores are closed and do not collide, so only the record
       // count limit can stop an accept here.
       return { kind: 'tooLarge' };
+    }
+    // The last entry of a digest wins (Lean `ofList`); a recorded one stays.
+    const fromBlob = new Map<string, ReadonlyArray<Seat>>();
+    for (const { digest, seats } of blobAudiences) {
+      fromBlob.set(key(digest), seats);
+    }
+    for (const { digest } of next.entries()) {
+      const seats = fromBlob.get(key(digest));
+      if (seats !== undefined && next.audienceOf(digest) === undefined) {
+        next.recordAudience(digest, seats);
+      }
     }
     this.#stores.set(chat, next);
     return { kind: 'ok' };

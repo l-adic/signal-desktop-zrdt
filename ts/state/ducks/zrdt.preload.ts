@@ -153,13 +153,18 @@ export function getZrdtDumpPath(conversationId: string): string {
 //
 // - An export to your own account (§4.5 "to your own account"):
 //     { "zrdtDump": 1, "account": <the exporter's ACI>, "blob": base64 store
-//       blob, "content": { <hex digest>: base64 opening } }.
-//   An opening is `nonce(32) ‖ DataMessage bytes without fields 15 and 200`
-//   (message attribute zrdtOpening), so the file never holds the group master
-//   key. Only the account it names imports it (MERGE, then each opening
-//   checked): another account's own export is refused, so a member's store
-//   never reaches someone else by MERGE. doctor.ts edits the blob inside the
-//   JSON (its `locateBlob`).
+//       blob, "content": { "header", "ephemeralKey", "sealed" } }.
+//   The content is the openings SERVE gives our own account (the export
+//   flag), as JSON { <hex digest>: base64 opening }, sealed to our own
+//   identity key exactly as a SERVE reply (seal.node.ts; the header names our
+//   ACI and the tag of our key), so no other account can read it. An opening
+//   is `nonce(32) ‖ DataMessage bytes without fields 15 and 200` (message
+//   attribute zrdtOpening), so the file never holds the group master key.
+//   Only the account it names, holding that key, imports it (MERGE, then
+//   each opening checked): another account's own export is refused, so a
+//   member's store never reaches someone else by MERGE. The blob (structure:
+//   digests, authors, links) stays readable, for the doctor: doctor.ts edits
+//   it inside the JSON (its `locateBlob`).
 // - An export for another member X (§4.5 "to another account X"):
 //     { "zrdtExport": 2, "from": the giver's ACI, "to": X's ACI, "group":
 //       base64 group id, "key": base64 X's identity key, "sections": [ {
@@ -171,17 +176,23 @@ export function getZrdtDumpPath(conversationId: string): string {
 //   boundary digests. X imports it with ACCEPT_VIEW in import mode, the giver
 //   as voucher; its records start `imported` (A9).
 
-type ZrdtOwnDumpType = ReadonlyDeep<{
-  kind: 'own';
-  account: string | undefined;
-  blob: Uint8Array<ArrayBuffer>;
-  content: ReadonlyMap<string, Uint8Array<ArrayBuffer>>;
-}>;
-
 type ZrdtExportSectionType = ReadonlyDeep<{
   header: Uint8Array<ArrayBuffer>;
   ephemeralKey: Uint8Array<ArrayBuffer>;
   sealed: Uint8Array<ArrayBuffer>;
+}>;
+
+type ZrdtOwnDumpType = ReadonlyDeep<{
+  kind: 'own';
+  account: string | undefined;
+  blob: Uint8Array<ArrayBuffer>;
+  content: ZrdtExportSectionType;
+}>;
+
+/** An own export whose content opened under our key. */
+type ZrdtOpenedDumpType = ReadonlyDeep<{
+  blob: Uint8Array<ArrayBuffer>;
+  content: ReadonlyMap<string, Uint8Array<ArrayBuffer>>;
 }>;
 
 type ZrdtServedExportType = ReadonlyDeep<{
@@ -208,6 +219,27 @@ function base64Field(value: unknown, what: string): Uint8Array<ArrayBuffer> {
   return Bytes.fromBase64(value);
 }
 
+function parseSection(section: unknown): ZrdtExportSectionType {
+  const fields = (section ?? {}) as Record<string, unknown>;
+  return {
+    header: base64Field(fields.header, 'header'),
+    ephemeralKey: base64Field(fields.ephemeralKey, 'ephemeralKey'),
+    sealed: base64Field(fields.sealed, 'sealed'),
+  };
+}
+
+function encodeSection(section: ZrdtExportSectionType): {
+  header: string;
+  ephemeralKey: string;
+  sealed: string;
+} {
+  return {
+    header: Bytes.toBase64(section.header),
+    ephemeralKey: Bytes.toBase64(section.ephemeralKey),
+    sealed: Bytes.toBase64(section.sealed),
+  };
+}
+
 /** Parses an export file of either kind (JSON only: greenfield). */
 function zrdtParseExport(bytes: Uint8Array<ArrayBuffer>): ZrdtExportFileType {
   // 0x7b is "{"
@@ -226,45 +258,33 @@ function zrdtParseExport(bytes: Uint8Array<ArrayBuffer>): ZrdtExportFileType {
       to: doc.to,
       group: base64Field(doc.group, 'group'),
       key: base64Field(doc.key, 'key'),
-      sections: sections.map((section: Record<string, unknown>) => ({
-        header: base64Field(section?.header, 'header'),
-        ephemeralKey: base64Field(section?.ephemeralKey, 'ephemeralKey'),
-        sealed: base64Field(section?.sealed, 'sealed'),
-      })),
+      sections: sections.map(parseSection),
     };
   }
   if (doc.zrdtDump !== 1) {
     throw new Error('not a zrdt export (no "zrdtDump" or "zrdtExport")');
   }
-  const content = new Map<string, Uint8Array<ArrayBuffer>>();
-  const docContent = (doc.content ?? {}) as Record<string, unknown>;
-  for (const [hex, opening] of Object.entries(docContent)) {
-    if (HEX_DIGEST.test(hex) && typeof opening === 'string') {
-      content.set(hex, Bytes.fromBase64(opening));
-    }
-  }
   return {
     kind: 'own',
     account: typeof doc.account === 'string' ? doc.account : undefined,
     blob: base64Field(doc.blob, 'blob'),
-    content,
+    // Greenfield: the content is always sealed; a plaintext map is refused.
+    content: parseSection(doc.content),
   };
 }
 
 function zrdtEncodeDump(
   dump: Omit<ZrdtOwnDumpType, 'kind'>
 ): Uint8Array<ArrayBuffer> {
-  const content: Record<string, string> = {};
-  for (const [hex, opening] of dump.content) {
-    content[hex] = Bytes.toBase64(opening);
-  }
   return Bytes.fromString(
     `${JSON.stringify({
       zrdtDump: 1,
       account: dump.account,
-      warning: EXPORT_WARNING,
+      warning:
+        `For ${dump.account} only: the content is sealed to that ` +
+        `account's identity key. ${EXPORT_WARNING}`,
       blob: Bytes.toBase64(dump.blob),
-      content,
+      content: encodeSection(dump.content),
     })}\n`
   );
 }
@@ -282,11 +302,7 @@ function zrdtEncodeServedExport(
       to: file.to,
       group: Bytes.toBase64(file.group),
       key: Bytes.toBase64(file.key),
-      sections: file.sections.map(section => ({
-        header: Bytes.toBase64(section.header),
-        ephemeralKey: Bytes.toBase64(section.ephemeralKey),
-        sealed: Bytes.toBase64(section.sealed),
-      })),
+      sections: file.sections.map(encodeSection),
     })}\n`
   );
 }
@@ -401,6 +417,93 @@ async function getExportContent(
     }
   }
   return content;
+}
+
+/**
+ * The content of an own export, sealed to our own identity key (seal.node.ts,
+ * as a SERVE reply to our own account: the header names our ACI, the tag of
+ * our key and a random id). Only an account holding our identity private key
+ * opens it.
+ */
+function sealOwnContent(
+  conversationId: string,
+  content: ReadonlyMap<string, Uint8Array<ArrayBuffer>>
+): ZrdtExportSectionType {
+  const groupId = getGroupIdBytes(conversationId);
+  if (!groupId) {
+    throw new Error('not a group');
+  }
+  const { aci: ourAci, keys: ourKeys, tag: ourTag } = getOurKeys();
+  const map: Record<string, string> = {};
+  for (const [hex, opening] of content) {
+    map[hex] = Bytes.toBase64(opening);
+  }
+  const header = Bytes.concatenate([
+    uuidToBytes(ourAci),
+    ourTag,
+    globalThis.crypto.getRandomValues(new Uint8Array(16)),
+  ]);
+  const { ephemeralKey, sealed } = sealServeReply({
+    group: groupId,
+    headerBytes: header,
+    entriesBytes: Bytes.fromString(JSON.stringify(map)),
+    recipientKey: new Uint8Array(ourKeys.publicKey.serialize()),
+  });
+  return { header, ephemeralKey, sealed };
+}
+
+/**
+ * Opens an own export for import: it must name this account, and its content
+ * must be sealed to our ACI and key, for this chat, and open under our
+ * identity key. Anything else is another account's store: refused.
+ */
+function openOwnDump(
+  conversationId: string,
+  file: ZrdtOwnDumpType
+): ZrdtOpenedDumpType | { reason: string } {
+  const { aci: ourAci, keys: ourKeys, tag: ourTag } = getOurKeys();
+  if (file.account !== ourAci) {
+    return {
+      reason:
+        `it is the own export of another account (${file.account ?? 'unnamed'}); ` +
+        'ask that member for an export for you',
+    };
+  }
+  const groupId = getGroupIdBytes(conversationId);
+  const header = decodeServeHeader(file.content.header);
+  if (
+    !groupId ||
+    !header ||
+    aciHex(header.requesterAci) !== aciStringHex(ourAci) ||
+    aciHex(header.keyTag) !== aciHex(ourTag)
+  ) {
+    return { reason: "its content is not sealed to this account's key" };
+  }
+  const opened = openServeReply({
+    group: groupId,
+    headerBytes: file.content.header,
+    ephemeralKey: file.content.ephemeralKey,
+    sealed: file.content.sealed,
+    ourPrivateKey: ourKeys.privateKey,
+    ourPublicKey: ourKeys.publicKey,
+  });
+  if (!opened) {
+    return {
+      reason: 'its content does not open under our key for this chat',
+    };
+  }
+  const content = new Map<string, Uint8Array<ArrayBuffer>>();
+  try {
+    const map = JSON.parse(Bytes.toString(opened)) as Record<string, unknown>;
+    for (const [hex, opening] of Object.entries(map)) {
+      if (HEX_DIGEST.test(hex) && typeof opening === 'string') {
+        content.set(hex, Bytes.fromBase64(opening));
+      }
+    }
+  } catch {
+    return { reason: 'its sealed content is not a content map' };
+  }
+  return { blob: file.blob, content };
 }
 
 // Verified imported content, by conversation and hex digest: the text the
@@ -673,7 +776,7 @@ async function importServedExport(
 
 // Import dumps that failed MERGE, kept for "Keep what verifies". Not in
 // Redux: bytes do not belong in the store.
-const failedImportBlobs = new Map<string, ZrdtOwnDumpType>();
+const failedImportBlobs = new Map<string, ZrdtOpenedDumpType>();
 
 // --- State ----------------------------------------------------------------------
 
@@ -1129,14 +1232,14 @@ function exportConversation(
       const file = zrdtEncodeDump({
         account: itemStorage.user.getCheckedAci(),
         blob,
-        content,
+        content: sealOwnContent(conversationId, content),
       });
       await writeFile(target, file);
       const count = zrdtBlobRecordCount(blob);
       dispatch(
         setInternalResult(
           `Exported ${count ?? '?'} records, ${content.size} with content ` +
-            `(${file.byteLength} bytes) to ${target}`
+            `sealed to our key (${file.byteLength} bytes) to ${target}`
         )
       );
       return target;
@@ -1234,18 +1337,16 @@ function importConversation(
         await dispatch(refreshConversation(conversationId));
         return { status: 'ok' };
       }
-      const ourAci = itemStorage.user.getCheckedAci();
-      if (file.account !== ourAci) {
+      // Our own export only: it names this account, and its content opens
+      // under our identity key (openOwnDump). Another account's store never
+      // reaches ours by MERGE.
+      const dump = openOwnDump(conversationId, file);
+      if ('reason' in dump) {
         dispatch(
-          setInternalResult(
-            `Import of ${source} refused: it is the own export of another ` +
-              `account (${file.account ?? 'unnamed'}); ask that member for ` +
-              'an export for you'
-          )
+          setInternalResult(`Import of ${source} refused: ${dump.reason}`)
         );
         return undefined;
       }
-      const dump = file;
       const outcome = await zrdtService.importBlob(conversationId, dump.blob);
       if (outcome.status === 'ok') {
         failedImportBlobs.delete(conversationId);
@@ -1288,13 +1389,14 @@ function salvageFile(
     const source = path || getZrdtDumpPath(conversationId);
     try {
       const file = zrdtParseExport(new Uint8Array(await readFile(source)));
-      if (
-        file.kind !== 'own' ||
-        file.account !== itemStorage.user.getCheckedAci()
-      ) {
+      if (file.kind !== 'own') {
         throw new Error("only this account's own export can be salvaged");
       }
-      failedImportBlobs.set(conversationId, file);
+      const dump = openOwnDump(conversationId, file);
+      if ('reason' in dump) {
+        throw new Error(dump.reason);
+      }
+      failedImportBlobs.set(conversationId, dump);
     } catch (error) {
       dispatch(setInternalResult(`Salvage failed: ${errorText(error)}`));
       return;

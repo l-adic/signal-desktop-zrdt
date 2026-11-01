@@ -1015,6 +1015,43 @@ describe('zrdt rung 7: stub vs Lean (vectors.json, zrdtd)', function (this: Moch
             // so the host sends the openings it holds again.
             // oxlint-disable-next-line no-await-in-loop
             const encoded = await both({ op: Op.ENCODE, chat }, 'ENCODE');
+            // MERGE of the blob into a new store records the blob's
+            // audiences where none is recorded (protocol 4,
+            // run_merge_audiences): ADDRESSED and ENCODE of the copy agree.
+            const copy = 'copy';
+            // oxlint-disable-next-line no-await-in-loop
+            await both({ op: Op.CLOSE, chat: copy }, 'CLOSE copy');
+            // oxlint-disable-next-line no-await-in-loop
+            await both({ op: Op.NEW, chat: copy, group }, 'NEW copy');
+            for (const held of some(openings, 0.2)) {
+              const record = recordOf.get(hex(held.digest));
+              if (record !== undefined) {
+                // oxlint-disable-next-line no-await-in-loop
+                await both(
+                  { op: Op.ACCEPT_RECORD, chat: copy, record },
+                  'ACCEPT_RECORD into the copy before MERGE'
+                );
+              }
+            }
+            // oxlint-disable-next-line no-await-in-loop
+            await both(
+              { op: Op.MERGE, chat: copy, blob: encoded.slice(5) },
+              'MERGE into the copy'
+            );
+            for (const [m, member] of members.entries()) {
+              // oxlint-disable-next-line no-await-in-loop
+              await both(
+                {
+                  op: Op.ADDRESSED,
+                  chat: copy,
+                  aci: member,
+                  key: keys[m] ?? pick(keys),
+                },
+                'ADDRESSED in the copy after MERGE'
+              );
+            }
+            // oxlint-disable-next-line no-await-in-loop
+            await both({ op: Op.ENCODE, chat: copy }, 'ENCODE the copy');
             // oxlint-disable-next-line no-await-in-loop
             await both({ op: Op.CLOSE, chat }, 'CLOSE');
             // oxlint-disable-next-line no-await-in-loop

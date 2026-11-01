@@ -38,8 +38,9 @@
 // (<profile>/zrdt-export-<conversation id>.bin). A container that holds a
 // blob (RESTORE_PLAN.md §5 adds a content section later) also works: the blob
 // is found by its magic; see `locateBlob`.
-// The app's export is a JSON dump with a content section (RESTORE_PLAN.md §3);
-// `remove` drops the removed record's content entry too.
+// The app's own export is a JSON dump whose content section is sealed to the
+// exporter's identity key (ducks/zrdt): the doctor edits the readable blob
+// only; the app checks every opening against the store on import.
 
 import { spawn } from 'node:child_process';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
@@ -855,22 +856,6 @@ export function doctoredPath(file: string): string {
   return `${file.slice(0, file.length - ext.length)}.doctored${ext}`;
 }
 
-/**
- * A JSON dump (`{"blob": …, "content": {<hex digest>: …}}`, the app's export):
- * drops the removed record's content entry too, so the file has no opening
- * for a record it does not hold.
- */
-export function dropContentEntry(json: Bytes, digest: string): Bytes {
-  const doc = JSON.parse(json.toString('utf8')) as {
-    content?: Record<string, unknown>;
-  };
-  if (doc.content == null || !Object.hasOwn(doc.content, digest)) {
-    return json;
-  }
-  delete doc.content[digest];
-  return Buffer.from(`${JSON.stringify(doc, null, 2)}\n`);
-}
-
 /** Beat 4 on a file. Returns a summary for the presenter. */
 export async function doctorRemove(
   file: string,
@@ -879,11 +864,7 @@ export async function doctorRemove(
 ): Promise<string> {
   const located = locateBlob(await fs.readFile(file));
   const result = removeLinkedRecord(parseBlob(located.blob), prefix);
-  let next = located.replace(encodeBlob(result.blob));
-  if (located.kind === 'json') {
-    next = dropContentEntry(next, result.removed);
-  }
-  await fs.writeFile(out, next);
+  await fs.writeFile(out, located.replace(encodeBlob(result.blob)));
   return (
     `removed ${tag(result.removed)} (${result.removed}), linked by ` +
     `${result.linkedBy.map(tag).join(' ')}; ` +

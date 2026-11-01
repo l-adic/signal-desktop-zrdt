@@ -18,7 +18,6 @@ import { openServeReply } from '../ts/zrdt/seal.node.ts';
 import {
   analyse,
   appendSealedFakes,
-  dropContentEntry,
   appendFakes,
   checkOpen,
   closedHeader,
@@ -353,13 +352,3 @@ void test(
     );
   }
 );
-
-void test('dropContentEntry removes one content entry of a JSON dump', () => {
-  const doc = { zrdtDump: 1, blob: 'enJkdFMy', content: { aa: 'x', bb: 'y' } };
-  const json = Buffer.from(JSON.stringify(doc));
-  const out = JSON.parse(dropContentEntry(json, 'aa').toString('utf8')) as {
-    content: Record<string, string>;
-  };
-  assert.deepEqual(out.content, { bb: 'y' });
-  assert.equal(dropContentEntry(json, 'cc'), json);
-});

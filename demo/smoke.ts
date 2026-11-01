@@ -42,9 +42,12 @@
 //           table, zrdt tables, window); his heads equal Alice's. Live
 //           messages flow both ways. Dave asks Alice and Bob for a pre-join
 //           digest by itself: each reply is that digest, as a boundary
-//           digest only, and Dave's heads still equal Alice's. Dave's import
-//           of Bob's own export is refused; Bob's export for Dave gives him
-//           no pre-join content and no pre-join record. A reaction and a pin
+//           digest only, and Dave's heads still equal Alice's. Bob's own
+//           export holds no text in the clear (its content is sealed to his
+//           key); Dave's import of it is refused, even with its account
+//           rewritten to Dave's; Bob restores it himself with every opening
+//           kept. Bob's export for Dave gives him no pre-join content and no
+//           pre-join record. A reaction and a pin
 //           by Bob on a pre-join message do not address Dave. Alice, Bob and
 //           Carol still hold everything.
 //
@@ -1849,12 +1852,18 @@ async function beat6(demo: Demo): Promise<void> {
     );
   await headsEqual('after the per-digest asks');
 
-  // Exports (JOIN_PLAN §4.5). Bob's own export is his alone: Dave's import
-  // of it is refused. Bob's export for Dave is SERVE for Dave, sealed to his
-  // key: only what Dave was sent.
+  // Exports (JOIN_PLAN §4.5). Bob's own export is his alone: its content is
+  // sealed to his key, and Dave's import of it is refused, even with the
+  // file's account rewritten to Dave's. Bob restores it himself. Bob's
+  // export for Dave is SERVE for Dave, sealed to his key: only what Dave
+  // was sent.
   const davePath = await dumpPath(demo, dave);
+  // Texts long enough not to occur by chance (Bob's "me" would).
+  const clearTexts = (bytes: Buffer<ArrayBuffer>): Array<string> =>
+    preTexts.filter(t => t.length >= 8 && bytes.toString('utf8').includes(t));
+  let ownExport: Buffer<ArrayBuffer> | undefined;
   await attempt(
-    "beat6 Dave imports Bob's own export: refused (another account's store)",
+    "beat6 Bob's own export: its content is sealed to his key (no text in the clear)",
     'zrdt',
     async () => {
       const own = await hook<string | undefined>(
@@ -1865,21 +1874,84 @@ async function beat6(demo: Demo): Promise<void> {
       if (own.missing || own.value === undefined) {
         return { ok: false, detail: 'Bob could not export' };
       }
-      await fs.copyFile(own.value, davePath);
-      const status = await hookValue<string | undefined>(
-        demo,
-        dave,
-        'importStore'
-      );
-      const line = await internalResult(dave);
-      const tables = await hookValue<TablesView>(demo, dave, 'tables');
-      const stored = tables.records.filter(d => preDigests.has(d));
+      ownExport = await fs.readFile(own.value);
+      const plain = clearTexts(ownExport);
+      const doc = JSON.parse(ownExport.toString('utf8')) as {
+        zrdtDump?: number;
+        account?: string;
+        content?: { sealed?: string };
+      };
       return {
         ok:
-          status === undefined &&
-          line.includes('refused') &&
-          stored.length === 0,
-        detail: `status=${String(status)}; "${line}"; pre-join records stored ${stored.length}`,
+          doc.zrdtDump === 1 &&
+          doc.account === aciOf(bob) &&
+          typeof doc.content?.sealed === 'string' &&
+          plain.length === 0,
+        detail:
+          `account ${doc.account === aciOf(bob) ? 'Bob' : String(doc.account)}; ` +
+          `content ${typeof doc.content?.sealed === 'string' ? 'sealed' : 'NOT sealed'}; ` +
+          `${plain.length} of ${preTexts.length} pre-join texts in the clear`,
+      };
+    }
+  );
+  const ownBytes = ownExport;
+  for (const [what, rewrite] of [
+    ["Bob's own export", false],
+    ["Bob's own export with the account rewritten to Dave's", true],
+  ] as const) {
+    // oxlint-disable-next-line no-await-in-loop
+    await attempt(
+      `beat6 Dave imports ${what}: refused (another account's store)`,
+      'zrdt',
+      async () => {
+        if (ownBytes === undefined) {
+          return { ok: false, detail: 'no own export of Bob' };
+        }
+        const doc = JSON.parse(ownBytes.toString('utf8')) as Record<
+          string,
+          unknown
+        >;
+        if (rewrite) {
+          doc.account = aciOf(dave);
+        }
+        await fs.writeFile(
+          davePath,
+          rewrite ? `${JSON.stringify(doc)}\n` : ownBytes
+        );
+        const status = await hookValue<string | undefined>(
+          demo,
+          dave,
+          'importStore'
+        );
+        const line = await internalResult(dave);
+        const tables = await hookValue<TablesView>(demo, dave, 'tables');
+        const stored = tables.records.filter(d => preDigests.has(d));
+        return {
+          ok:
+            status === undefined &&
+            line.includes('refused') &&
+            stored.length === 0,
+          detail: `status=${String(status)}; "${line}"; pre-join records stored ${stored.length}`,
+        };
+      }
+    );
+  }
+  await attempt(
+    'beat6 Bob restores his own export: every opening kept',
+    'zrdt',
+    async () => {
+      const status = await hookValue<string | undefined>(
+        demo,
+        bob,
+        'importStore'
+      );
+      const line = await internalResult(bob);
+      const m = /content: (\d+) kept, (\d+) refused/.exec(line);
+      const kept = Number(m?.[1] ?? -1);
+      const refused = Number(m?.[2] ?? -1);
+      return {
+        ok: status === 'ok' && kept >= preTexts.length && refused === 0,
+        detail: `status=${String(status)}; "${line}"`,
       };
     }
   );
@@ -1895,10 +1967,7 @@ async function beat6(demo: Demo): Promise<void> {
         };
       }
       const bytes = await fs.readFile(exp.file);
-      // Texts long enough not to occur by chance (Bob's "me" would).
-      const plain = preTexts.filter(
-        t => t.length >= 8 && bytes.toString('utf8').includes(t)
-      );
+      const plain = clearTexts(bytes);
       await fs.writeFile(davePath, bytes);
       const imp = await importVia(demo, dave);
       const tables = await hookValue<TablesView>(demo, dave, 'tables');

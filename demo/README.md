@@ -71,17 +71,28 @@ curl -X POST "$P/actions/quit"
 ```
 
 Exports go to `<profile>/zrdt-export-<conversation id>.bin`, and Import reads
-the same path for the importing desktop. The file is JSON (RESTORE_PLAN.md
-§3): `{"zrdtDump": 1, "blob": <base64 store blob>, "content": {<hex digest>:
-<base64 opening>}}`; an opening is `nonce ‖ DataMessage bytes` without fields
-15 and 200, so no group master key. Import keeps a content entry only if its
-record is in the store and `COMMIT(opening) == record.commit` (zrdtd's
-ACCEPT_RECORD with the opening); the unconfirmed section shows that text for
-records without a message row (in memory only for now). A raw store blob is
-still accepted. So `doctor-remove` edits Carol's export in place
-(the original is kept as `.orig`), and `doctor-append` reads Bob's export and
-writes Dave's import path (Dave must be linked first). Both take an explicit
-`file` instead (`~/` allowed).
+the same path for the importing desktop. Two kinds, both JSON (zrdt
+JOIN_PLAN §4.5; layouts in `ts/state/ducks/zrdt.preload.ts`):
+
+- **Own export** (`{"zrdtDump": 1, "account", "blob", "content"}`): the store
+  blob, readable (structure only: digests, authors, links), and the content
+  (the openings SERVE gives the exporter's own account) sealed to that
+  account's identity key. Only that account imports it (MERGE, then each
+  opening checked with zrdtd's ACCEPT_RECORD); another account's own export
+  is refused.
+- **Export for a member X** (`{"zrdtExport": 2, "from", "to", "group", "key",
+"sections"}`): SERVE's reply for X (X's ACI and key, catch-up, the export
+  flag), sealed to X's key. X imports it with ACCEPT_VIEW in import mode;
+  it holds only what SERVE gives X.
+
+Import keeps an opening only if its own committed audience seats the
+importer under the tag of its key and it opens a record in the store; the
+unconfirmed section shows that text for records without a message row (in
+memory only for now). `doctor-remove` edits Carol's own export's blob in
+place (the original is kept as `.orig`), and `doctor-append` appends fakes to
+Bob's export for Dave, in a new section sealed to Dave's key, and writes
+Dave's import path (Dave must be linked first). Both take an explicit `file`
+instead (`~/` allowed).
 
 ## Doctor
 
