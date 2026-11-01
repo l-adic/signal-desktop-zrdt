@@ -13,7 +13,7 @@ import { drop } from '../../util/drop.std.ts';
 const log = createLogger('SmartZrdtGapRow');
 
 /** A `zrdt-gap` timeline row; "Ask again" goes to the resend module (T2). */
-export const SmartZrdtGapRow = memo(function SmartZrdtGapRow(
+const SmartZrdtGapRow = memo(function SmartZrdtGapRow(
   props: ZrdtGapItemDataType
 ): JSX.Element {
   const {

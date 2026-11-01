@@ -9,7 +9,7 @@ import { ZrdtBackendBadge } from '../../zrdt/ui/ZrdtBackendBadge.dom.tsx';
 import { ZrdtCompareModal } from '../../zrdt/ui/ZrdtCompareModal.dom.tsx';
 
 /** The always-on backend badge (APP.md §7, §9 checklist). */
-export const SmartZrdtBackendBadge = memo(
+const SmartZrdtBackendBadge = memo(
   function SmartZrdtBackendBadge(): JSX.Element {
     const backend = useSelector((state: StateType) => state.zrdt.backend);
     return (
@@ -26,7 +26,7 @@ export const SmartZrdtBackendBadge = memo(
 );
 
 /** The compare screen, driven by state.zrdt.compare (APP.md §7 "Compare"). */
-export const SmartZrdtCompareModal = memo(
+const SmartZrdtCompareModal = memo(
   function SmartZrdtCompareModal(): JSX.Element | null {
     const compare = useSelector((state: StateType) => state.zrdt.compare);
     const { comparePasted, askCompare, closeCompare } = useZrdtActions();

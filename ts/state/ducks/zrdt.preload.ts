@@ -186,7 +186,7 @@ export function getEmptyState(): ZrdtStateType {
   return { byConversation: {} };
 }
 
-export function getEmptyConversationState(): ZrdtConversationStateType {
+function getEmptyConversationState(): ZrdtConversationStateType {
   return { statuses: {}, disown: [], alarmDismissed: [], unconfirmed: [] };
 }
 
