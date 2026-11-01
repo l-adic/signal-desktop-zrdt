@@ -1,0 +1,489 @@
+// Copyright 2026 Signal Messenger, LLC
+// SPDX-License-Identifier: AGPL-3.0-only
+
+// Styles for ts/zrdt/ui/*. Self-contained (no Signal variables or mixins) so
+// the fallback mini-client can compile this file on its own with sass.
+// Dark mode follows Signal's `.dark-theme` class on an ancestor.
+
+// Signal sets `.dark-theme` / `.light-theme` on <body>; the custom properties
+// cascade from there. Every use below also carries a light fallback.
+:root {
+  --zrdt-fg: #1b1b1b;
+  --zrdt-fg-muted: #6b6b6b;
+  --zrdt-bg: #ffffff;
+  --zrdt-bg-subtle: #f2f2f2;
+  --zrdt-border: #d6d6d6;
+  --zrdt-accent: #2c6bed;
+  --zrdt-ok: #1d7a3a;
+  --zrdt-warn: #9a5b00;
+  --zrdt-warn-bg: #fff4e0;
+  --zrdt-error: #b3261e;
+  --zrdt-error-bg: #fdecea;
+  --zrdt-info-bg: #e8f0fe;
+}
+
+.dark-theme {
+  --zrdt-fg: #e9e9e9;
+  --zrdt-fg-muted: #a0a0a0;
+  --zrdt-bg: #2a2a2a;
+  --zrdt-bg-subtle: #3b3b3b;
+  --zrdt-border: #4a4a4a;
+  --zrdt-accent: #7aa7ff;
+  --zrdt-ok: #6fd28f;
+  --zrdt-warn: #f2b45a;
+  --zrdt-warn-bg: #3d2f17;
+  --zrdt-error: #ff8a80;
+  --zrdt-error-bg: #3f1f1d;
+  --zrdt-info-bg: #1f2b40;
+}
+
+// ---------------------------------------------------------------------------
+// Shared bits
+
+.ZrdtButton {
+  flex: none;
+  padding-block: 4px;
+  padding-inline: 12px;
+  border: 1px solid var(--zrdt-border, #d6d6d6);
+  border-radius: 14px;
+  background: var(--zrdt-bg, #ffffff);
+  color: var(--zrdt-accent, #2c6bed);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+
+  &:disabled {
+    cursor: default;
+    opacity: 0.5;
+  }
+
+  &:focus-visible {
+    outline: 2px solid var(--zrdt-accent, #2c6bed);
+    outline-offset: 1px;
+  }
+}
+
+@keyframes ZrdtSpin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.ZrdtSpinner {
+  display: inline-block;
+  flex: none;
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--zrdt-border, #d6d6d6);
+  border-block-start-color: var(--zrdt-accent, #2c6bed);
+  border-radius: 50%;
+  animation: ZrdtSpin 0.8s linear infinite;
+}
+
+.ZrdtWords {
+  padding-block: 8px;
+  padding-inline: 10px;
+  border-radius: 6px;
+  background: var(--zrdt-bg-subtle, #f2f2f2);
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  word-spacing: 4px;
+  user-select: text;
+}
+
+// ---------------------------------------------------------------------------
+// Gap row (timeline item for the zrdt-gap message type)
+
+.ZrdtGapRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  justify-content: center;
+  margin-block: 8px;
+  margin-inline: 16px;
+  padding-block: 8px;
+  padding-inline: 12px;
+  border: 1px dashed var(--zrdt-border, #d6d6d6);
+  border-radius: 10px;
+  color: var(--zrdt-fg, #1b1b1b);
+  font-size: 13px;
+  text-align: center;
+}
+
+.ZrdtGapRow--waiting,
+.ZrdtGapRow--requested {
+  background: var(--zrdt-bg-subtle, #f2f2f2);
+}
+
+.ZrdtGapRow--still-missing {
+  border-style: solid;
+  border-color: var(--zrdt-warn, #9a5b00);
+  background: var(--zrdt-warn-bg, #fff4e0);
+}
+
+.ZrdtGapRow--content-unavailable {
+  color: var(--zrdt-fg-muted, #6b6b6b);
+  font-style: italic;
+}
+
+.ZrdtGapRow__title {
+  font-weight: 500;
+}
+
+.ZrdtGapRow__tags {
+  color: var(--zrdt-fg-muted, #6b6b6b);
+  font-family: ui-monospace, Menlo, monospace;
+}
+
+.ZrdtGapRow__status {
+  color: var(--zrdt-fg-muted, #6b6b6b);
+}
+
+// ---------------------------------------------------------------------------
+// Provenance labels (beside the message metadata)
+
+.ZrdtLabel {
+  display: inline-block;
+  margin-inline-start: 6px;
+  padding-block: 0;
+  padding-inline: 6px;
+  border-radius: 8px;
+  font-size: 11px;
+  line-height: 16px;
+  white-space: nowrap;
+}
+
+.ZrdtLabel--relayed {
+  background: var(--zrdt-info-bg, #e8f0fe);
+  color: var(--zrdt-accent, #2c6bed);
+}
+
+.ZrdtLabel--confirmed {
+  color: var(--zrdt-ok, #1d7a3a);
+}
+
+.ZrdtLabel--held {
+  background: var(--zrdt-bg-subtle, #f2f2f2);
+  color: var(--zrdt-fg-muted, #6b6b6b);
+}
+
+.ZrdtLabel--unconfirmed {
+  color: var(--zrdt-fg-muted, #6b6b6b);
+  opacity: 0.8;
+}
+
+.ZrdtLabel--not-confirmed {
+  background: var(--zrdt-error-bg, #fdecea);
+  color: var(--zrdt-error, #b3261e);
+  font-weight: 600;
+}
+
+// ---------------------------------------------------------------------------
+// Banners (conversation-level slot above the timeline)
+
+.ZrdtBanner {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  padding-block: 8px;
+  padding-inline: 16px;
+  color: var(--zrdt-fg, #1b1b1b);
+  font-size: 13px;
+}
+
+.ZrdtBanner--error {
+  background: var(--zrdt-error-bg, #fdecea);
+  border-block-end: 2px solid var(--zrdt-error, #b3261e);
+}
+
+.ZrdtBanner--warning {
+  background: var(--zrdt-warn-bg, #fff4e0);
+  border-block-end: 2px solid var(--zrdt-warn, #9a5b00);
+}
+
+.ZrdtBanner--info {
+  background: var(--zrdt-info-bg, #e8f0fe);
+  border-block-end: 1px solid var(--zrdt-accent, #2c6bed);
+}
+
+.ZrdtBanner__text {
+  flex: 1 1 auto;
+  font-weight: 500;
+}
+
+.ZrdtBanner__detail {
+  color: var(--zrdt-fg-muted, #6b6b6b);
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 12px;
+}
+
+// ---------------------------------------------------------------------------
+// Backend badge
+
+.ZrdtBackendBadge {
+  display: inline-block;
+  padding-block: 1px;
+  padding-inline: 8px;
+  border-radius: 10px;
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 11px;
+  line-height: 18px;
+  white-space: nowrap;
+}
+
+.ZrdtBackendBadge--lean {
+  background: var(--zrdt-ok, #1d7a3a);
+  color: #ffffff;
+}
+
+.ZrdtBackendBadge--stub {
+  background: var(--zrdt-warn, #9a5b00);
+  color: #ffffff;
+}
+
+.ZrdtBackendBadge--down {
+  background: var(--zrdt-error, #b3261e);
+  color: #ffffff;
+}
+
+.ZrdtBackendBadge__floating {
+  position: fixed;
+  inset-block-end: 6px;
+  inset-inline-end: 8px;
+  z-index: 10000;
+  pointer-events: none;
+  opacity: 0.9;
+}
+
+// ---------------------------------------------------------------------------
+// Compare modal
+
+.ZrdtModal__overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 9000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.4);
+}
+
+.ZrdtModal {
+  width: 480px;
+  max-width: calc(100vw - 32px);
+  max-height: calc(100vh - 32px);
+  overflow-y: auto;
+  padding: 20px;
+  border-radius: 12px;
+  background: var(--zrdt-bg, #ffffff);
+  color: var(--zrdt-fg, #1b1b1b);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+  font-size: 14px;
+}
+
+.ZrdtModal__title {
+  margin-block: 0 12px;
+  margin-inline: 0;
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.ZrdtModal__footer {
+  display: flex;
+  justify-content: flex-end;
+  margin-block-start: 16px;
+}
+
+.ZrdtCompare__section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-block-end: 16px;
+}
+
+.ZrdtCompare__heading {
+  margin: 0;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.ZrdtCompare__code {
+  box-sizing: border-box;
+  width: 100%;
+  padding: 6px;
+  border: 1px solid var(--zrdt-border, #d6d6d6);
+  border-radius: 6px;
+  background: var(--zrdt-bg-subtle, #f2f2f2);
+  color: var(--zrdt-fg, #1b1b1b);
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 11px;
+  word-break: break-all;
+  resize: vertical;
+}
+
+.ZrdtCompare__row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
+.ZrdtCompare__hint,
+.ZrdtCompare__words-label {
+  color: var(--zrdt-fg-muted, #6b6b6b);
+  font-size: 12px;
+}
+
+.ZrdtCompare__outcome {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  padding-block: 8px;
+  padding-inline: 10px;
+  border-radius: 8px;
+}
+
+.ZrdtCompare__outcome-text {
+  flex: 1 1 auto;
+  font-weight: 500;
+}
+
+.ZrdtCompare__outcome--identical {
+  background: var(--zrdt-info-bg, #e8f0fe);
+  color: var(--zrdt-ok, #1d7a3a);
+}
+
+.ZrdtCompare__outcome--they-are-behind {
+  background: var(--zrdt-bg-subtle, #f2f2f2);
+}
+
+.ZrdtCompare__outcome--you-are-behind {
+  background: var(--zrdt-warn-bg, #fff4e0);
+}
+
+.ZrdtCompare__outcome--withheld {
+  background: var(--zrdt-error-bg, #fdecea);
+  color: var(--zrdt-error, #b3261e);
+}
+
+.ZrdtCompare__outcome--invalid-code {
+  background: var(--zrdt-bg-subtle, #f2f2f2);
+  color: var(--zrdt-fg-muted, #6b6b6b);
+}
+
+// ---------------------------------------------------------------------------
+// Unconfirmed section (top of the timeline)
+
+.ZrdtUnconfirmed {
+  margin-block: 8px;
+  margin-inline: 16px;
+  border: 1px solid var(--zrdt-border, #d6d6d6);
+  border-radius: 10px;
+  background: var(--zrdt-bg-subtle, #f2f2f2);
+  color: var(--zrdt-fg-muted, #6b6b6b);
+  font-size: 13px;
+}
+
+.ZrdtUnconfirmed__toggle {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  width: 100%;
+  padding-block: 8px;
+  padding-inline: 12px;
+  border: none;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
+}
+
+.ZrdtUnconfirmed__chevron {
+  width: 12px;
+}
+
+.ZrdtUnconfirmed__list {
+  margin: 0;
+  padding-block: 0 8px;
+  padding-inline: 12px;
+  list-style: none;
+}
+
+.ZrdtUnconfirmed__item {
+  padding-block: 6px;
+  border-block-start: 1px solid var(--zrdt-border, #d6d6d6);
+}
+
+.ZrdtUnconfirmed__meta {
+  font-size: 11px;
+  opacity: 0.8;
+}
+
+.ZrdtUnconfirmed__text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+// ---------------------------------------------------------------------------
+// Per-message code
+
+.ZrdtMessageCode {
+  position: relative;
+  display: inline-block;
+}
+
+.ZrdtMessageCode__tag {
+  padding-block: 0;
+  padding-inline: 4px;
+  border: none;
+  border-radius: 4px;
+  background: none;
+  color: inherit;
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 11px;
+  cursor: pointer;
+  opacity: 0.85;
+
+  &:hover,
+  &:focus-visible {
+    background: rgba(127, 127, 127, 0.2);
+    opacity: 1;
+  }
+}
+
+.ZrdtMessageCode__popover {
+  position: absolute;
+  inset-block-start: 100%;
+  inset-inline-end: 0;
+  z-index: 100;
+  display: block;
+  width: 280px;
+  margin-block-start: 4px;
+  padding: 8px;
+  border: 1px solid var(--zrdt-border, #d6d6d6);
+  border-radius: 8px;
+  background: var(--zrdt-bg, #ffffff);
+  color: var(--zrdt-fg, #1b1b1b);
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
+  white-space: normal;
+}
+
+.ZrdtCodeDetail {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  align-items: flex-start;
+}
+
+.ZrdtCodeDetail__digest {
+  max-width: 100%;
+  color: var(--zrdt-fg-muted, #6b6b6b);
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 10px;
+  word-break: break-all;
+  user-select: text;
+}

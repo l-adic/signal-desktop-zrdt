@@ -43,6 +43,9 @@ const config = {
         'ts/windows/pdf/app.dom.tsx!',
         'ts/windows/permissions/app.dom.tsx!',
         'ts/windows/screenShare/app.dom.tsx!',
+        // zrdt UI: an entry until the timeline/header wiring imports it, and
+        // kept for the fallback mini-client. TODO(zrdt): drop after wiring.
+        'ts/zrdt/ui/*.{ts,tsx}!',
         // Others
         'codemods/**/*.mjs',
         'scripts/**/*.mjs',

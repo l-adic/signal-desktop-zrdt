@@ -164,3 +164,6 @@ $is-storybook: false !default;
 @use 'components/UsernameLinkEditor.scss';
 @use 'components/UsernameMegaphone.scss';
 @use 'components/WhatsNew.scss';
+
+// zrdt (ts/zrdt/ui)
+@use 'components/Zrdt.scss';
