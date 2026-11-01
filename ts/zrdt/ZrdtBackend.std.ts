@@ -32,7 +32,12 @@ export const MAX_LINKS = 4096;
 /** A store holds fewer than this many records (PLAN.md section 3.4). */
 export const RECORD_COUNT_LIMIT = 2 ** 24;
 
-/** The frame protocol version this host speaks. */
+/**
+ * The frame protocol version of zrdt core as of this host. Version 1 is the
+ * layout of core/Zrdt/Proto.lean at zrdt e2b3160. The lead's changes (an
+ * ACCEPT reply with the record bytes, a COMMIT reply with the opening, and
+ * ACCEPT_RECORD) are read by body length, so the host speaks both.
+ */
 export const PROTOCOL_VERSION = 1;
 
 /**
@@ -100,11 +105,33 @@ export type SalvageResult =
  *   full.
  */
 export type AcceptResult =
-  | { kind: 'accepted'; digest: Digest }
+  | { kind: 'accepted'; digest: Digest; record: Bytes }
   | { kind: 'missing'; digests: Array<Digest> }
   | { kind: 'collision'; digest: Digest }
   | { kind: 'wrongChat' }
   | { kind: 'tooLarge' };
+
+/**
+ * The reply to `acceptRecord()`: as `accept()`, plus
+ *
+ * - `malformed`: the bytes are not an encoded record (PLAN.md section 3.4);
+ * - `badOpening`: an opening was given and its commitment is not the
+ *   record's `commit`. Nothing changed.
+ */
+export type AcceptRecordResult =
+  | AcceptResult
+  | { kind: 'malformed' }
+  | { kind: 'badOpening' };
+
+/**
+ * The reply to `commit()`. `opening` is `nonce ‖ DataMessage bytes with
+ * top-level fields 15 and 200 removed`: exactly the committed bytes after the
+ * fixed prefix, so `commit = SHA-256("zrdtP1" ‖ group ‖ author ‖ opening)`.
+ * `malformed`: the DataMessage is not a well-formed protobuf message.
+ */
+export type CommitResult =
+  | { kind: 'ok'; commit: Bytes; opening: Bytes }
+  | { kind: 'malformed' };
 
 /**
  * How a record reached this device (host state, trusted).
@@ -162,14 +189,17 @@ export type BackendKind = 'lean' | 'stub';
  *
  * - `unavailable`: the backend is gone (the daemon exited). Nothing is
  *   accepted until the host restarts it and re-opens every chat.
- * - `unknownChat`: no store is open under this chat key.
- * - `badInput`: an argument has the wrong size, or the DataMessage bytes
- *   given to `commit()` are not protobuf.
+ * - `unknownChat`: no store is open under this chat key (NO_CHAT).
+ * - `chatOpen`: NEW, OPEN or SALVAGE under a chat key that already has a
+ *   store (CHAT_OPEN). CLOSE it first.
+ * - `badInput`: an argument has the wrong size (the daemon would reply
+ *   BAD_REQUEST).
  * - `protocol`: the daemon sent something the host cannot read.
  */
 export type ZrdtErrorCode =
   | 'unavailable'
   | 'unknownChat'
+  | 'chatOpen'
   | 'badInput'
   | 'protocol';
 
@@ -199,12 +229,13 @@ export type ZrdtBackend = {
   /** VERSION: the protocol version and the build of the backend. */
   version(): Promise<VersionInfo>;
 
-  /** NEW: an empty store for `group` under `chat`, replacing any store there. */
+  /** NEW: an empty store for `group` under `chat`. Throws `chatOpen` if one is there. */
   create(chat: ChatKey, group: Bytes): Promise<void>;
 
   /**
    * OPEN: load a store for `group` from a blob or a list of encoded records.
-   * On `ok` it replaces any store under `chat`; otherwise nothing changes.
+   * On `ok` the store is under `chat`; otherwise nothing changes. Throws
+   * `chatOpen` if `chat` already has a store.
    */
   open(chat: ChatKey, group: Bytes, input: OpenInput): Promise<OpenResult>;
 
@@ -220,20 +251,31 @@ export type ZrdtBackend = {
 
   /**
    * COMMIT: the 32-byte commitment over the DataMessage wire bytes, with
-   * top-level fields 15 (groupV2) and 200 (zrdt) removed. Needs no store.
+   * top-level fields 15 (groupV2) and 200 (zrdt) removed, and the opening.
+   * Needs no store.
    */
   commit(
     group: Bytes,
     author: Bytes,
     nonce: Bytes,
     dataMessage: Bytes
-  ): Promise<Bytes>;
+  ): Promise<CommitResult>;
 
   /** HASH: the digest of a record. Needs no store. */
   hash(record: RecordParts): Promise<Digest>;
 
   /** ACCEPT: add a record to the store under `chat`. */
   accept(chat: ChatKey, record: RecordParts): Promise<AcceptResult>;
+
+  /**
+   * ACCEPT_RECORD: add an encoded record (a relay or an import) to the store
+   * under `chat`. If `opening` is given, its commitment must be the record's.
+   */
+  acceptRecord(
+    chat: ChatKey,
+    record: Bytes,
+    opening?: Bytes
+  ): Promise<AcceptRecordResult>;
 
   /** HEADS: the digests no stored record links, sorted. */
   heads(chat: ChatKey): Promise<Array<Digest>>;

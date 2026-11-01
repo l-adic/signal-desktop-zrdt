@@ -24,10 +24,12 @@ import {
   ZrdtBackendError,
 } from '../ZrdtBackend.std.ts';
 import type {
+  AcceptRecordResult,
   AcceptResult,
   BackendKind,
   Bytes,
   ChatKey,
+  CommitResult,
   Digest,
   OpenInput,
   OpenResult,
@@ -350,6 +352,24 @@ export function commitment(
   nonce: Bytes,
   dataMessage: Bytes
 ): Bytes {
+  const result = commitWithOpening(group, author, nonce, dataMessage);
+  if (result.kind !== 'ok') {
+    throw new ZrdtBackendError('badInput', 'DataMessage is not protobuf');
+  }
+  return result.commit;
+}
+
+/**
+ * COMMIT: the commitment and the opening (`nonce ‖ DataMessage without fields
+ * 15 and 200`), or `malformed` for bytes that are not protobuf. Throws
+ * `badInput` on wrong sizes.
+ */
+export function commitWithOpening(
+  group: Bytes,
+  author: Bytes,
+  nonce: Bytes,
+  dataMessage: Bytes
+): CommitResult {
   checkSize('group', group, GROUP_ID_BYTES);
   checkSize('author', author, ACI_BYTES);
   checkSize('nonce', nonce, NONCE_BYTES);
@@ -358,9 +378,25 @@ export function commitment(
     new Set([FIELD_GROUP_V2, FIELD_ZRDT])
   );
   if (committed === undefined) {
-    throw new ZrdtBackendError('badInput', 'DataMessage is not protobuf');
+    return { kind: 'malformed' };
   }
-  return sha256(COMMIT_MAGIC, group, author, nonce, committed);
+  const opening = concat([nonce, committed]);
+  return {
+    kind: 'ok',
+    commit: sha256(COMMIT_MAGIC, group, author, opening),
+    opening,
+  };
+}
+
+/** Whether `opening` opens the record's commitment. */
+export function opens(record: StubRecord, opening: Bytes): boolean {
+  if (opening.length < NONCE_BYTES) {
+    return false;
+  }
+  return equal(
+    sha256(COMMIT_MAGIC, record.group, record.author, opening),
+    record.commit
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -442,7 +478,7 @@ export class StubStore {
     const existing = this.#entries.get(k);
     if (existing !== undefined) {
       return equal(existing.encoded, encoded)
-        ? { kind: 'accepted', digest }
+        ? { kind: 'accepted', digest, record: new Uint8Array(encoded) }
         : { kind: 'collision', digest };
     }
     const missing = record.links.filter(link => !this.has(link));
@@ -457,7 +493,11 @@ export class StubStore {
       this.#heads.delete(key(link));
     }
     this.#heads.add(k);
-    return { kind: 'accepted', digest: new Uint8Array(digest) };
+    return {
+      kind: 'accepted',
+      digest: new Uint8Array(digest),
+      record: new Uint8Array(encoded),
+    };
   }
 
   /**
@@ -847,7 +887,14 @@ export class StubBackend implements ZrdtBackend {
     return { protocol: PROTOCOL_VERSION, build: 'stub' };
   }
 
+  #notOpen(chat: ChatKey): void {
+    if (this.#stores.has(chat)) {
+      throw new ZrdtBackendError('chatOpen', `a store is open for ${chat}`);
+    }
+  }
+
   async create(chat: ChatKey, group: Bytes): Promise<void> {
+    this.#notOpen(chat);
     this.#stores.set(chat, new StubStore(group, this.#hash));
   }
 
@@ -856,6 +903,7 @@ export class StubBackend implements ZrdtBackend {
     group: Bytes,
     input: OpenInput
   ): Promise<OpenResult> {
+    this.#notOpen(chat);
     const opened = openInput(group, input, this.#hash);
     if (opened.kind !== 'ok') {
       return opened;
@@ -873,6 +921,7 @@ export class StubBackend implements ZrdtBackend {
     group: Bytes,
     input: OpenInput
   ): Promise<SalvageResult> {
+    this.#notOpen(chat);
     const opened = openInput(group, input, this.#hash);
     if (opened.kind !== 'ok') {
       return opened;
@@ -887,8 +936,8 @@ export class StubBackend implements ZrdtBackend {
     author: Bytes,
     nonce: Bytes,
     dataMessage: Bytes
-  ): Promise<Bytes> {
-    return commitment(group, author, nonce, dataMessage);
+  ): Promise<CommitResult> {
+    return commitWithOpening(group, author, nonce, dataMessage);
   }
 
   async hash(record: RecordParts): Promise<Digest> {
@@ -897,6 +946,26 @@ export class StubBackend implements ZrdtBackend {
 
   async accept(chat: ChatKey, record: RecordParts): Promise<AcceptResult> {
     return this.#store(chat).accept(makeRecord(record));
+  }
+
+  /**
+   * ACCEPT_RECORD. The checks run in this order: the chat is open, the bytes
+   * decode, the opening matches the commitment, then ACCEPT's checks.
+   */
+  async acceptRecord(
+    chat: ChatKey,
+    record: Bytes,
+    opening?: Bytes
+  ): Promise<AcceptRecordResult> {
+    const store = this.#store(chat);
+    const decoded = decodeRecord(record);
+    if (decoded === undefined) {
+      return { kind: 'malformed' };
+    }
+    if (opening !== undefined && !opens(decoded, opening)) {
+      return { kind: 'badOpening' };
+    }
+    return store.accept(decoded);
   }
 
   async heads(chat: ChatKey): Promise<Array<Digest>> {

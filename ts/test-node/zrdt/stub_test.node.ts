@@ -620,13 +620,16 @@ describe('zrdt stub', () => {
       await assert.isRejected(stub.heads('x'), /unknownChat/);
     });
 
-    it('leaves the open store alone when open fails', async () => {
+    it('leaves the open store alone when open is refused (CHAT_OPEN)', async () => {
       const stub = newStub();
       await threeRecords(stub);
       const before = await stub.encode(CHAT);
-      assert.deepEqual(await stub.open(CHAT, GROUP, new Uint8Array(1)), {
-        kind: 'malformed',
-      });
+      await assert.isRejected(
+        stub.open(CHAT, GROUP, new Uint8Array(1)),
+        /chatOpen/
+      );
+      await assert.isRejected(stub.open(CHAT, GROUP, before), /chatOpen/);
+      await assert.isRejected(stub.salvage(CHAT, GROUP, before), /chatOpen/);
       assert.deepEqual(await stub.encode(CHAT), before);
     });
 
@@ -896,12 +899,53 @@ describe('zrdt stub', () => {
       );
     });
 
-    it('create replaces the store under a chat key', async () => {
+    it('create refuses a chat key in use (CHAT_OPEN), as zrdtd does', async () => {
       const stub = newStub();
       await stub.create(CHAT, GROUP);
-      await accepted(stub, rec('a'));
+      const a = await accepted(stub, rec('a'));
+      await assert.isRejected(stub.create(CHAT, GROUP), /chatOpen/);
+      assert.deepEqual((await stub.heads(CHAT)).map(hex), [hex(a)]);
+      await stub.close(CHAT);
       await stub.create(CHAT, GROUP);
       assert.deepEqual(await stub.heads(CHAT), []);
+    });
+
+    it('commit returns the opening, and acceptRecord checks it', async () => {
+      const stub = newStub();
+      await stub.create(CHAT, GROUP);
+      const nonce = filled(32, 0x4e);
+      // body "hi" (field 1), groupV2 (field 15, dropped), zrdt (200, dropped)
+      const dataMessage = fromHex('0a026869' + '7a020000' + 'c20c00');
+      const committed = await stub.commit(GROUP, ALICE, nonce, dataMessage);
+      assert.strictEqual(committed.kind, 'ok');
+      if (committed.kind !== 'ok') {
+        return;
+      }
+      assert.strictEqual(hex(committed.opening), hex(nonce) + '0a026869');
+      const parts = {
+        group: GROUP,
+        commit: committed.commit,
+        links: [],
+        author: ALICE,
+      };
+      const record = encodeRecord(makeRecord(parts));
+      const bad = new Uint8Array(committed.opening);
+      bad[bad.length - 1] = (bad[bad.length - 1] ?? 0) ^ 1;
+      assert.deepEqual(await stub.acceptRecord(CHAT, record, bad), {
+        kind: 'badOpening',
+      });
+      assert.deepEqual(await stub.acceptRecord(CHAT, record.subarray(1)), {
+        kind: 'malformed',
+      });
+      const ok = await stub.acceptRecord(CHAT, record, committed.opening);
+      assert.strictEqual(ok.kind, 'accepted');
+      if (ok.kind === 'accepted') {
+        assert.strictEqual(hex(ok.record), hex(record));
+        assert.strictEqual(hex(ok.digest), hex(await stub.hash(parts)));
+      }
+      assert.deepEqual(await stub.commit(GROUP, ALICE, nonce, fromHex('0f')), {
+        kind: 'malformed',
+      });
     });
   });
 });

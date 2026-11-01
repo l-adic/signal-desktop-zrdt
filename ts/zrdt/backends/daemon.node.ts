@@ -16,10 +16,16 @@
 // nothing is accepted until the host starts a new backend and re-opens every
 // chat from its SQL rows.
 //
-// TODO(zrdt): the op numbers and the body layout of every request and reply
-// are fixed by core/Zrdt/Proto.lean (lane L3) and pinned by
-// vectors/vectors.json. Until that lands, the ZrdtBackend methods below throw;
-// only the transport (spawn, framing, fail-closed) is implemented and tested.
+// The body layout of every request and reply is in ./codec.std.ts, from
+// core/Zrdt/Proto.lean, and pinned by vectors/vectors.json (rung 7 test:
+// ts/test-node/zrdt/vectors_test.node.ts).
+//
+// Replies of the protocol 1 layout (zrdt e2b3160) have no record bytes in
+// ACCEPT and no opening in COMMIT, and that zrdtd has no ACCEPT_RECORD. For
+// those the host builds the canonical record encoding and the opening itself
+// (the same bytes the stub produces), and runs ACCEPT_RECORD as COMMIT on the
+// opening plus ACCEPT. TODO(zrdt T0): drop the fallbacks once every zrdtd in
+// use speaks the lead's changes (build/t5-core).
 
 import { spawn } from 'node:child_process';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
@@ -27,10 +33,12 @@ import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createLogger } from '../../logging/log.std.ts';
 import { ZrdtBackendError } from '../ZrdtBackend.std.ts';
 import type {
+  AcceptRecordResult,
   AcceptResult,
   BackendKind,
   Bytes,
   ChatKey,
+  CommitResult,
   Digest,
   OpenInput,
   OpenResult,
@@ -41,32 +49,25 @@ import type {
   VersionInfo,
   ZrdtBackend,
 } from '../ZrdtBackend.std.ts';
+import {
+  Code,
+  Op,
+  ReplyError,
+  concatBytes,
+  decodeReply,
+  encodeRequestBody,
+} from './codec.std.ts';
+import type { Request, ResultOf } from './codec.std.ts';
+import {
+  decodeRecord,
+  encodeRecord,
+  makeRecord,
+  removeTopLevelFields,
+} from './stub.node.ts';
+
+export { Op } from './codec.std.ts';
 
 const log = createLogger('zrdt/daemon');
-
-/**
- * Frame op codes.
- *
- * TODO(zrdt): PROVISIONAL. These follow the order of the op table in
- * PLAN.md section 3.3; Proto.lean decides the real numbers.
- */
-export enum Op {
-  VERSION = 0x01,
-  NEW = 0x02,
-  OPEN = 0x03,
-  SALVAGE = 0x04,
-  COMMIT = 0x05,
-  HASH = 0x06,
-  ACCEPT = 0x07,
-  HEADS = 0x08,
-  HAS = 0x09,
-  GET = 0x0a,
-  REACH_SET = 0x0b,
-  MERGE = 0x0c,
-  CLASSIFY = 0x0d,
-  ENCODE = 0x0e,
-  CLOSE = 0x0f,
-}
 
 /** The largest frame either side may send (tag and body), in bytes. */
 export const MAX_FRAME_BYTES = 256 * 1024 * 1024;
@@ -167,7 +168,7 @@ export type DaemonBackendOptions = Readonly<{
 }>;
 
 type Pending = Readonly<{
-  op: Op;
+  op: number;
   resolve: (frame: Frame) => void;
   reject: (error: ZrdtBackendError) => void;
 }>;
@@ -242,6 +243,23 @@ export class DaemonBackend implements ZrdtBackend {
     });
   }
 
+  /**
+   * Sends a raw request payload (`op ‖ body`, possibly empty or malformed)
+   * and resolves with the reply frame. For tests (rung 6 and 7 vectors).
+   */
+  callRaw(payload: Bytes): Promise<Frame> {
+    if (this.#failure !== undefined) {
+      return Promise.reject(this.#failure);
+    }
+    const frame = new Uint8Array(4 + payload.length);
+    new DataView(frame.buffer).setUint32(0, payload.length, false);
+    frame.set(payload, 4);
+    return new Promise<Frame>((resolve, reject) => {
+      this.#pending.push({ op: payload[0] ?? 0, resolve, reject });
+      this.#child.stdin.write(frame);
+    });
+  }
+
   #onData(chunk: Bytes): void {
     if (this.#failure !== undefined) {
       return;
@@ -288,91 +306,197 @@ export class DaemonBackend implements ZrdtBackend {
   }
 
   // -------------------------------------------------------------------------
-  // The frame ops. TODO(zrdt): body encodings pending Proto.lean.
+  // The frame ops (codec.std.ts).
   // -------------------------------------------------------------------------
 
-  #todo(op: Op): never {
-    throw new Error(
-      `TODO(zrdt): body encoding for ${Op[op]} is pending core/Zrdt/Proto.lean`
-    );
+  #acceptRecordOp: boolean | undefined;
+
+  /** Sends a typed request and reads the typed reply. */
+  async #request<O extends Op>(req: Request & { op: O }): Promise<ResultOf[O]> {
+    const frame = await this.call(req.op, encodeRequestBody(req));
+    let result: ResultOf[O] | undefined;
+    try {
+      result = decodeReply(req.op, frame.tag, frame.body);
+    } catch (error) {
+      if (!(error instanceof ReplyError)) {
+        throw error;
+      }
+      switch (error.status) {
+        case Code.NO_CHAT:
+          throw new ZrdtBackendError('unknownChat', `${Op[req.op]}: no store`);
+        case Code.CHAT_OPEN:
+          throw new ZrdtBackendError('chatOpen', `${Op[req.op]}: chat open`);
+        case Code.BAD_REQUEST:
+          throw new ZrdtBackendError('badInput', `${Op[req.op]}: bad request`);
+        case Code.UNKNOWN_OP:
+          throw new ZrdtBackendError('protocol', `${Op[req.op]}: unknown op`);
+        default:
+          break;
+      }
+      // A status the op cannot reply: the stream cannot be trusted.
+      this.#fail(error.message);
+      throw new ZrdtBackendError('unavailable', error.message);
+    }
+    if (
+      result === undefined &&
+      !(req.op === Op.NEW || req.op === Op.CLOSE || req.op === Op.GET)
+    ) {
+      const message = `zrdtd sent an unreadable ${Op[req.op]} reply`;
+      this.#fail(message);
+      throw new ZrdtBackendError('unavailable', message);
+    }
+    return result as ResultOf[O];
   }
 
   async version(): Promise<VersionInfo> {
-    return this.#todo(Op.VERSION);
+    return this.#request({ op: Op.VERSION });
   }
 
-  async create(_chat: ChatKey, _group: Bytes): Promise<void> {
-    return this.#todo(Op.NEW);
+  async create(chat: ChatKey, group: Bytes): Promise<void> {
+    await this.#request({ op: Op.NEW, chat, group });
   }
 
   async open(
-    _chat: ChatKey,
-    _group: Bytes,
-    _input: OpenInput
+    chat: ChatKey,
+    group: Bytes,
+    input: OpenInput
   ): Promise<OpenResult> {
-    return this.#todo(Op.OPEN);
+    return this.#request({ op: Op.OPEN, chat, group, input });
   }
 
   async salvage(
-    _chat: ChatKey,
-    _group: Bytes,
-    _input: OpenInput
+    chat: ChatKey,
+    group: Bytes,
+    input: OpenInput
   ): Promise<SalvageResult> {
-    return this.#todo(Op.SALVAGE);
+    return this.#request({ op: Op.SALVAGE, chat, group, input });
   }
 
   async commit(
-    _group: Bytes,
-    _author: Bytes,
-    _nonce: Bytes,
-    _dataMessage: Bytes
-  ): Promise<Bytes> {
-    return this.#todo(Op.COMMIT);
+    group: Bytes,
+    author: Bytes,
+    nonce: Bytes,
+    dataMessage: Bytes
+  ): Promise<CommitResult> {
+    const result = await this.#request({
+      op: Op.COMMIT,
+      group,
+      author,
+      nonce,
+      dataMessage,
+    });
+    if (result.kind === 'ok' && result.opening.length === 0) {
+      // Protocol 1: no opening in the reply.
+      const committed = removeTopLevelFields(dataMessage, new Set([15, 200]));
+      if (committed === undefined) {
+        return { kind: 'malformed' };
+      }
+      return { ...result, opening: concatBytes([nonce, committed]) };
+    }
+    return result;
   }
 
-  async hash(_record: RecordParts): Promise<Digest> {
-    return this.#todo(Op.HASH);
+  async hash(record: RecordParts): Promise<Digest> {
+    return this.#request({ op: Op.HASH, parts: record });
   }
 
-  async accept(_chat: ChatKey, _record: RecordParts): Promise<AcceptResult> {
-    return this.#todo(Op.ACCEPT);
+  async accept(chat: ChatKey, record: RecordParts): Promise<AcceptResult> {
+    const result = await this.#request({ op: Op.ACCEPT, chat, parts: record });
+    if (result.kind === 'accepted' && result.record.length === 0) {
+      // Protocol 1: no record bytes in the reply.
+      return { ...result, record: encodeRecord(makeRecord(record)) };
+    }
+    return result;
   }
 
-  async heads(_chat: ChatKey): Promise<Array<Digest>> {
-    return this.#todo(Op.HEADS);
+  async acceptRecord(
+    chat: ChatKey,
+    record: Bytes,
+    opening?: Bytes
+  ): Promise<AcceptRecordResult> {
+    if (this.#acceptRecordOp !== false) {
+      try {
+        const result = await this.#request({
+          op: Op.ACCEPT_RECORD,
+          chat,
+          record,
+          opening,
+        });
+        this.#acceptRecordOp = true;
+        return result;
+      } catch (error) {
+        if (
+          !(error instanceof ZrdtBackendError) ||
+          error.code !== 'protocol' ||
+          this.#acceptRecordOp === true
+        ) {
+          throw error;
+        }
+        log.warn('zrdtd has no ACCEPT_RECORD; using COMMIT and ACCEPT');
+        this.#acceptRecordOp = false;
+      }
+    }
+    // Protocol 1: decode here, check the opening with COMMIT, then ACCEPT.
+    const parts = decodeRecord(record);
+    if (parts === undefined) {
+      return { kind: 'malformed' };
+    }
+    if (opening !== undefined) {
+      if (opening.length < 32) {
+        return { kind: 'badOpening' };
+      }
+      const check = await this.commit(
+        parts.group,
+        parts.author,
+        opening.subarray(0, 32),
+        opening.subarray(32)
+      );
+      if (
+        check.kind !== 'ok' ||
+        Buffer.compare(Buffer.from(check.commit), Buffer.from(parts.commit)) !==
+          0
+      ) {
+        return { kind: 'badOpening' };
+      }
+    }
+    return this.accept(chat, parts);
   }
 
-  async has(_chat: ChatKey, _digest: Digest): Promise<boolean> {
-    return this.#todo(Op.HAS);
+  async heads(chat: ChatKey): Promise<Array<Digest>> {
+    return this.#request({ op: Op.HEADS, chat });
   }
 
-  async get(_chat: ChatKey, _digest: Digest): Promise<RecordParts | undefined> {
-    return this.#todo(Op.GET);
+  async has(chat: ChatKey, digest: Digest): Promise<boolean> {
+    return this.#request({ op: Op.HAS, chat, digest });
+  }
+
+  async get(chat: ChatKey, digest: Digest): Promise<RecordParts | undefined> {
+    return this.#request({ op: Op.GET, chat, digest });
   }
 
   async reachSet(
-    _chat: ChatKey,
-    _from: ReadonlyArray<Digest>
+    chat: ChatKey,
+    from: ReadonlyArray<Digest>
   ): Promise<Array<Digest>> {
-    return this.#todo(Op.REACH_SET);
+    return this.#request({ op: Op.REACH_SET, chat, from });
   }
 
-  async merge(_chat: ChatKey, _blob: Bytes): Promise<OpenResult> {
-    return this.#todo(Op.MERGE);
+  async merge(chat: ChatKey, blob: Bytes): Promise<OpenResult> {
+    return this.#request({ op: Op.MERGE, chat, blob });
   }
 
   async classify(
-    _chat: ChatKey,
-    _facts: ReadonlyArray<ProvenanceFact>
+    chat: ChatKey,
+    facts: ReadonlyArray<ProvenanceFact>
   ): Promise<Array<RecordStatus>> {
-    return this.#todo(Op.CLASSIFY);
+    return this.#request({ op: Op.CLASSIFY, chat, facts });
   }
 
-  async encode(_chat: ChatKey): Promise<Bytes> {
-    return this.#todo(Op.ENCODE);
+  async encode(chat: ChatKey): Promise<Bytes> {
+    return this.#request({ op: Op.ENCODE, chat });
   }
 
-  async close(_chat: ChatKey): Promise<void> {
-    return this.#todo(Op.CLOSE);
+  async close(chat: ChatKey): Promise<void> {
+    await this.#request({ op: Op.CLOSE, chat });
   }
 }

@@ -238,9 +238,11 @@ describe('zrdt daemon backend', () => {
       }
     });
 
-    it('does not encode op bodies yet (pending Proto.lean)', async () => {
+    it('fails closed on a reply the op cannot give', async () => {
+      // The fake daemon echoes the frame: tag 0x01 (MISSING) to VERSION.
       backend = fakeDaemon();
-      await assert.isRejected(backend.version(), /TODO\(zrdt\)/);
+      await assert.isRejected(backend.version(), /unavailable/);
+      assert.isFalse(backend.isAvailable());
     });
   });
 });
