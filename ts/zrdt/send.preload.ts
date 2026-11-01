@@ -37,7 +37,7 @@ import type {
   ZrdtMetaSendType,
 } from '../textsecure/SendMessage.preload.ts';
 import { ACI_BYTES, GROUP_ID_BYTES, NONCE_BYTES } from './ZrdtBackend.std.ts';
-import { isZrdtRecordMessage } from './scope.std.ts';
+import { getZrdtOutOfScopeReason, isZrdtRecordMessage } from './scope.std.ts';
 import { zrdtService } from './service.preload.ts';
 import type { ConversationModel } from '../models/conversations.preload.ts';
 import type { MessageModel } from '../models/messages.preload.ts';
@@ -267,6 +267,17 @@ export async function freezeZrdtSend(
     log.warn(`${logId}: Content changed on decode → encode; froze the second`);
   }
   strictAssert(dataMessage.zrdt, 'zrdt: built DataMessage has no zrdt');
+  // Receivers apply the same predicate to the DataMessage they decrypt; a
+  // mismatch here means they would ignore ZrdtMeta and later messages that
+  // link this one would show gaps.
+  const outOfScope = getZrdtOutOfScopeReason({
+    isGroupV2: true,
+    isEdit: false,
+    dataMessage,
+  });
+  if (outOfScope !== undefined) {
+    log.error(`${logId}: built DataMessage is out of scope (${outOfScope})`);
+  }
 
   const frozen: ZrdtSendAttributesType = {
     links: links.map(link => Bytes.toHex(link)),
