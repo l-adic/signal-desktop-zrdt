@@ -209,7 +209,7 @@ say "env:      ZRDT_REQUIRE_LEAN=1 ZRDT_RESEND_DELAY_MS=$ZRDT_RESEND_DELAY_MS ZR
 cd "$ROOT" || die "cannot cd to $ROOT"
 
 if [ "$MODE" = smoke ]; then
-  say "smoke test (beats 1-3); artifacts in $ROOT/demo/artifacts/smoke"
+  say "smoke test (beats 1-5); artifacts in $ROOT/demo/artifacts/smoke"
   node --import tsx demo/smoke.ts
   rc=$?
   kill_ours
