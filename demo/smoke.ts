@@ -338,7 +338,7 @@ async function beat2(
   await attempt('beat2 Carol shows a gap row', 'zrdt', async () => {
     const carolConv = await conversationId(demo, carol);
     const deadline = Date.now() + GAP_VISIBLE_MS;
-    let rows = 0;
+    let rows: number | string = 'n/a (no hook)';
     let onScreen = false;
     while (Date.now() < deadline && !onScreen) {
       // oxlint-disable-next-line no-await-in-loop

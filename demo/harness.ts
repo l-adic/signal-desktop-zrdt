@@ -426,8 +426,10 @@ export async function hook<T>(
 
 /** `m`'s conversation id for the group (each desktop has its own). */
 export async function conversationId(demo: Demo, m: Member): Promise<string> {
+  // Only window.SignalCI reaches the page (contextBridge); it looks up by
+  // group id too.
   const id = await page(m).evaluate(
-    `window.ConversationController.get(${JSON.stringify(demo.group.id)})?.id`
+    `window.SignalCI.getConversationId(${JSON.stringify(demo.group.id)})`
   );
   if (typeof id !== 'string') {
     throw new Error(`${m.display} has no conversation for the group`);
@@ -441,15 +443,9 @@ export async function conversationId(demo: Demo, m: Member): Promise<string> {
  */
 export async function dumpPath(demo: Demo, m: Member): Promise<string> {
   const conv = await conversationId(demo, m);
-  let userData: unknown;
-  try {
-    userData = await page(m).evaluate(
-      "window.SignalContext.getPath('userData')"
-    );
-  } catch {
-    userData = undefined;
-  }
-  const dir = typeof userData === 'string' ? userData : m.storagePath;
+  // userData is the profile directory (config storagePath); SignalContext
+  // is not reachable from the page.
+  const dir = m.storagePath;
   if (!dir) {
     throw new Error(`no profile directory for ${m.display}`);
   }
