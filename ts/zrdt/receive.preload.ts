@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 // The zrdt receive path (APP.md §5): accept every in-scope group DataMessage
-// as a record, place gap rows for what its links reveal, drain the pending
-// buffer, and re-enter relayed messages into Desktop.
+// as a record, place gap rows for what its links reveal, and re-enter relayed
+// messages into Desktop. The service persists and drains the pending buffer
+// (zrdt_pending) itself; this module reacts to its 'accepted' and 'classify'
+// events.
 //
 // The host never hashes and never decides acceptance: zrdtService (the Lean
 // daemon, or the stub) does. This module routes bytes and keeps the timeline
@@ -43,7 +45,7 @@ import { isZrdtRecordMessage } from './scope.std.ts';
 import type { ZrdtReceiveInfo } from './receiveInfo.std.ts';
 import { decideRelayAction, relayProvenance } from './resendLogic.std.ts';
 import { zrdtEvents, zrdtService } from './service.preload.ts';
-import type { ZrdtAcceptOutcome, ZrdtProvenance } from './service.preload.ts';
+import type { ZrdtProvenance } from './service.preload.ts';
 import { requestAuthorCopy, zrdtResendScheduler } from './resend.preload.ts';
 
 const { isEqual } = lodash;
@@ -52,7 +54,7 @@ const log = createLogger('zrdt/receive');
 
 const NONCE_BYTES = 32;
 
-// Bytes as the service contract passes them (any backing buffer).
+// Any backing buffer (the UI may pass plain Uint8Arrays).
 // oxlint-disable-next-line typescript/no-unnecessary-type-arguments
 export type ZrdtBytes = Uint8Array<ArrayBufferLike>;
 
@@ -86,191 +88,52 @@ function getOurAci(): AciString {
   return itemStorage.user.getCheckedAci();
 }
 
-// Forward-compatible read of fields a later service may add to an outcome
-// (the record's own digest and bytes on MISSING; see TODO below).
-function optionalBytes(value: object, key: string): ZrdtBytes | undefined {
-  const field = (value as Record<string, unknown>)[key];
-  return field instanceof Uint8Array ? field : undefined;
-}
-
 function getGroupConversation(
-  groupId: ZrdtBytes
+  groupId: Uint8Array<ArrayBuffer>
 ): ConversationModel | undefined {
   return window.ConversationController.get(Bytes.toBase64(own(groupId)));
 }
 
-// --- pending buffer ---------------------------------------------------------------
+// --- pending -------------------------------------------------------------------------
 
-// TODO(zrdt T0): the service's MISSING outcome carries only the missing links.
-// With the record's own digest and bytes (`digest`, `record`) the pending row
-// can be persisted as STORE designed it (zrdt_pending) and a pending record can
-// be excluded from later gaps. Until then pending entries live in memory, so a
-// restart loses them; the links then show as gaps and are fetched again.
-type PendingInput =
-  | Readonly<{
-      kind: 'incoming';
-      groupId: ZrdtBytes;
-      authorAci: ZrdtBytes;
-      nonce: ZrdtBytes;
-      dataMessageBytes: ZrdtBytes;
-      links: Array<ZrdtBytes>;
-      disown: Array<ZrdtBytes>;
-    }>
-  | Readonly<{
-      kind: 'record';
-      record: ZrdtBytes;
-      opening?: ZrdtBytes;
-      responderAci: AciString;
-    }>;
+// Relayed records that came back MISSING: the service keeps the record in
+// zrdt_pending and drains it later, but not the opening. Kept in memory
+// (TODO(zrdt): a restart loses the opening; the record then resolves
+// structure-only and the author fast path can still bring the content).
+type PendingRelay = Readonly<{
+  opening: Uint8Array<ArrayBuffer> | undefined;
+  responderAci: AciString;
+}>;
+const pendingRelays = new Map<string, PendingRelay>();
 
-type PendingEntry = {
-  key: string;
-  conversationId: string;
-  input: PendingInput;
-  provenance: ZrdtProvenance;
-  messageId?: string;
-  dbDigest?: Uint8Array<ArrayBuffer>;
-};
-
-const pendingByConversation = new Map<string, Map<string, PendingEntry>>();
-const drainChains = new Map<string, Promise<void>>();
-
-function getPending(conversationId: string): Map<string, PendingEntry> {
-  let map = pendingByConversation.get(conversationId);
-  if (!map) {
-    map = new Map();
-    pendingByConversation.set(conversationId, map);
-  }
-  return map;
+async function getPendingDigests(conversationId: string): Promise<Set<string>> {
+  const rows = await DataReader.getZrdtPending(conversationId);
+  return new Set(rows.map(row => toHex(row.digest)));
 }
 
-// Returns the key the entry is stored under.
-async function addPending(
-  entry: PendingEntry,
-  outcome: ZrdtAcceptOutcome
-): Promise<string> {
-  const digest = optionalBytes(outcome, 'digest');
-  const record = optionalBytes(outcome, 'record');
-  const keyed = { ...entry, key: digest ? toHex(digest) : entry.key };
-  getPending(entry.conversationId).set(keyed.key, keyed);
-  if (digest && record) {
-    keyed.dbDigest = own(digest);
-    await DataWriter.insertZrdtPending({
-      conversationId: entry.conversationId,
-      digest: own(digest),
-      record: own(record),
-      messageId: entry.messageId ?? null,
-    });
-  }
-  return keyed.key;
-}
-
-// Retry every pending record until no more go in (APP.md §5 step 2).
-export function drainPending(conversationId: string): Promise<void> {
-  const previous = drainChains.get(conversationId);
-  const next = (async () => {
-    await previous;
-    await doDrain(conversationId);
-  })();
-  drainChains.set(
-    conversationId,
-    (async () => {
-      try {
-        await next;
-      } catch (error) {
-        log.error('drainPending failed', Errors.toLogFormat(error));
-      }
-    })()
-  );
-  return next;
-}
-
-async function doDrain(conversationId: string): Promise<void> {
-  const pending = getPending(conversationId);
-  let progress = true;
-  while (progress && pending.size > 0) {
-    progress = false;
-    for (const entry of [...pending.values()]) {
-      // oxlint-disable-next-line no-await-in-loop
-      const outcome = await retryPending(entry);
-      if (outcome.status === 'missing') {
-        continue;
-      }
-      pending.delete(entry.key);
-      if (entry.dbDigest) {
-        // oxlint-disable-next-line no-await-in-loop
-        await DataWriter.deleteZrdtPending(conversationId, [entry.dbDigest]);
-      }
-      if (outcome.status !== 'accepted') {
-        log.warn(`drain: pending record refused: ${outcome.status}`);
-        continue;
-      }
-      progress = true;
-      // oxlint-disable-next-line no-await-in-loop
-      await onPendingAccepted(entry, outcome);
-    }
-  }
-}
-
-function retryPending(entry: PendingEntry): Promise<ZrdtAcceptOutcome> {
-  const { input, conversationId, provenance } = entry;
-  if (input.kind === 'incoming') {
-    return zrdtService.acceptIncoming(conversationId, {
-      groupId: input.groupId,
-      authorAci: input.authorAci,
-      nonce: input.nonce,
-      dataMessageBytes: input.dataMessageBytes,
-      links: input.links,
-      provenance,
-    });
-  }
-  return zrdtService.acceptRecord(conversationId, {
-    record: input.record,
-    opening: input.opening,
-    provenance,
-  });
-}
-
-async function onPendingAccepted(
-  entry: PendingEntry,
-  outcome: Extract<ZrdtAcceptOutcome, { status: 'accepted' }>
-): Promise<void> {
-  const { conversationId, input } = entry;
-  const digest = toHex(outcome.digest);
-  log.info(`drain: accepted ${digest.slice(0, 8)}`);
-  if (input.kind === 'record') {
-    await onRelayAccepted({
-      conversationId,
-      outcome,
-      responderAci: input.responderAci,
-      opening: input.opening,
-    });
+// The service emits 'accepted' for every record it stores, including pending
+// records it drains after another accept.
+function onAcceptedEvent(conversationId: string, digest: string): void {
+  zrdtResendScheduler.resolved(conversationId, digest);
+  const key = `${conversationId}:${digest}`;
+  const relay = pendingRelays.get(key);
+  if (relay) {
+    pendingRelays.delete(key);
+    drop(afterDrainedRelay(conversationId, digest, relay));
     return;
   }
-  zrdtResendScheduler.resolved(conversationId, digest);
-  const authorAci = aciFromBytes(input.authorAci);
-  if (authorAci) {
-    await recordDisown(conversationId, authorAci, input.disown);
+  drop(resolveGapsForShownMessage(conversationId, digest));
+}
+
+let listening = false;
+// Called at startup (background.preload.ts) and on first use.
+export function initZrdtReceive(): void {
+  if (listening) {
+    return;
   }
-  if (entry.messageId) {
-    const message = await getMessageById(entry.messageId);
-    if (message) {
-      message.set({
-        zrdtDigest: digest,
-        zrdtOpening: outcome.opening
-          ? Bytes.toBase64(own(outcome.opening))
-          : message.get('zrdtOpening'),
-        zrdtProvenance: { kind: 'live' },
-      });
-      await window.MessageCache.saveMessage(message.attributes);
-    }
-  }
-  // Another message's gap may have been waiting for this one.
-  for (const gap of await findGapsFor(conversationId, digest)) {
-    // oxlint-disable-next-line no-await-in-loop
-    await resolveGapRow(gap, digest, { kind: 'content' });
-  }
-  scheduleStatusRefresh(conversationId);
+  listening = true;
+  zrdtEvents.on('accepted', onAcceptedEvent);
+  zrdtEvents.on('classify', scheduleStatusRefresh);
 }
 
 // --- the live step (MessageReceiver) ----------------------------------------------
@@ -297,11 +160,11 @@ export async function zrdtReceiveLive({
   receivedAtDate,
 }: Readonly<{
   logId: string;
-  groupId: ZrdtBytes | undefined;
+  groupId: Uint8Array<ArrayBuffer> | undefined;
   senderAci: AciString;
   isSync: boolean;
   dataMessage: Proto.DataMessage;
-  dataMessageBytes: ZrdtBytes | undefined;
+  dataMessageBytes: Uint8Array<ArrayBuffer> | undefined;
   receivedAtCounter: number;
   receivedAtDate: number;
 }>): Promise<ZrdtLiveStepResult | undefined> {
@@ -309,6 +172,7 @@ export async function zrdtReceiveLive({
   if (meta == null || groupId == null || !isZrdtRecordMessage(dataMessage)) {
     return undefined;
   }
+  initZrdtReceive();
   try {
     if (!dataMessageBytes) {
       log.warn(`${logId}: zrdt present but no DataMessage bytes; skipped`);
@@ -332,88 +196,82 @@ export async function zrdtReceiveLive({
     const conversationId = conversation.id;
     await zrdtService.ensureConversation(conversationId, groupId);
 
-    const input: PendingInput = {
-      kind: 'incoming',
+    const outcome = await zrdtService.acceptIncoming(conversationId, {
       groupId,
       authorAci: uuidToBytes(authorAci),
       nonce: meta.nonce,
       dataMessageBytes,
       links: meta.links,
-      disown: meta.disown,
-    };
-    const outcome = await zrdtService.acceptIncoming(conversationId, {
-      groupId: input.groupId,
-      authorAci: input.authorAci,
-      nonce: input.nonce,
-      dataMessageBytes: input.dataMessageBytes,
-      links: input.links,
       provenance: { kind: 'live' },
     });
 
-    if (outcome.status === 'accepted') {
-      const digest = toHex(outcome.digest);
-      log.info(`${logId}: zrdt accepted ${digest.slice(0, 8)}`);
-      zrdtResendScheduler.resolved(conversationId, digest);
-      await recordDisown(conversationId, authorAci, meta.disown);
-      // A gap row waiting for this digest: the message takes its place.
-      const gaps = await findGapsFor(conversationId, digest);
-      const first = gaps[0];
-      drop(drainPending(conversationId));
-      return {
-        info: {
-          conversationId,
-          digest,
-          opening: outcome.opening
-            ? Bytes.toBase64(own(outcome.opening))
-            : undefined,
-          resolvesGapIds: gaps.map(gap => gap.id),
-        },
-        receivedAtCounter: first?.get('received_at') ?? receivedAtCounter,
-        receivedAtDate: first?.get('received_at_ms') ?? receivedAtDate,
-      };
+    if (outcome.status !== 'accepted' && outcome.status !== 'missing') {
+      // COLLISION, WRONG_CHAT, TOO_LARGE, MALFORMED: drop the record, log.
+      // TODO(zrdt): COLLISION should show the message with its digest
+      // (APP.md §5 step 4); it never fires with SHA-256.
+      log.warn(`${logId}: zrdt record refused: ${outcome.status}`);
+      return undefined;
     }
 
-    if (outcome.status === 'missing') {
-      const missing = outcome.digests.map(toHex);
+    const digest = outcome.digest ? toHex(outcome.digest) : undefined;
+    const opening = outcome.opening
+      ? Bytes.toBase64(own(outcome.opening))
+      : undefined;
+    let missing: Array<string> = [];
+    if (outcome.status === 'accepted') {
+      log.info(`${logId}: zrdt accepted ${digest?.slice(0, 8)}`);
+      await recordDisown(conversationId, authorAci, meta.disown);
+    } else {
+      // Records waiting in zrdt_pending are held here, just not linked up
+      // yet: they are not gaps.
+      const pending = await getPendingDigests(conversationId);
+      missing = outcome.digests.map(toHex).filter(d => !pending.has(d));
       log.info(
-        `${logId}: zrdt missing ${missing.map(d => d.slice(0, 8)).join(',')}`
+        `${logId}: zrdt pending ${digest?.slice(0, 8)}; missing: ${missing.length}`
       );
-      const key = await addPending(
-        {
-          key: `nonce:${toHex(meta.nonce)}`,
-          conversationId,
-          input,
-          provenance: { kind: 'live' },
-        },
-        outcome
-      );
-      // Ask the member whose message referenced them, after the delay; a
-      // sync transcript of ours goes to the group.
-      zrdtResendScheduler.schedule(
-        conversationId,
-        missing,
-        isSync ? undefined : senderAci
-      );
-      return {
-        info: {
+      // TODO(zrdt): the disown list of a pending live message is applied
+      // only by the author's next message (every message carries the set).
+      if (missing.length > 0) {
+        // Ask the member whose message referenced them, after the delay; a
+        // sync transcript of ours goes to the group.
+        zrdtResendScheduler.schedule(
           conversationId,
           missing,
-          gapReceivedAt: receivedAtCounter,
-          gapReceivedAtMs: receivedAtDate,
-          pendingKey: key,
-        },
-        // Restamp: the gap row takes the old counter, so the message sorts
-        // below it and recovered messages land in between.
-        receivedAtCounter: incrementMessageCounter(),
-        receivedAtDate,
-      };
+          isSync ? undefined : senderAci
+        );
+      }
     }
 
-    // COLLISION, WRONG_CHAT, TOO_LARGE, MALFORMED: drop the record and log.
-    // TODO(zrdt): COLLISION should show the message with its digest instead
-    // of as a normal message (APP.md §5 step 4); it never fires with SHA-256.
-    log.warn(`${logId}: zrdt record refused: ${outcome.status}`);
-    return undefined;
+    // A gap row waiting for this digest: the message takes its place (and a
+    // new gap for its own missing links goes right above it).
+    const gaps = digest ? await findGapsFor(conversationId, digest) : [];
+    const place = gaps[0];
+    let counter = receivedAtCounter;
+    let date = receivedAtDate;
+    let gapReceivedAt: number | undefined;
+    if (place) {
+      counter = place.get('received_at');
+      date = place.get('received_at_ms') ?? receivedAtDate;
+      gapReceivedAt = counter;
+    } else if (missing.length > 0) {
+      // Restamp: the gap row takes the old counter, so the message sorts
+      // below it and recovered messages land in between.
+      gapReceivedAt = receivedAtCounter;
+      counter = incrementMessageCounter();
+    }
+    return {
+      info: {
+        conversationId,
+        digest,
+        opening,
+        missing: missing.length > 0 ? missing : undefined,
+        gapReceivedAt: missing.length > 0 ? gapReceivedAt : undefined,
+        gapReceivedAtMs: missing.length > 0 ? date : undefined,
+        resolvesGapIds: gaps.map(gap => gap.id),
+      },
+      receivedAtCounter: counter,
+      receivedAtDate: date,
+    };
   } catch (error) {
     log.error(`${logId}: zrdt step failed`, Errors.toLogFormat(error));
     return undefined;
@@ -426,7 +284,7 @@ export async function zrdtReceiveLive({
 async function recordDisown(
   conversationId: string,
   authorAci: AciString,
-  disown: ReadonlyArray<ZrdtBytes>
+  disown: ReadonlyArray<Uint8Array<ArrayBuffer>>
 ): Promise<void> {
   if (disown.length === 0) {
     return;
@@ -461,16 +319,8 @@ export async function zrdtApplyBeforeSave(
       zrdtOpening: info.opening,
       zrdtProvenance: { kind: 'live' },
     });
-    if (info.missing && info.missing.length > 0) {
-      const entry = info.pendingKey
-        ? getPending(info.conversationId).get(info.pendingKey)
-        : undefined;
-      if (entry) {
-        entry.messageId = message.id;
-      }
-      if (info.gapReceivedAt != null) {
-        await createGapRow(conversation, message, info);
-      }
+    if (info.missing && info.missing.length > 0 && info.gapReceivedAt != null) {
+      await createGapRow(conversation, message, info);
     }
     if (info.digest) {
       for (const id of info.resolvesGapIds ?? []) {
@@ -525,6 +375,33 @@ export async function zrdtOnDuplicate(
     log.error('zrdtOnDuplicate failed', Errors.toLogFormat(error));
   }
   return 'drop';
+}
+
+// A pending record (its message already shown) was drained: the gaps that
+// were waiting for it are answered.
+async function resolveGapsForShownMessage(
+  conversationId: string,
+  digest: string
+): Promise<void> {
+  try {
+    const gaps = await findGapsFor(conversationId, digest);
+    if (gaps.length === 0) {
+      return;
+    }
+    const gapIds = new Set(gaps.map(gap => gap.id));
+    const rows = await DataReader.getMessageIdsByZrdtDigest(conversationId, [
+      digest,
+    ]);
+    if (!rows.some(row => !gapIds.has(row.messageId))) {
+      return;
+    }
+    for (const gap of gaps) {
+      // oxlint-disable-next-line no-await-in-loop
+      await resolveGapRow(gap, digest, { kind: 'content' });
+    }
+  } catch (error) {
+    log.error('resolveGapsForShownMessage failed', Errors.toLogFormat(error));
+  }
 }
 
 // --- gap rows -------------------------------------------------------------------------
@@ -655,11 +532,12 @@ export async function acceptRelayedRecord({
   record,
   opening,
 }: Readonly<{
-  groupId: ZrdtBytes;
+  groupId: Uint8Array<ArrayBuffer>;
   responderAci: AciString;
-  record: ZrdtBytes;
-  opening: ZrdtBytes | undefined;
+  record: Uint8Array<ArrayBuffer>;
+  opening: Uint8Array<ArrayBuffer> | undefined;
 }>): Promise<void> {
+  initZrdtReceive();
   const conversation = getGroupConversation(groupId);
   if (
     !conversation ||
@@ -687,20 +565,24 @@ export async function acceptRelayedRecord({
     });
   }
   if (outcome.status === 'missing') {
-    const missing = outcome.digests.map(toHex);
+    const digest = outcome.digest ? toHex(outcome.digest) : undefined;
+    if (digest) {
+      pendingRelays.set(`${conversationId}:${digest}`, {
+        opening: usedOpening,
+        responderAci,
+      });
+      // Answered; it now waits for its own links.
+      zrdtResendScheduler.resolved(conversationId, digest);
+    }
+    const pending = await getPendingDigests(conversationId);
+    const missing = outcome.digests.map(toHex).filter(d => !pending.has(d));
     log.info(
-      `relay: record links ${missing.length} more missing digest(s); pending`
+      `relay: ${digest?.slice(0, 8)} pending; asking for ${missing.length} more`
     );
-    await addPending(
-      {
-        key: `relay:${toHex(record)}`,
-        conversationId,
-        input: { kind: 'record', record, opening: usedOpening, responderAci },
-        provenance,
-      },
-      outcome
-    );
-    await zrdtResendScheduler.ask(conversationId, missing, responderAci);
+    // TODO(zrdt): add these digests to the gap row that asked for `digest`.
+    if (missing.length > 0) {
+      await zrdtResendScheduler.ask(conversationId, missing, responderAci);
+    }
     return;
   }
   if (outcome.status !== 'accepted') {
@@ -709,30 +591,70 @@ export async function acceptRelayedRecord({
   }
   await onRelayAccepted({
     conversationId,
-    outcome,
+    digest: outcome.digest,
+    record: outcome.record,
     responderAci,
     opening: usedOpening,
   });
-  drop(drainPending(conversationId));
+}
+
+// A relayed record that was pending got drained by the service (without the
+// opening): check the opening now (idempotent accept), then go on as for a
+// direct relay.
+async function afterDrainedRelay(
+  conversationId: string,
+  digest: string,
+  relay: PendingRelay
+): Promise<void> {
+  try {
+    const digestBytes = Bytes.fromHex(digest);
+    const held = await zrdtService.get(conversationId, digestBytes);
+    if (!held) {
+      return;
+    }
+    let { opening } = relay;
+    if (opening) {
+      const check = await zrdtService.acceptRecord(conversationId, {
+        record: held.record,
+        opening,
+        provenance: { kind: 'relayed', byAci: relay.responderAci },
+      });
+      if (check.status !== 'accepted') {
+        log.warn(`relay: drained ${digest.slice(0, 8)}: ${check.status}`);
+        opening = undefined;
+      }
+    }
+    await onRelayAccepted({
+      conversationId,
+      digest: digestBytes,
+      record: held.record,
+      responderAci: relay.responderAci,
+      opening,
+    });
+  } catch (error) {
+    log.error('afterDrainedRelay failed', Errors.toLogFormat(error));
+  }
 }
 
 async function onRelayAccepted({
   conversationId,
-  outcome,
+  digest: digestBytes,
+  record,
   responderAci,
   opening,
 }: Readonly<{
   conversationId: string;
-  outcome: Extract<ZrdtAcceptOutcome, { status: 'accepted' }>;
+  digest: Uint8Array<ArrayBuffer>;
+  record: Uint8Array<ArrayBuffer>;
   responderAci: AciString;
-  opening: ZrdtBytes | undefined;
+  opening: Uint8Array<ArrayBuffer> | undefined;
 }>): Promise<void> {
   const conversation = window.ConversationController.get(conversationId);
   if (!conversation) {
     return;
   }
-  const digest = toHex(outcome.digest);
-  const held = await zrdtService.get(conversationId, outcome.digest);
+  const digest = toHex(digestBytes);
+  const held = await zrdtService.get(conversationId, digestBytes);
   const authorAci = held ? aciFromBytes(held.authorAci) : undefined;
   if (!authorAci) {
     log.warn(`relay: accepted ${digest.slice(0, 8)} but cannot read author`);
@@ -742,7 +664,7 @@ async function onRelayAccepted({
   if (provenance.kind === 'live') {
     // The author relayed its own record: upgrade (idempotent accept).
     await zrdtService.acceptRecord(conversationId, {
-      record: outcome.record,
+      record,
       provenance,
     });
     await upgradeShownMessage(conversationId, digest);
@@ -751,7 +673,7 @@ async function onRelayAccepted({
   const ourAci = getOurAci();
   const gaps = await findGapsFor(conversationId, digest);
   const ownLive =
-    authorAci === ourAci ? await isLive(conversationId, outcome.digest) : true;
+    authorAci === ourAci ? await isLive(conversationId, digestBytes) : true;
   const action = decideRelayAction({
     authorAci,
     ourAci,
@@ -765,7 +687,7 @@ async function onRelayAccepted({
   log.info(`relay: ${digest.slice(0, 8)} by ${responderAci}: ${action}`);
 
   if (action === 'ownNameAlarm') {
-    await raiseOwnNameAlarm(conversationId, outcome.digest);
+    await raiseOwnNameAlarm(conversationId, digestBytes);
   } else if (action === 'show' && opening) {
     const gap = gaps[0];
     const shown = await showRelayedMessage({
@@ -804,10 +726,10 @@ async function onRelayAccepted({
 
 async function isLive(
   conversationId: string,
-  digest: ZrdtBytes
+  digest: Uint8Array<ArrayBuffer>
 ): Promise<boolean> {
   const rows = await DataReader.getZrdtProvenance(conversationId);
-  const row = rows.find(r => Bytes.areEqual(r.digest, own(digest)));
+  const row = rows.find(r => Bytes.areEqual(r.digest, digest));
   return row?.kind === 'live';
 }
 
@@ -840,7 +762,7 @@ async function upgradeShownMessage(
 // path puts the whole disown set (zrdtService.disownSet) on every message.
 export async function raiseOwnNameAlarm(
   conversationId: string,
-  digest: ZrdtBytes
+  digest: Uint8Array<ArrayBuffer>
 ): Promise<void> {
   const hex = toHex(digest);
   log.warn(`own-name alarm: ${hex.slice(0, 8)} is in our name, not ours`);
@@ -864,7 +786,7 @@ async function showRelayedMessage({
 }: Readonly<{
   conversation: ConversationModel;
   digest: string;
-  opening: ZrdtBytes;
+  opening: Uint8Array<ArrayBuffer>;
   authorAci: AciString;
   provenance: ZrdtProvenance;
   receivedAt: number | undefined;

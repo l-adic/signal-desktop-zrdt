@@ -195,6 +195,7 @@ import {
   onInvalidPlaintextMessage,
   onSuccessfulDecrypt,
 } from './util/handleRetry.preload.ts';
+import { initZrdtReceive } from './zrdt/receive.preload.ts';
 import { themeChanged } from './shims/themeChanged.dom.ts';
 import { createIPCEvents } from './util/createIPCEvents.preload.ts';
 import type { ServiceIdString } from './types/ServiceId.std.ts';
@@ -687,6 +688,10 @@ async function startApp(): Promise<void> {
         drop(onRetryRequestQueue.add(() => onRetryRequest(event)));
       })
     );
+    // zrdt: the resend control messages (Content 200-202) are dispatched by
+    // MessageReceiver itself; this subscribes the receive path to the
+    // service events (accepted, classify).
+    initZrdtReceive();
     messageReceiver.addEventListener(
       'empty',
       queuedEventListener(() => onEmpty({ isFromMessageReceiver: true }))

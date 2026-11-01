@@ -7,19 +7,18 @@
 
 export type ZrdtReceiveInfo = Readonly<{
   conversationId: string;
-  // ACCEPTED: hex digest and base64 opening (nonce ‖ DataMessage without
-  // fields 15 and 200).
+  // The record's hex digest: accepted, or waiting in zrdt_pending (the
+  // service drains it once its links arrive).
   digest?: string;
+  // base64(nonce ‖ DataMessage without fields 15 and 200)
   opening?: string;
-  // MISSING: the hex digests the record links and we lack.
+  // MISSING: the hex digests the record links and nobody here holds (records
+  // waiting in zrdt_pending are left out). A gap row is placed for them.
   missing?: ReadonlyArray<string>;
-  // MISSING: the message's received_at before the restamp; the gap row takes
-  // it (APP.md §6, timeline placement).
+  // The received_at (and _ms) of that gap row (APP.md §6, placement).
   gapReceivedAt?: number;
   gapReceivedAtMs?: number;
-  // MISSING: key of the in-memory pending entry, to attach the message id.
-  pendingKey?: string;
-  // ACCEPTED: gap rows that were waiting for this digest; the message takes
-  // the first one's received_at and they resolve.
+  // Gap rows that were waiting for this digest; the message takes the first
+  // one's received_at and they resolve once it is saved.
   resolvesGapIds?: ReadonlyArray<string>;
 }>;
