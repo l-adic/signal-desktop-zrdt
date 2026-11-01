@@ -81,6 +81,10 @@ import type { ServiceIdString } from '../types/ServiceId.std.ts';
 import { getCachedSubscriptionConfiguration } from '../util/subscriptionConfiguration.preload.ts';
 import { itemStorage } from '../textsecure/Storage.preload.ts';
 import { canConversationBeUnarchived } from '../util/canConversationBeUnarchived.preload.ts';
+import {
+  zrdtApplyBeforeSave,
+  zrdtOnDuplicate,
+} from '../zrdt/receive.preload.ts';
 
 const { isNumber } = lodash;
 
@@ -93,12 +97,14 @@ export async function handleDataMessage(
   message: MessageModel,
   initialMessage: ProcessedDataMessage,
   confirm: () => void,
-  options: { data?: SentEventData } = {},
+  // zrdtRelayed: a message re-entered from a zrdt relay (ts/zrdt/receive):
+  // no group updates, no profile key, no zrdt step (APP.md §5 step 8).
+  options: { data?: SentEventData; zrdtRelayed?: boolean } = {},
   dependencies: {
     saveAndNotify: typeof saveAndNotify;
   }
 ): Promise<void> {
-  const { data } = options;
+  const { data, zrdtRelayed = false } = options;
 
   // This function is called from the background script in a few scenarios:
   //   1. on an incoming message
@@ -137,7 +143,17 @@ export async function handleDataMessage(
           existingMessage.get('storyDistributionListId') ===
             message.attributes.storyDistributionListId));
 
-    if (isDuplicateMessage) {
+    // zrdt: a live copy upgrades a relayed one; a copy whose digest differs
+    // is never dropped silently (APP.md §5 step 10).
+    const zrdtKeepDuplicate =
+      isDuplicateMessage && !zrdtRelayed && existingMessage
+        ? (await zrdtOnDuplicate(
+            existingMessage,
+            initialMessage.zrdtReceive
+          )) === 'keep'
+        : false;
+
+    if (isDuplicateMessage && !zrdtKeepDuplicate) {
       log.warn(
         `${idLog}: Received duplicate message`,
         getMessageIdForLogging(message.attributes)
@@ -231,8 +247,8 @@ export async function handleDataMessage(
       }
     }
 
-    // GroupV2
-    if (initialMessage.groupV2) {
+    // GroupV2 (never from a zrdt relay)
+    if (initialMessage.groupV2 && !zrdtRelayed) {
       if (isGroupV1(conversation.attributes)) {
         // If we received a GroupV2 message in a GroupV1 group, we migrate!
 
@@ -684,7 +700,11 @@ export async function handleDataMessage(
           }
         }
 
-        if (initialMessage.profileKey && !isMe(conversation.attributes)) {
+        if (
+          initialMessage.profileKey &&
+          !isMe(conversation.attributes) &&
+          !zrdtRelayed
+        ) {
           const { profileKey } = initialMessage;
           const ourE164 = itemStorage.user.getOptionalNumber();
           if (
@@ -791,6 +811,14 @@ export async function handleDataMessage(
       if (result === ModifyTargetMessageResult.Deleted) {
         confirm();
         return;
+      }
+
+      if (!zrdtRelayed) {
+        await zrdtApplyBeforeSave(
+          message,
+          conversation,
+          initialMessage.zrdtReceive
+        );
       }
 
       log.info(`${idLog}: Batching save`);
