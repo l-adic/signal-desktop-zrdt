@@ -10,6 +10,7 @@
 //   1. baseline   Alice sends; Bob's and Carol's desktops both show it.
 //   2. drop       dropGroupMsg('alice', 'carol'); Alice sends; Bob gets it,
 //                 Carol does not. Bob replies; Carol gets the reply.
+//                 Alice sends again; the spent rule lets it through.
 //   3. blackhole  blackhole('carol'); Alice sends; Bob gets it, Carol not.
 //   4. hold       hold('carol'); Alice sends; Carol gets it only after
 //                 release('carol').
@@ -412,6 +413,19 @@ async function main(): Promise<void> {
         `alice=${ra} carol=${rc} carol still lacks the dropped one=${stillAbsent}`
       );
       await screenshots(members, '2-drop');
+
+      // The rule is still armed but spent: Alice's next message passes.
+      const next = 'See you all there';
+      const nts = await send(alice, next);
+      const [nb, nc] = await Promise.all([
+        shown(bob, nts, next),
+        shown(carol, nts, next),
+      ]);
+      record(
+        '2c dropGroupMsg fires once',
+        nb && nc,
+        `rules armed=${server.rules.length} bob=${nb} carol=${nc}`
+      );
       server.clearRules();
     }
 
