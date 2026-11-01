@@ -431,8 +431,20 @@ describe('zrdt rung 7: stub vs Lean (vectors.json, zrdtd)', function (this: Moch
       daemon?.dispose();
       daemon = undefined;
     });
+    // Which (op, reply status) pairs the random runs reached.
+    const coverage = new Map<string, number>();
+    after(() => {
+      const line = [...coverage.entries()]
+        .sort(([x], [y]) => x.localeCompare(y))
+        .map(([k, n]) => `${k}: ${n}`)
+        .join(', ');
+      // eslint-disable-next-line no-console
+      console.log(`      coverage: ${line}`);
+    });
 
-    for (const seed of [1, 2, 3, 4]) {
+    // ZRDT_DIFF_SEEDS=n runs seeds 1..n (default 4).
+    const seedCount = Number(process.env.ZRDT_DIFF_SEEDS ?? 4);
+    for (let seed = 1; seed <= seedCount; seed += 1) {
       it(`seed ${seed}: 400 random ops give the same replies`, async () => {
         daemon = new DaemonBackend({ path: ZRDTD });
         const stub = new StubBackend({ env: {} });
@@ -471,6 +483,8 @@ describe('zrdt rung 7: stub vs Lean (vectors.json, zrdtd)', function (this: Moch
             serve(lean, payload, extended),
           ]);
           assert.strictEqual(hex(a), hex(b), `seed ${seed}: ${label}`);
+          const k = `${Op[req.op]} ${Code[a[0] ?? 0] ?? a[0]}`;
+          coverage.set(k, (coverage.get(k) ?? 0) + 1);
           // Learn digests and records from accepted replies.
           if (
             (req.op === Op.ACCEPT || req.op === Op.ACCEPT_RECORD) &&
