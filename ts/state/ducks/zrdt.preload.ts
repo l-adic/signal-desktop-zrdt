@@ -33,6 +33,7 @@ import type {
 } from '../../zrdt/service.preload.ts';
 import { zrdtEvents, zrdtService } from '../../zrdt/service.preload.ts';
 import { requestMissing } from '../../zrdt/resend.preload.ts';
+import { drop } from '../../util/drop.std.ts';
 import type { ZrdtRejectReason } from '../../zrdt/ui/labels.std.ts';
 import type { ZrdtCompareOutcome } from '../../zrdt/ui/ZrdtCompareModal.dom.tsx';
 import {
@@ -616,6 +617,10 @@ function comparePasted(
       const theirName = nameOf(getState(), owner);
       let outcome: ZrdtCompareOutcome;
       const current = getState().zrdt.compare;
+      if (current?.conversationId !== conversationId) {
+        // Closed (or reopened for another chat) while we were asking HAS.
+        return;
+      }
       const wasAsking =
         current?.outcome?.kind === 'you-are-behind' && current.outcome.asking;
       const wasWithheld = current?.outcome?.kind === 'withheld';
@@ -636,7 +641,7 @@ function comparePasted(
       dispatch({
         type: SET_COMPARE,
         payload: {
-          ...compare,
+          ...current,
           ourCode,
           ourWords,
           pastedCode,
@@ -677,15 +682,8 @@ function askCompare(): ZrdtThunk<Promise<void>> {
         outcome: { kind: 'you-are-behind', missing, asking: true },
       },
     });
-    try {
-      await requestMissing(
-        compare.conversationId,
-        missing.map(zrdtFromHex),
-        compare.theirOwner
-      );
-    } catch (error) {
-      log.warn('askCompare: requestMissing failed', Errors.toLogFormat(error));
-    }
+    // The timeout starts now: requestMissing may only resolve after its own
+    // 1:1 and group rounds.
     clearCompareTimer();
     compareTimer = setTimeout(() => {
       compareTimer = undefined;
@@ -702,6 +700,23 @@ function askCompare(): ZrdtThunk<Promise<void>> {
         void dispatch(comparePasted(now.pastedCode, { autoAsk: false }));
       }
     }, getCompareTimeoutMs());
+    // Not awaited: the compare screen (and the CI hook) return at once.
+    drop(
+      (async () => {
+        try {
+          await requestMissing(
+            compare.conversationId,
+            missing.map(zrdtFromHex),
+            compare.theirOwner
+          );
+        } catch (error) {
+          log.warn(
+            'askCompare: requestMissing failed',
+            Errors.toLogFormat(error)
+          );
+        }
+      })()
+    );
   };
 }
 
