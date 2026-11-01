@@ -19,6 +19,14 @@ import { getConversationSelector } from '../state/selectors/conversations.dom.ts
 import { getUserACI } from '../state/selectors/user.std.ts';
 import { labelText } from './ui/labels.std.ts';
 import type { MessageAttributesType } from '../model-types.d.ts';
+import * as Bytes from '../Bytes.std.ts';
+import { SignalService as Proto } from '../protobuf/index.std.ts';
+import {
+  getCatchUpState,
+  getServedLog,
+  requestDigestsFrom,
+} from './resend.preload.ts';
+import type { ZrdtServedLogItem } from './resend.preload.ts';
 
 export type ZrdtCIMessageType = {
   id: string;
@@ -70,7 +78,58 @@ export type ZrdtCIHooks = {
   ) => Promise<ZrdtOpenOutcome['status'] | undefined>;
   keepWhatVerifies: (conversationId: string) => Promise<unknown>;
   getInternalResult: () => string | undefined;
+  /** The catch-up of a conversation (JOIN_PLAN §6.1), and whether its store is relative. */
+  catchUpState: (conversationId: string) => Promise<{
+    hasStore: boolean;
+    relative: boolean;
+    reason?: string;
+    asked: Array<string>;
+    answeredBy?: string;
+    replies: number;
+    since: number;
+  }>;
+  /** The SERVE replies this device took for the conversation (kinds and digests). */
+  servedLog: (conversationId: string) => Array<ZrdtServedLogItem>;
+  /** Sends a per-digest SERVE request to one member, now. */
+  requestDigests: (
+    conversationId: string,
+    responderAci: string,
+    digests: Array<string>
+  ) => Promise<void>;
+  /** The zrdt rows of a conversation: records, pending, boundary, provenance (hex). */
+  tables: (conversationId: string) => Promise<{
+    relative: boolean;
+    records: Array<string>;
+    pending: Array<string>;
+    boundary: Array<{ digest: string; voucherAci: string }>;
+    provenance: Array<{ digest: string; kind: string; byAci: string | null }>;
+  }>;
+  /** Every message row of the conversation in the database, with zrdt fields. */
+  allMessages: (conversationId: string) => Promise<Array<ZrdtCIMessageType>>;
+  /** The member ACIs of the conversation (membersV2), as this device sees them. */
+  memberAcis: (conversationId: string) => Array<string>;
+  /**
+   * Every message row in the database (all conversations) whose body, quote
+   * text or zrdt opening's body is exactly one of `texts`.
+   */
+  scanMessages: (texts: Array<string>) => Promise<{
+    scanned: number;
+    hits: Array<{ text: string; id: string; type: string; where: string }>;
+  }>;
 };
+
+/** The body a zrdt opening (nonce ‖ DataMessage) commits, if it decodes. */
+function openingBody(opening: string | undefined): string | undefined {
+  if (opening == null) {
+    return undefined;
+  }
+  try {
+    const bytes = Bytes.fromBase64(opening);
+    return Proto.DataMessage.decode(bytes.subarray(32)).body ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 function toCIMessage(message: MessageAttributesType): ZrdtCIMessageType {
   const state = window.reduxStore.getState();
@@ -193,6 +252,84 @@ export function installZrdtCIHooks(): void {
       return zrdtState().byConversation[conversationId]?.salvage;
     },
     getInternalResult: () => zrdtState().internalResult,
+    catchUpState: async conversationId => {
+      const state = getCatchUpState(conversationId);
+      const [hasStore, relative] = await Promise.all([
+        zrdtService.hasStore(conversationId),
+        zrdtService.isRelative(conversationId),
+      ]);
+      return {
+        hasStore,
+        relative,
+        reason: state?.reason,
+        asked: [...(state?.asked ?? [])],
+        answeredBy: state?.answeredBy,
+        replies: state?.replies ?? 0,
+        since: state?.since.length ?? 0,
+      };
+    },
+    servedLog: conversationId => getServedLog(conversationId),
+    allMessages: async conversationId => {
+      const all = await DataReader._getAllMessages();
+      return all
+        .filter(message => message.conversationId === conversationId)
+        .map(toCIMessage);
+    },
+    memberAcis: conversationId =>
+      (
+        window.ConversationController.get(conversationId)?.get('membersV2') ??
+        []
+      ).map(member => member.aci),
+    requestDigests: async (conversationId, responderAci, digests) =>
+      requestDigestsFrom(conversationId, responderAci, digests),
+    tables: async conversationId => {
+      const [records, pending, boundary, provenance, relative] =
+        await Promise.all([
+          DataReader.getZrdtRecords(conversationId),
+          DataReader.getZrdtPending(conversationId),
+          DataReader.getZrdtBoundary(conversationId),
+          DataReader.getZrdtProvenance(conversationId),
+          zrdtService.isRelative(conversationId),
+        ]);
+      return {
+        relative,
+        records: records.map(row => zrdtHex(row.digest)),
+        pending: pending.map(row => zrdtHex(row.digest)),
+        boundary: boundary.map(row => ({
+          digest: zrdtHex(row.digest),
+          voucherAci: row.voucherAci,
+        })),
+        provenance: provenance.map(row => ({
+          digest: zrdtHex(row.digest),
+          kind: row.kind,
+          byAci: row.byAci,
+        })),
+      };
+    },
+    scanMessages: async texts => {
+      const all = await DataReader._getAllMessages();
+      const hits = new Array<{
+        text: string;
+        id: string;
+        type: string;
+        where: string;
+      }>();
+      for (const message of all) {
+        const places: Array<[string, string | undefined]> = [
+          ['body', message.body],
+          ['quote', message.quote?.text ?? undefined],
+          ['opening', openingBody(message.zrdtOpening)],
+        ];
+        for (const text of texts) {
+          for (const [where, value] of places) {
+            if (value != null && value === text) {
+              hits.push({ text, id: message.id, type: message.type, where });
+            }
+          }
+        }
+      }
+      return { scanned: all.length, hits };
+    },
   };
   setZrdtCIHooks(hooks);
 }

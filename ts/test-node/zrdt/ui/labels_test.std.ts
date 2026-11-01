@@ -7,6 +7,7 @@ import {
   OWN_NAME_ALARM_TEXT,
   UNAVAILABLE_TEXT,
   chooseProvenanceLabel,
+  BOUNDARY_ROW_TEXT,
   contentUnavailableText,
   gapTitle,
   identicalText,
@@ -52,6 +53,15 @@ describe('zrdt/ui/labels', () => {
       contentUnavailableText('Alice'),
       'A message from Alice (content unavailable)'
     );
+    // JOIN_PLAN §4.4: who sent the structure, never "not sent to you".
+    assert.strictEqual(
+      contentUnavailableText('Carol', 'Alice'),
+      'A message from Carol (content not available from Alice)'
+    );
+    assert.strictEqual(
+      BOUNDARY_ROW_TEXT,
+      'Earlier messages: not available to you'
+    );
   });
 
   it('words the compare outcomes as in the demo', () => {
@@ -81,6 +91,8 @@ describe('zrdt/ui/labels', () => {
     const texts = [
       gapTitle(1, 'Bob'),
       contentUnavailableText('Alice'),
+      contentUnavailableText('Carol', 'Alice'),
+      BOUNDARY_ROW_TEXT,
       withheldText('Bob', [K7F2]),
       youAreBehindText('Bob', [K7F2]),
       identicalText('Bob'),

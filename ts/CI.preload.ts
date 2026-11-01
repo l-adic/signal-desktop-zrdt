@@ -103,6 +103,13 @@ const ZRDT_CI_HOOK_NAMES = Object.keys({
   importStore: true,
   keepWhatVerifies: true,
   getInternalResult: true,
+  catchUpState: true,
+  servedLog: true,
+  requestDigests: true,
+  tables: true,
+  allMessages: true,
+  memberAcis: true,
+  scanMessages: true,
 } satisfies Record<keyof ZrdtCIHooks, true>) as Array<keyof ZrdtCIHooks>;
 
 type AnyHookType = (...args: ReadonlyArray<unknown>) => unknown;

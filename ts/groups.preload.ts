@@ -144,6 +144,7 @@ import { registrationJobQueue } from './jobs/registrationJobQueue.preload.ts';
 import Actions = Proto.GroupChange.Actions;
 import AccessRequired = Proto.AccessControl.AccessRequired;
 import MemberRole = Proto.Member.Role;
+import { runZrdtGroupUpdateHook } from './zrdt/groupHook.std.ts';
 
 const { compact, difference, flatten, fromPairs, isNumber, omit, values } =
   lodash;
@@ -3167,9 +3168,26 @@ export async function maybeUpdateGroup(
       dropInitialJoinMessage,
     });
 
+    // zrdt (JOIN_PLAN §6.1, §6.5): who was a member before this update.
+    const zrdtPreviousMemberAcis = (conversation.get('membersV2') ?? []).map(
+      member => member.aci
+    );
+    const zrdtWasMember = conversation.areWeAGroupMember();
+
     await updateGroup(
       { conversation, receivedAt, sentAt, serverGuid, updates },
       { viaFirstStorageSync }
+    );
+
+    // zrdt: catch-up for a group we have no store for; our `since` for
+    // members a Signal message from the remover removed; a re-add.
+    drop(
+      runZrdtGroupUpdateHook({
+        conversation,
+        previousMemberAcis: zrdtPreviousMemberAcis,
+        wasMember: zrdtWasMember,
+        viaSignalMessage: groupChange != null,
+      })
     );
   } catch (error) {
     log.error(`${logId}: Failed to update group:`, Errors.toLogFormat(error));

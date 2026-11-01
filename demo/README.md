@@ -15,7 +15,7 @@ Everything here runs from the repository root with Node 24 and `tsx`. Build
 | `harness.ts` | the demo world: four phones (Alice, Bob, Carol, Dave), group "Camping", link, tile, warm-up, restart, teardown                                                     |
 | `launch.ts`  | the live demo: links Alice, Bob, Carol; warms up; starts the panel; links Dave on demand                                                                           |
 | `doctor.ts`  | beats 4 and 5: edits an exported store                                                                                                                             |
-| `smoke.ts`   | the F2 go/no-go test: beats 1–5 through the harness and the panel                                                                                                  |
+| `smoke.ts`   | the F2 go/no-go test: beats 1–5 through the harness and the panel, then beat 6 (a member added later catches up, JOIN_PLAN)                                        |
 
 ## Live demo
 
@@ -106,7 +106,7 @@ up).
 
 ```sh
 node --import tsx --test demo/*_test.ts          # rules, panel, doctor (+ zrdtd)
-node --import tsx demo/smoke.ts                  # launches three desktops
+node --import tsx demo/smoke.ts                  # launches up to five desktops
 ```
 
 `smoke.ts` tags each check `harness` or `zrdt`, writes
@@ -115,3 +115,14 @@ node --import tsx demo/smoke.ts                  # launches three desktops
 `ZRDT_SMOKE_BEATS=1,2` runs a subset (beat 1 always runs). It drives beats 4
 and 5 through the zrdt hooks (export, import) and doctor.ts in-process, and
 clicks the banner's "Keep what verifies".
+
+The smoke's group differs from the live demo's: Erin, not Dave, is the fourth
+member from the start and imports in beat 5; Dave joins only in beat 6. There
+`addToGroup` (harness.ts) adds him the way Alice's phone would: the mock has
+no `addMembers` change of its own, so the harness applies one to the server's
+group (signed by the server) and sends the group update to every linked
+desktop. Dave then links a desktop with no store. It catches up from Alice
+(sealed SERVE replies into a relative store), and the beat checks that it
+holds every message sent after the add, a boundary row, no pre-join content in
+its messages table, zrdt tables or window, the same heads as Alice; and that a
+pre-join digest Dave asks for by itself comes back as a bare digest.

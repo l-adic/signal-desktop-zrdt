@@ -128,6 +128,15 @@
   font-style: italic;
 }
 
+// A newcomer's boundary row (JOIN_PLAN §6.3): history before his first
+// message, which he was not sent.
+.ZrdtGapRow--boundary {
+  color: var(--zrdt-fg-muted, #6b6b6b);
+  border-top: 1px dashed var(--zrdt-fg-muted, #6b6b6b);
+  border-bottom: 1px dashed var(--zrdt-fg-muted, #6b6b6b);
+  justify-content: center;
+}
+
 .ZrdtGapRow__title {
   font-weight: 500;
 }

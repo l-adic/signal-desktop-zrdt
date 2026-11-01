@@ -23,9 +23,11 @@ import { drop } from '../util/drop.std.ts';
 import type { AciString } from '../types/ServiceId.std.ts';
 import type {
   UpsertZrdtProvenanceOptionsType,
+  ZrdtBoundaryRowType,
   ZrdtPendingRowType,
   ZrdtProvenanceRowType,
   ZrdtRecordRowType,
+  ZrdtStoreModeType,
 } from '../types/Zrdt.std.ts';
 import { PROTOCOL_VERSION, ZrdtBackendError } from './ZrdtBackend.std.ts';
 import type {
@@ -35,9 +37,11 @@ import type {
   ProvenanceFact,
   RecordParts,
   SalvageResult,
+  ServeEntry,
   ServeReply,
   ServeRequest,
   Status,
+  ViewResult,
   ZrdtBackend,
 } from './ZrdtBackend.std.ts';
 import {
@@ -45,6 +49,7 @@ import {
   encodeRecord,
   makeRecord,
 } from './backends/stub.node.ts';
+import { readBlob3Header } from './blob.std.ts';
 
 const log = createLogger('zrdt/service');
 
@@ -132,6 +137,23 @@ export type ZrdtGetResult = {
   commit: Bytes;
 };
 
+/**
+ * One SERVE entry to take with ACCEPT_VIEW, and the provenance its record
+ * gets if it is stored (host state, A8: `live` only for an author copy from
+ * the record's own author).
+ */
+export type ZrdtViewItem = Readonly<{
+  entry: ServeEntry;
+  provenance: ZrdtProvenance;
+}>;
+
+/** What ACCEPT_VIEW did with one item, in item order. */
+export type ZrdtViewOutcome = Readonly<{
+  result: ViewResult;
+  // The record entry's record was stored by this call (not held before).
+  isNew: boolean;
+}>;
+
 export type ZrdtSalvageOutcome =
   | { dropped: Array<Bytes>; missing: Array<Bytes> }
   | ZrdtOpenOutcome;
@@ -194,6 +216,23 @@ export type ZrdtServiceType = {
     aci: Uint8Array<ArrayBuffer>,
     key: Uint8Array<ArrayBuffer>
   ): Promise<Array<Bytes>>;
+  hasStore(conversationId: string): Promise<boolean>;
+  isRelative(conversationId: string): Promise<boolean>;
+  startRelative(
+    conversationId: string,
+    groupId: Uint8Array<ArrayBuffer>
+  ): Promise<ZrdtStoreModeType>;
+  acceptView(
+    conversationId: string,
+    a: Readonly<{
+      voucherAci: string;
+      forImport: boolean;
+      items: ReadonlyArray<ZrdtViewItem>;
+    }>
+  ): Promise<Array<ZrdtViewOutcome>>;
+  linkable(conversationId: string): Promise<Array<Bytes>>;
+  boundary(conversationId: string): Promise<Array<ZrdtBoundaryRowType>>;
+  archive(conversationId: string): Promise<string>;
 };
 
 // ---------------------------------------------------------------------------
@@ -227,6 +266,17 @@ export type ZrdtServiceStorage = Readonly<{
     digests: ReadonlyArray<Uint8Array<ArrayBuffer>>,
     disownedBy: string
   ): Promise<number>;
+  getZrdtStoreMode(conversationId: string): Promise<ZrdtStoreModeType>;
+  setZrdtStoreMode(
+    conversationId: string,
+    mode: ZrdtStoreModeType
+  ): Promise<void>;
+  getZrdtBoundary(conversationId: string): Promise<Array<ZrdtBoundaryRowType>>;
+  insertZrdtBoundary(rows: ReadonlyArray<ZrdtBoundaryRowType>): Promise<number>;
+  archiveZrdtConversation(
+    conversationId: string,
+    archiveId: string
+  ): Promise<void>;
 }>;
 
 export type ZrdtServiceDeps = Readonly<{
@@ -343,9 +393,9 @@ class ZrdtServiceError extends Error {
   }
 }
 
-/** Per conversation: is a store open, or was it rejected at OPEN? */
+/** Per conversation: is a store open (closed or relative), or was it rejected at OPEN? */
 type ConversationState =
-  | { kind: 'open'; group: B }
+  | { kind: 'open'; group: B; relative: boolean }
   | { kind: 'rejected'; group: B; outcome: ZrdtOpenOutcome };
 
 // ---------------------------------------------------------------------------
@@ -544,9 +594,19 @@ export class ZrdtServiceCore implements ZrdtServiceType {
       return;
     }
     await backend.close(conversationId);
-    if (rows.length === 0) {
+    const mode = await this.#deps.storage.getZrdtStoreMode(conversationId);
+    if (mode === 'relative') {
+      if (!(await this.#reopenRelative(conversationId, group, rows))) {
+        return;
+      }
+      await this.#reRecordAudiences(conversationId, rows);
+    } else if (rows.length === 0) {
       await backend.create(conversationId, group);
-      this.#state.set(conversationId, { kind: 'open', group });
+      this.#state.set(conversationId, {
+        kind: 'open',
+        group,
+        relative: false,
+      });
     } else {
       const result = await backend.open(
         conversationId,
@@ -560,10 +620,79 @@ export class ZrdtServiceCore implements ZrdtServiceType {
         this.#emit('rejected', conversationId, outcome);
         return;
       }
-      this.#state.set(conversationId, { kind: 'open', group });
+      this.#state.set(conversationId, {
+        kind: 'open',
+        group,
+        relative: false,
+      });
       await this.#reRecordAudiences(conversationId, rows);
     }
     await this.#drain(conversationId);
+  }
+
+  /**
+   * Re-opens a relative store from its rows: NEW_RELATIVE, the boundary
+   * digests (one ACCEPT_VIEW per voucher), then every record as one batch.
+   * False (and the conversation rejected) if a record does not come back.
+   */
+  async #reopenRelative(
+    conversationId: string,
+    group: B,
+    rows: ReadonlyArray<ZrdtRecordRowType>
+  ): Promise<boolean> {
+    const backend = this.#ready();
+    await backend.createRelative(conversationId, group);
+    const boundary = await this.#deps.storage.getZrdtBoundary(conversationId);
+    const byVoucher = new Map<string, Array<B>>();
+    for (const row of boundary) {
+      const list = byVoucher.get(row.voucherAci) ?? [];
+      list.push(own(row.digest));
+      byVoucher.set(row.voucherAci, list);
+    }
+    for (const [voucher, digests] of byVoucher) {
+      let voucherBytes: B;
+      try {
+        voucherBytes = aciStringToBytes(voucher);
+      } catch {
+        continue;
+      }
+      // oxlint-disable-next-line no-await-in-loop
+      await backend.acceptView(
+        conversationId,
+        voucherBytes,
+        false,
+        digests.map(digest => ({ kind: 'boundary', digest }))
+      );
+    }
+    if (rows.length > 0) {
+      const results = await backend.acceptView(
+        conversationId,
+        new Uint8Array(16),
+        false,
+        rows.map(row => ({ kind: 'after', record: own(row.record) }))
+      );
+      const bad = rows.filter((_row, i) => results[i]?.kind !== 'ok');
+      if (bad.length > 0) {
+        const outcome: ZrdtOpenOutcome = {
+          status: 'unverifiable',
+          unverifiable: bad.map(row => own(row.digest)),
+          missing: [],
+        };
+        log.warn(
+          `zrdt: relative ${conversationId} does not reopen: ${bad.length} record(s)`
+        );
+        await backend.close(conversationId);
+        this.#state.set(conversationId, { kind: 'rejected', group, outcome });
+        this.#emit('rejected', conversationId, outcome);
+        return false;
+      }
+    }
+    this.#state.set(conversationId, { kind: 'open', group, relative: true });
+    log.info(
+      `zrdt: ${conversationId}: relative store, ${rows.length} record(s), ` +
+        `${boundary.length} boundary digest(s)`
+    );
+    return true;
   }
 
   /** Re-sends the openings we hold, so zrdtd records their audiences again. */
@@ -621,7 +750,7 @@ export class ZrdtServiceCore implements ZrdtServiceType {
         throw error;
       }
     }
-    this.#state.set(conversationId, { kind: 'open', group });
+    this.#state.set(conversationId, { kind: 'open', group, relative: false });
     return group;
   }
 
@@ -652,9 +781,12 @@ export class ZrdtServiceCore implements ZrdtServiceType {
 
   // --- reads --------------------------------------------------------------------
 
+  /** HEADS; none (and no store is made) while the conversation has no store. */
   heads(conversationId: string): Promise<Array<Bytes>> {
     return this.#enter(conversationId, async backend => {
-      await this.#ensureKnown(conversationId);
+      if (this.#state.get(conversationId)?.kind !== 'open') {
+        return [];
+      }
       return backend.heads(conversationId);
     });
   }
@@ -1045,6 +1177,193 @@ export class ZrdtServiceCore implements ZrdtServiceType {
     });
   }
 
+  // --- the relative store (JOIN_PLAN sections 4.4, 6) ---------------------------
+
+  /** Whether this device has a store for the conversation (open or rejected). */
+  hasStore(conversationId: string): Promise<boolean> {
+    return this.#enter(conversationId, async () =>
+      this.#state.has(conversationId)
+    );
+  }
+
+  /** Whether the conversation's open store is relative. */
+  isRelative(conversationId: string): Promise<boolean> {
+    return this.#enter(conversationId, async () => {
+      const state = this.#state.get(conversationId);
+      return state?.kind === 'open' && state.relative;
+    });
+  }
+
+  /**
+   * A catch-up starts (JOIN_PLAN §6.1): if the conversation has no store,
+   * NEW_RELATIVE one. Returns the mode of the store it has now (an existing
+   * store keeps its mode: a closed store never becomes relative).
+   */
+  startRelative(
+    conversationId: string,
+    groupId: Uint8Array<ArrayBuffer>
+  ): Promise<ZrdtStoreModeType> {
+    return this.#enter(conversationId, async backend => {
+      const state = this.#state.get(conversationId);
+      if (state?.kind === 'open') {
+        return state.relative ? 'relative' : 'closed';
+      }
+      if (state?.kind === 'rejected') {
+        throw new ZrdtServiceError(
+          'rejected',
+          `${conversationId} does not verify; salvage or import first`
+        );
+      }
+      const group = own(groupId);
+      await backend.close(conversationId);
+      await backend.createRelative(conversationId, group);
+      await this.#deps.storage.setZrdtStoreMode(conversationId, 'relative');
+      this.#state.set(conversationId, { kind: 'open', group, relative: true });
+      log.info(`zrdt: ${conversationId}: new relative store (catch-up)`);
+      return 'relative';
+    });
+  }
+
+  /**
+   * ACCEPT_VIEW: take the entries of a sealed SERVE reply that passed the
+   * §4.4 checks (the caller's duty), vouched by `voucherAci`. Stores a row for
+   * every record that is stored now, with the item's provenance, and a
+   * boundary row for every boundary digest a relative store took; then
+   * drains the pending records.
+   */
+  acceptView(
+    conversationId: string,
+    a: Readonly<{
+      voucherAci: string;
+      forImport: boolean;
+      items: ReadonlyArray<ZrdtViewItem>;
+    }>
+  ): Promise<Array<ZrdtViewOutcome>> {
+    return this.#enter(conversationId, async backend => {
+      await this.#ensureKnown(conversationId);
+      const results = await backend.acceptView(
+        conversationId,
+        aciStringToBytes(a.voucherAci),
+        a.forImport,
+        a.items.map(item => item.entry)
+      );
+      if (results.length !== a.items.length) {
+        throw new ZrdtServiceError(
+          'notAccepted',
+          `ACCEPT_VIEW gave ${results.length} results for ${a.items.length} entries`
+        );
+      }
+      const out = new Array<ZrdtViewOutcome>();
+      const boundaryRows = new Array<ZrdtBoundaryRowType>();
+      const newRecords = new Array<{ digest: B; record: B }>();
+      const provenanceRows = new Array<ZrdtProvenanceRowType>();
+      for (const [i, item] of a.items.entries()) {
+        const result = results[i] ?? { kind: 'malformed' };
+        const { entry } = item;
+        if (result.kind !== 'ok' || entry.kind === 'boundary') {
+          if (result.kind === 'ok' && entry.kind === 'boundary') {
+            boundaryRows.push({
+              conversationId,
+              digest: own(result.digest),
+              voucherAci: a.voucherAci as AciString,
+            });
+          }
+          out.push({ result, isNew: false });
+          continue;
+        }
+        // oxlint-disable-next-line no-await-in-loop
+        const inserted = await this.#deps.storage.insertZrdtRecords([
+          {
+            conversationId,
+            digest: own(result.digest),
+            record: own(entry.record),
+          },
+        ]);
+        provenanceRows.push(
+          provenanceRow(conversationId, result.digest, item.provenance)
+        );
+        if (inserted > 0) {
+          newRecords.push({ digest: own(result.digest), record: entry.record });
+        }
+        out.push({ result, isNew: inserted > 0 });
+      }
+      await this.#deps.storage.upsertZrdtProvenance(provenanceRows);
+      const newBoundary =
+        boundaryRows.length > 0
+          ? await this.#newBoundaryRows(boundaryRows)
+          : [];
+      for (const { digest } of newRecords) {
+        this.#emit('accepted', conversationId, toHex(digest));
+      }
+      if (newBoundary.length > 0) {
+        this.#emit(
+          'boundary',
+          conversationId,
+          newBoundary.map(row => toHex(row.digest))
+        );
+      }
+      await this.#afterAccept(conversationId);
+      return out;
+    });
+  }
+
+  /** Inserts the rows; returns those that were new. */
+  async #newBoundaryRows(
+    rows: ReadonlyArray<ZrdtBoundaryRowType>
+  ): Promise<Array<ZrdtBoundaryRowType>> {
+    const out = new Array<ZrdtBoundaryRowType>();
+    for (const row of rows) {
+      // oxlint-disable-next-line no-await-in-loop
+      if ((await this.#deps.storage.insertZrdtBoundary([row])) > 0) {
+        out.push(row);
+      }
+    }
+    return out;
+  }
+
+  /**
+   * LINKABLE: the links of this device's next record (JOIN_PLAN §6.2). A
+   * closed store: its heads. A relative store: the heads that are records
+   * this device holds live (its own, or an author copy).
+   */
+  linkable(conversationId: string): Promise<Array<Bytes>> {
+    return this.#enter(conversationId, async backend => {
+      await this.#ensureKnown(conversationId);
+      const provenance =
+        await this.#deps.storage.getZrdtProvenance(conversationId);
+      const live = provenance
+        .filter(p => p.kind === 'live')
+        .map(p => own(p.digest));
+      return backend.linkable(conversationId, live);
+    });
+  }
+
+  /**
+   * A re-add (JOIN_PLAN §6.5): the store is closed and its rows move to an
+   * archive key (they stay readable: the store re-opens under that key at
+   * the next start). The conversation then has no store. Returns the key.
+   */
+  archive(conversationId: string): Promise<string> {
+    return this.#enter(conversationId, async backend => {
+      const archiveId = `${conversationId}:archived:${Date.now()}`;
+      await backend.close(conversationId);
+      this.#state.delete(conversationId);
+      await this.#deps.storage.archiveZrdtConversation(
+        conversationId,
+        archiveId
+      );
+      log.info(`zrdt: ${conversationId} archived as ${archiveId}`);
+      return archiveId;
+    });
+  }
+
+  /** The boundary digests of the conversation's relative store, with vouchers. */
+  boundary(conversationId: string): Promise<Array<ZrdtBoundaryRowType>> {
+    return this.#enter(conversationId, async () =>
+      this.#deps.storage.getZrdtBoundary(conversationId)
+    );
+  }
+
   // --- provenance ---------------------------------------------------------------
 
   /**
@@ -1188,6 +1507,35 @@ export class ZrdtServiceCore implements ZrdtServiceType {
   }
 
   /**
+   * A relative store's boundary after a MERGE (which adds the blob's
+   * boundary): read it from ENCODE and keep the digests not yet stored.
+   */
+  async #storeBoundary(
+    backend: ZrdtBackend,
+    conversationId: string
+  ): Promise<void> {
+    const state = this.#state.get(conversationId);
+    if (state?.kind !== 'open' || !state.relative) {
+      return;
+    }
+    const boundary =
+      readBlob3Header(await backend.encode(conversationId))?.boundary ?? [];
+    const rows = boundary.map(({ digest, voucher }) => ({
+      conversationId,
+      digest,
+      voucherAci: aciBytesToString(voucher) as AciString,
+    }));
+    const added = await this.#newBoundaryRows(rows);
+    if (added.length > 0) {
+      this.#emit(
+        'boundary',
+        conversationId,
+        added.map(row => toHex(row.digest))
+      );
+    }
+  }
+
+  /**
    * MERGE a blob into the open store (it is OPENed first by the backend);
    * new records start `imported`, records already held keep their
    * provenance. TODO(zrdt T0): importing into a conversation rejected at
@@ -1205,6 +1553,7 @@ export class ZrdtServiceCore implements ZrdtServiceType {
         return openOutcome(result);
       }
       await this.#storeNew(backend, conversationId, before);
+      await this.#storeBoundary(backend, conversationId);
       await this.#afterAccept(conversationId);
       return { status: 'ok' };
     });
@@ -1283,7 +1632,7 @@ export class ZrdtServiceCore implements ZrdtServiceType {
     if (salvaged.kind !== 'ok') {
       return openOutcome(salvaged);
     }
-    this.#state.set(conversationId, { kind: 'open', group });
+    this.#state.set(conversationId, { kind: 'open', group, relative: false });
     // Rewrite the rows: drop the dropped digests, add kept records that are
     // new (when the input was a blob), all kept records become imported.
     // Exception (T0 decision): records in our own name that were live stay

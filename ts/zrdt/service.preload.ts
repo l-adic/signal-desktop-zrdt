@@ -13,6 +13,8 @@
 // - 'classify' (conversationId): statuses may have changed; call classify();
 // - 'rejected' (conversationId, outcome): extra, a conversation's rows did
 //   not OPEN at start (show the rejected banner; see rejectionOf()).
+// - 'boundary' (conversationId, hexDigests): a relative store took new
+//   boundary digests (JOIN_PLAN §6.2).
 
 import type { EventEmitter } from 'node:events';
 
@@ -33,6 +35,8 @@ export type {
   ZrdtProvenance,
   ZrdtServiceType,
   ZrdtStatus,
+  ZrdtViewItem,
+  ZrdtViewOutcome,
 } from './serviceCore.node.ts';
 
 function groupIdOf(
@@ -65,6 +69,12 @@ const core = new ZrdtServiceCore({
       DataWriter.upsertZrdtProvenance(rows, options),
     markZrdtDisowned: (id, digests, by) =>
       DataWriter.markZrdtDisowned(id, digests, by),
+    getZrdtStoreMode: id => DataReader.getZrdtStoreMode(id),
+    setZrdtStoreMode: (id, mode) => DataWriter.setZrdtStoreMode(id, mode),
+    getZrdtBoundary: id => DataReader.getZrdtBoundary(id),
+    insertZrdtBoundary: rows => DataWriter.insertZrdtBoundary(rows),
+    archiveZrdtConversation: (id, archiveId) =>
+      DataWriter.archiveZrdtConversation(id, archiveId),
   },
   groupIdOf,
   ourAci: () => itemStorage.user.getAci(),

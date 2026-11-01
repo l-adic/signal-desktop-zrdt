@@ -20,8 +20,12 @@
 //   node --import tsx demo/doctor.ts show <export>
 // <out> defaults to <export> with ".doctored" before the extension.
 //
-// Store blob: "zrdtS2" ‖ group(32) ‖ u32 count ‖ (u32 len ‖ record)*, sorted
-// by digest. Record: "zrdt2" ‖ group(32) ‖ commit(32) ‖ u32 nlinks ‖
+// Store blob (protocol 3, zrdt core/Zrdt/ChatStore.lean): "zrdtS3" ‖ mode
+// u8 ‖ u32 n ‖ n × (digest ‖ voucher aci) ‖ u32 m ‖ m × (digest ‖ u32 len ‖
+// field-201 value) ‖ the records as "zrdtS2" ‖ group(32) ‖ u32 count ‖
+// (u32 len ‖ record)*, sorted by digest. The doctor keeps the zrdtS3 header
+// as it is and edits the records part (zrdtd keeps the audiences of stored
+// records only). Record: "zrdt2" ‖ group(32) ‖ commit(32) ‖ u32 nlinks ‖
 // links(32 each) ‖ author(16). Digest = SHA-256 of the record bytes.
 // (docs/PLAN.md §3.4.)
 //
@@ -39,6 +43,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 
 export const BLOB_MAGIC = Buffer.from('zrdtS2', 'ascii');
+export const BLOB3_MAGIC = Buffer.from('zrdtS3', 'ascii');
 export const RECORD_MAGIC = Buffer.from('zrdt2', 'ascii');
 // Every byte buffer here owns its memory (Signal's enforce-array-buffer rule).
 export type Bytes = Buffer<ArrayBuffer>;
@@ -53,7 +58,14 @@ export type StoreBlob = Readonly<{
   group: Bytes;
   // Encoded records, in file order.
   records: ReadonlyArray<Bytes>;
+  // The zrdtS3 header before the records part (mode, boundary, audiences).
+  header?: Bytes;
 }>;
+
+/** The zrdtS3 header of a closed store with no recorded audiences. */
+export function closedHeader(): Bytes {
+  return Buffer.concat([BLOB3_MAGIC, Buffer.alloc(1 + 4 + 4)]);
+}
 
 /** Parses a store blob's framing. `bytes` must be exactly one blob. */
 export function parseBlob(bytes: Uint8Array<ArrayBuffer>): StoreBlob {
@@ -66,11 +78,51 @@ export function parseBlob(bytes: Uint8Array<ArrayBuffer>): StoreBlob {
   return blob;
 }
 
+/** The length of the zrdtS3 header at `offset` (before the records part). */
+function blob3HeaderLength(buf: Bytes, offset: number): number {
+  let at = offset + BLOB3_MAGIC.length + 1;
+  const need = (n: number) => {
+    if (at + n > buf.length) {
+      throw new Error('the zrdtS3 header is cut short');
+    }
+  };
+  need(4);
+  const n = buf.readUInt32BE(at);
+  at += 4;
+  need(n * (DIGEST + ACI));
+  at += n * (DIGEST + ACI);
+  need(4);
+  const m = buf.readUInt32BE(at);
+  at += 4;
+  for (let i = 0; i < m; i += 1) {
+    need(DIGEST + 4);
+    const len = buf.readUInt32BE(at + DIGEST);
+    at += DIGEST + 4;
+    need(len);
+    at += len;
+  }
+  return at - offset;
+}
+
 /** Parses the store blob that starts at `offset`; returns it and its length. */
 export function parseBlobPrefix(
   buf: Bytes,
   offset: number
 ): { blob: StoreBlob; length: number } {
+  if (buf.subarray(offset, offset + BLOB3_MAGIC.length).equals(BLOB3_MAGIC)) {
+    const headerLength = blob3HeaderLength(buf, offset);
+    const inner = parseBlobPrefix(buf, offset + headerLength);
+    if (inner.blob.header !== undefined) {
+      throw new Error('a zrdtS3 blob inside a zrdtS3 blob');
+    }
+    return {
+      blob: {
+        ...inner.blob,
+        header: Buffer.from(buf.subarray(offset, offset + headerLength)),
+      },
+      length: headerLength + inner.length,
+    };
+  }
   let at = offset;
   const need = (n: number, what: string) => {
     if (at + n > buf.length) {
@@ -79,7 +131,7 @@ export function parseBlobPrefix(
   };
   need(BLOB_MAGIC.length + DIGEST + 4, 'its header');
   if (!buf.subarray(at, at + BLOB_MAGIC.length).equals(BLOB_MAGIC)) {
-    throw new Error('not a zrdt store blob (no "zrdtS2" magic)');
+    throw new Error('not a zrdt store blob (no "zrdtS3" or "zrdtS2" magic)');
   }
   at += BLOB_MAGIC.length;
   const group = Buffer.from(buf.subarray(at, at + DIGEST));
@@ -105,7 +157,12 @@ export function parseBlobPrefix(
 export function encodeBlob(blob: StoreBlob): Bytes {
   const head = Buffer.alloc(4);
   head.writeUInt32BE(blob.records.length);
-  const parts: Array<Bytes> = [BLOB_MAGIC, blob.group, head];
+  const parts: Array<Bytes> = [
+    ...(blob.header ? [blob.header] : []),
+    BLOB_MAGIC,
+    blob.group,
+    head,
+  ];
   for (const r of blob.records) {
     const len = Buffer.alloc(4);
     len.writeUInt32BE(r.length);
@@ -294,7 +351,7 @@ export function removeLinkedRecord(
   const removed = victim.digest;
   return {
     blob: {
-      group: blob.group,
+      ...blob,
       records: blob.records.filter(r => hex(digestOf(r)) !== removed),
     },
     removed,
@@ -318,7 +375,10 @@ export type Located = Readonly<{
 }>;
 
 export function locateBlob(file: Bytes): Located {
-  if (file.subarray(0, BLOB_MAGIC.length).equals(BLOB_MAGIC)) {
+  if (
+    file.subarray(0, BLOB_MAGIC.length).equals(BLOB_MAGIC) ||
+    file.subarray(0, BLOB3_MAGIC.length).equals(BLOB3_MAGIC)
+  ) {
     const { length } = parseBlobPrefix(file, 0);
     if (length === file.length) {
       return { blob: file, kind: 'raw', replace: next => next };
@@ -327,10 +387,16 @@ export function locateBlob(file: Bytes): Located {
   const text = file.toString('utf8').trimStart();
   if (text.startsWith('{')) {
     const doc = JSON.parse(text) as unknown;
-    const b64Magic = BLOB_MAGIC.toString('base64').slice(0, 8); // "enJkdFMy"
+    // "enJkdFMz" (zrdtS3), "enJkdFMy" (zrdtS2).
+    const b64Magics = [BLOB3_MAGIC, BLOB_MAGIC].map(m =>
+      m.toString('base64').slice(0, 8)
+    );
     const paths: Array<Array<string | number>> = [];
     const walk = (v: unknown, at: Array<string | number>) => {
-      if (typeof v === 'string' && v.startsWith(b64Magic)) {
+      if (
+        typeof v === 'string' &&
+        b64Magics.some(magic => v.startsWith(magic))
+      ) {
         paths.push(at);
       } else if (Array.isArray(v)) {
         v.forEach((x, i) => walk(x, [...at, i]));
@@ -366,7 +432,8 @@ export function locateBlob(file: Bytes): Located {
       },
     };
   }
-  const at = file.indexOf(BLOB_MAGIC);
+  const at3 = file.indexOf(BLOB3_MAGIC);
+  const at = at3 >= 0 ? at3 : file.indexOf(BLOB_MAGIC);
   if (at < 0) {
     throw new Error('no zrdt store blob in this file');
   }

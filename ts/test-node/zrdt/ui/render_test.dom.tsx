@@ -73,6 +73,29 @@ describe('zrdt/ui render', () => {
       text(unavailable),
       'A message from Alice (content unavailable)'
     );
+
+    const fromResponder = renderToStaticMarkup(
+      <ZrdtGapRow
+        state="content-unavailable"
+        count={1}
+        replierName="Bob"
+        authorName="Carol"
+        responderName="Alice"
+      />
+    );
+    assert.include(
+      text(fromResponder),
+      'A message from Carol (content not available from Alice)'
+    );
+
+    const boundary = renderToStaticMarkup(
+      <ZrdtGapRow state="boundary" count={0} replierName="A member" />
+    );
+    assert.strictEqual(
+      text(boundary),
+      'Earlier messages: not available to you'
+    );
+    assert.include(boundary, 'ZrdtGapRow--boundary');
   });
 
   it('ZrdtProvenanceLabel', () => {

@@ -60,6 +60,17 @@ function concat(parts: ReadonlyArray<Uint8Array<ArrayBuffer>>): Bytes {
   return new Uint8Array(Buffer.concat(parts));
 }
 
+/**
+ * A closed `zrdtS3` blob with no recorded audiences around a records blob
+ * (`zrdtS2`): tag, mode 0, no boundary digests, no audiences.
+ */
+function closed(records: Uint8Array<ArrayBuffer>): Bytes {
+  return concat([ascii('zrdtS3'), Uint8Array.of(0), u32(0), u32(0), records]);
+}
+
+/** The records part of a closed blob without audiences. */
+const CLOSED_HEADER_BYTES = 6 + 1 + 4 + 4;
+
 function sorted(digests: ReadonlyArray<Digest>): Array<string> {
   return [...digests].sort(compareBytes).map(hex);
 }
@@ -471,11 +482,11 @@ describe('zrdt stub', () => {
       return [a, b, c];
     }
 
-    it('encodes "zrdtS2" ‖ group ‖ u32 count ‖ (u32 len ‖ record)*, sorted by digest', async () => {
+    it('encodes zrdtS3 around "zrdtS2" ‖ group ‖ u32 count ‖ (u32 len ‖ record)*, sorted by digest', async () => {
       const stub = newStub();
       await threeRecords(stub);
       const blob = await stub.encode(CHAT);
-      const decoded = decodeBlob(blob);
+      const decoded = decodeBlob(blob.subarray(CLOSED_HEADER_BYTES));
       assert.strictEqual(decoded.kind, 'ok');
       if (decoded.kind !== 'ok') {
         return;
@@ -489,7 +500,7 @@ describe('zrdt stub', () => {
         const encoded = encodeRecord(r);
         expected.push(u32(encoded.length), encoded);
       }
-      assert.deepEqual(blob, concat(expected));
+      assert.deepEqual(blob, closed(concat(expected)));
     });
 
     it('opens what it encodes, to the same store', async () => {
@@ -543,7 +554,11 @@ describe('zrdt stub', () => {
       );
       // A count larger than the records present.
       const moreCount = new Uint8Array(blob);
-      new DataView(moreCount.buffer).setUint32(38, 4, false);
+      new DataView(moreCount.buffer).setUint32(
+        CLOSED_HEADER_BYTES + 38,
+        4,
+        false
+      );
       assert.deepEqual(await stub.open('x', GROUP, moreCount), malformed);
       // A malformed record in a list.
       assert.deepEqual(
@@ -555,19 +570,24 @@ describe('zrdt stub', () => {
 
     it('refuses a count of 2^24 or more without reading further', async () => {
       const stub = newStub();
-      const header = concat([ascii('zrdtS2'), GROUP, u32(RECORD_COUNT_LIMIT)]);
+      const header = closed(
+        concat([ascii('zrdtS2'), GROUP, u32(RECORD_COUNT_LIMIT)])
+      );
       assert.deepEqual(await stub.open('x', GROUP, header), {
         kind: 'tooLarge',
       });
-      const oneLess = concat([
-        ascii('zrdtS2'),
-        GROUP,
-        u32(RECORD_COUNT_LIMIT - 1),
-      ]);
+      const oneLess = closed(
+        concat([ascii('zrdtS2'), GROUP, u32(RECORD_COUNT_LIMIT - 1)])
+      );
       assert.deepEqual(await stub.open('x', GROUP, oneLess), {
         kind: 'malformed',
       });
-      const max = concat([ascii('zrdtS2'), GROUP, u32(0xffffffff)]);
+      // A records blob alone is not a store blob (greenfield: zrdtS3 only).
+      assert.deepEqual(
+        await stub.open('x', GROUP, concat([ascii('zrdtS2'), GROUP, u32(0)])),
+        { kind: 'malformed' }
+      );
+      const max = closed(concat([ascii('zrdtS2'), GROUP, u32(0xffffffff)]));
       assert.deepEqual(await stub.open('x', GROUP, max), { kind: 'tooLarge' });
     });
 
@@ -763,13 +783,15 @@ describe('zrdt stub', () => {
       const holey = [encodeRecord(makeRecord(rec('h', [filled(32, 9)])))];
       const result = await stub.merge(
         CHAT,
-        concat([
-          ascii('zrdtS2'),
-          GROUP,
-          u32(1),
-          u32(holey[0]?.length ?? 0),
-          ...holey,
-        ])
+        closed(
+          concat([
+            ascii('zrdtS2'),
+            GROUP,
+            u32(1),
+            u32(holey[0]?.length ?? 0),
+            ...holey,
+          ])
+        )
       );
       assert.strictEqual(result.kind, 'unverifiable');
 

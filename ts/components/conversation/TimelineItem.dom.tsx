@@ -101,6 +101,7 @@ export type ZrdtGapItemDataType = Readonly<{
   replierName: string;
   referencedByAci?: string;
   authorName?: string;
+  responderName?: string;
 }>;
 type ZrdtGapType = {
   type: 'zrdtGap';

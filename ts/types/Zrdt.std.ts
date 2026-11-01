@@ -39,6 +39,18 @@ export type ZrdtPendingRowType = Readonly<{
   messageId: string | null;
 }>;
 
+// A store is closed (a genesis member's) or relative (created by a catch-up,
+// zrdt docs/JOIN_PLAN.md §6.2).
+export type ZrdtStoreModeType = 'closed' | 'relative';
+
+// A boundary digest of a relative store: no record, vouched for by the member
+// whose sealed SERVE reply carried it.
+export type ZrdtBoundaryRowType = Readonly<{
+  conversationId: string;
+  digest: Uint8Array<ArrayBuffer>;
+  voucherAci: AciString;
+}>;
+
 export type ZrdtProvenanceRowType = Readonly<{
   conversationId: string;
   digest: Uint8Array<ArrayBuffer>;
@@ -88,12 +100,16 @@ export type ZrdtAudienceSnapshotType = Readonly<{
 // 'requested'         a ZrdtResendRequest went out
 // 'still-missing'     NotFound or timeout; UI shows "Ask again"
 // 'content-unavailable' a structure-only relay resolved the links, but there
-//                     is no opening: "a message from <author> (content unavailable)"
+//                     is no opening: "a message from <author> (content not
+//                     available from <responder>)" (JOIN_PLAN §4.4)
+// 'boundary'          not a gap: a relative store's boundary row, "Earlier
+//                     messages: not available to you" (JOIN_PLAN §6.3)
 export type ZrdtGapStateType =
   | 'waiting'
   | 'requested'
   | 'still-missing'
-  | 'content-unavailable';
+  | 'content-unavailable'
+  | 'boundary';
 
 // `message.zrdtGap`: payload of a `type: 'zrdt-gap'` row.
 export type ZrdtGapAttributesType = Readonly<{
@@ -106,6 +122,8 @@ export type ZrdtGapAttributesType = Readonly<{
   lastRequestedAt?: number;
   // Set with state 'content-unavailable'.
   contentUnavailableAuthorAci?: AciString;
+  // The member whose SERVE reply carried the structure without content.
+  contentUnavailableFromAci?: AciString;
 }>;
 
 // `message.zrdtProvenance`: denormalised copy of the zrdt_provenance row for
@@ -148,6 +166,78 @@ export type ZrdtStatusAttributesType = Readonly<{
 //      row (DataWriter.removeMessage) once every missing digest resolved.
 // Read and NotApplicable: a gap row never counts as unread.
 // TODO(zrdt transport): drop @testexport once MessageReceiver calls this.
+// The boundary row of a relative store (JOIN_PLAN §6.3): one per
+// conversation, just above the earliest message a catch-up brought. It holds
+// no digest (the boundary digests are opaque, and never asked for).
+export function makeZrdtBoundaryMessageAttributes({
+  id,
+  conversationId,
+  receivedAt,
+  sentAt,
+}: Readonly<{
+  id: string;
+  conversationId: string;
+  receivedAt: number;
+  sentAt: number;
+}>): MessageAttributesType {
+  return {
+    id,
+    conversationId,
+    type: 'zrdt-gap',
+    received_at: receivedAt,
+    received_at_ms: sentAt,
+    sent_at: sentAt,
+    timestamp: sentAt,
+    readStatus: ReadStatus.Read,
+    seenStatus: SeenStatus.NotApplicable,
+    zrdtGap: {
+      missingDigests: [],
+      referencedBy: '',
+      state: 'boundary',
+    },
+  };
+}
+
+// A record a SERVE reply carried without content (an `after` entry of a
+// catch-up, JOIN_PLAN §6.4): "a message from <author> (content not available
+// from <responder>)", never "not sent to you".
+export function makeZrdtUnavailableMessageAttributes({
+  id,
+  conversationId,
+  receivedAt,
+  sentAt,
+  digest,
+  authorAci,
+  responderAci,
+}: Readonly<{
+  id: string;
+  conversationId: string;
+  receivedAt: number;
+  sentAt: number;
+  digest: string;
+  authorAci: AciString;
+  responderAci: AciString;
+}>): MessageAttributesType {
+  return {
+    id,
+    conversationId,
+    type: 'zrdt-gap',
+    received_at: receivedAt,
+    received_at_ms: sentAt,
+    sent_at: sentAt,
+    timestamp: sentAt,
+    readStatus: ReadStatus.Read,
+    seenStatus: SeenStatus.NotApplicable,
+    zrdtGap: {
+      missingDigests: [digest],
+      referencedBy: '',
+      state: 'content-unavailable',
+      contentUnavailableAuthorAci: authorAci,
+      contentUnavailableFromAci: responderAci,
+    },
+  };
+}
+
 /** @testexport */
 export function makeZrdtGapMessageAttributes({
   id,

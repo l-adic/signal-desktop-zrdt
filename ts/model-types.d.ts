@@ -556,6 +556,10 @@ export type ConversationAttributesType = {
   // zrdt strict mode (JOIN_PLAN §5): SERVE releases content only in author
   // copies. Per group, off by default.
   zrdtStrict?: boolean;
+  // zrdt (JOIN_PLAN §6.5): our heads (hex digests) when a Signal message from
+  // the remover told us that account was removed. SERVE joins them with that
+  // account's `since`.
+  zrdtRemovedSince?: Readonly<Record<string, ReadonlyArray<string>>>;
   pendingMembersV2?: Array<GroupV2PendingMemberType>;
   pendingAdminApprovalV2?: Array<GroupV2PendingAdminApprovalType>;
   bannedMembersV2?: Array<GroupV2BannedMemberType>;

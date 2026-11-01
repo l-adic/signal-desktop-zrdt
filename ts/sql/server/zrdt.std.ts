@@ -8,9 +8,11 @@ import type { ReadableDB, WritableDB } from '../Interface.std.ts';
 import { sql, sqlFragment } from '../util.std.ts';
 import type {
   UpsertZrdtProvenanceOptionsType,
+  ZrdtBoundaryRowType,
   ZrdtPendingRowType,
   ZrdtProvenanceRowType,
   ZrdtRecordRowType,
+  ZrdtStoreModeType,
 } from '../../types/Zrdt.std.ts';
 
 // --- zrdt_records ---------------------------------------------------------------
@@ -81,9 +83,104 @@ export function getZrdtConversationIds(db: ReadableDB): Array<string> {
   const [query, params] = sql`
     SELECT DISTINCT conversationId FROM zrdt_records
     UNION
-    SELECT DISTINCT conversationId FROM zrdt_pending;
+    SELECT DISTINCT conversationId FROM zrdt_pending
+    UNION
+    SELECT conversationId FROM zrdt_stores
+    UNION
+    SELECT DISTINCT conversationId FROM zrdt_boundary;
   `;
   return db.prepare(query, { pluck: true }).all<string>(params);
+}
+
+// --- zrdt_stores, zrdt_boundary (JOIN_PLAN §6.2) --------------------------------
+
+// 'relative' if a catch-up created the conversation's store, else 'closed'.
+export function getZrdtStoreMode(
+  db: ReadableDB,
+  conversationId: string
+): ZrdtStoreModeType {
+  const [query, params] = sql`
+    SELECT mode FROM zrdt_stores WHERE conversationId = ${conversationId};
+  `;
+  const mode = db.prepare(query, { pluck: true }).get<string>(params);
+  return mode === 'relative' ? 'relative' : 'closed';
+}
+
+export function setZrdtStoreMode(
+  db: WritableDB,
+  conversationId: string,
+  mode: ZrdtStoreModeType
+): void {
+  if (mode === 'closed') {
+    const [query, params] = sql`
+      DELETE FROM zrdt_stores WHERE conversationId = ${conversationId};
+    `;
+    db.prepare(query).run(params);
+    return;
+  }
+  const [query, params] = sql`
+    INSERT INTO zrdt_stores (conversationId, mode)
+    VALUES (${conversationId}, ${mode})
+    ON CONFLICT (conversationId) DO UPDATE SET mode = excluded.mode;
+  `;
+  db.prepare(query).run(params);
+}
+
+// The first voucher of a digest stays. Returns the number of new rows.
+export function insertZrdtBoundary(
+  db: WritableDB,
+  rows: ReadonlyArray<ZrdtBoundaryRowType>
+): number {
+  return db.transaction(() => {
+    let inserted = 0;
+    for (const { conversationId, digest, voucherAci } of rows) {
+      const [query, params] = sql`
+        INSERT INTO zrdt_boundary (conversationId, digest, voucherAci)
+        VALUES (${conversationId}, ${digest}, ${voucherAci})
+        ON CONFLICT (conversationId, digest) DO NOTHING;
+      `;
+      inserted += db.prepare(query).run(params).changes;
+    }
+    return inserted;
+  })();
+}
+
+// In insertion order.
+export function getZrdtBoundary(
+  db: ReadableDB,
+  conversationId: string
+): Array<ZrdtBoundaryRowType> {
+  const [query, params] = sql`
+    SELECT conversationId, digest, voucherAci
+    FROM zrdt_boundary
+    WHERE conversationId = ${conversationId}
+    ORDER BY rowid ASC;
+  `;
+  return db.prepare(query).all<ZrdtBoundaryRowType>(params);
+}
+
+// A re-add (JOIN_PLAN §6.5): the conversation's zrdt rows move to
+// `archiveId`, where they stay readable; the conversation starts afresh.
+export function archiveZrdtConversation(
+  db: WritableDB,
+  conversationId: string,
+  archiveId: string
+): void {
+  db.transaction(() => {
+    for (const table of [
+      sqlFragment`zrdt_records`,
+      sqlFragment`zrdt_pending`,
+      sqlFragment`zrdt_provenance`,
+      sqlFragment`zrdt_stores`,
+      sqlFragment`zrdt_boundary`,
+    ]) {
+      const [query, params] = sql`
+        UPDATE ${table} SET conversationId = ${archiveId}
+        WHERE conversationId = ${conversationId};
+      `;
+      db.prepare(query).run(params);
+    }
+  })();
 }
 
 // --- zrdt_pending ---------------------------------------------------------------
@@ -267,6 +364,8 @@ export function deleteZrdtForConversation(
       sqlFragment`zrdt_records`,
       sqlFragment`zrdt_pending`,
       sqlFragment`zrdt_provenance`,
+      sqlFragment`zrdt_stores`,
+      sqlFragment`zrdt_boundary`,
     ]) {
       const [query, params] = sql`
         DELETE FROM ${table} WHERE conversationId = ${conversationId};

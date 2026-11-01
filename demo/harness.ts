@@ -4,10 +4,14 @@
 // The demo world, shared by demo/launch.ts (the live demo) and demo/smoke.ts
 // (the F2 go/no-go test). APP.md §8a, AMENDMENTS A11.
 //
-// One EvilServer; four Bootstraps sharing it (Alice, Bob, Carol, Dave), each
-// with contactCount 0 and its own phone name; a group "Camping" with all four
-// from creation, written into every phone's storage state. Desktops are
-// linked one after another (the mock's provisioning queue is shared).
+// One EvilServer; a Bootstrap per member sharing it, each with contactCount 0
+// and its own phone name; a group "Camping" with the founders from creation,
+// written into their phones' storage states. By default the founders are
+// Alice, Bob, Carol and Dave (demo/launch.ts). The smoke (beat 6) makes Erin a
+// founder and Dave a late joiner: `addToGroup` adds him later through the
+// mock, as Alice's phone would (a server-signed group change, and the group
+// update sent to every device). Desktops are linked one after another (the
+// mock's provisioning queue is shared).
 //
 // Environment for the fork (set by `configureEnv`, kept if already set):
 //   SIGNAL_MOCK_TESTS_BACKGROUND=1  windows do not wait to become visible
@@ -25,8 +29,13 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 
 import { PNG } from 'pngjs';
-import { StorageState } from '@signalapp/mock-server';
-import type { Group } from '@signalapp/mock-server';
+import {
+  EMPTY_DATA_MESSAGE,
+  EMPTY_GROUP_ACTIONS,
+  Group,
+  Proto,
+  StorageState,
+} from '@signalapp/mock-server';
 import type { Page } from 'playwright';
 
 import { Bootstrap } from '../ts/test-mock/bootstrap.node.ts';
@@ -46,7 +55,7 @@ export const REPO = path.resolve(__dirname, '..');
 export const GROUP_VISIBLE_MS = 60_000;
 export const DELIVERY_MS = 30_000;
 
-export type MemberName = 'alice' | 'bob' | 'carol' | 'dave';
+export type MemberName = 'alice' | 'bob' | 'carol' | 'dave' | 'erin';
 
 export type Member = {
   name: MemberName; // rule name, e.g. 'alice'
@@ -59,8 +68,10 @@ export type Member = {
 
 export type Demo = {
   server: EvilServer;
+  // The roster: the founders, then the members who join later.
   members: ReadonlyArray<Member>;
   byName: Readonly<Record<MemberName, Member>>;
+  // Replaced by addToGroup (a new revision).
   group: Group;
   artifacts: string;
   // Every profile directory a desktop of ours used.
@@ -129,48 +140,76 @@ export function linked(demo: Demo): Array<Member> {
   return demo.members.filter(m => m.app !== undefined);
 }
 
-// Every phone gets the group (pinned), the other members as whitelisted
-// contacts, and typing indicators off. helpers.createGroup only writes the
-// creator's state. Typing indicators are sender-key sends to the whole group;
-// a real server tells them apart by their `online` flag, which the mock does
-// not pass on, so they stay off to keep dropGroupMsg aimed at messages.
+// Every phone gets the group (pinned) if it is in the group, the other
+// members as whitelisted contacts, and typing indicators off.
+// helpers.createGroup only writes the creator's state. Typing indicators are
+// sender-key sends to the whole group; a real server tells them apart by
+// their `online` flag, which the mock does not pass on, so they stay off to
+// keep dropGroupMsg aimed at messages.
+async function writeStorageState(
+  m: Member,
+  members: ReadonlyArray<Member>,
+  group: Group | undefined
+): Promise<void> {
+  const { phone } = m.boot;
+  let state = StorageState.getEmpty().updateAccount({
+    profileKey: phone.profileKey.serialize(),
+    givenName: m.display,
+    typingIndicators: false,
+  });
+  if (group) {
+    state = state.addGroup(group, { whitelisted: true }).pinGroup(group);
+  }
+  for (const other of members) {
+    if (other === m) {
+      continue;
+    }
+    const o = other.boot.phone;
+    state = state.addContact(o, {
+      whitelisted: true,
+      e164: o.device.number,
+      identityKey: o.publicKey.serialize(),
+      profileKey: o.profileKey.serialize(),
+      givenName: other.display,
+    });
+  }
+  await phone.setStorageState(state);
+}
+
 async function writeStorageStates(
   members: ReadonlyArray<Member>,
+  founders: ReadonlySet<Member>,
   group: Group
 ): Promise<void> {
   for (const m of members) {
-    const { phone } = m.boot;
-    let state = StorageState.getEmpty().updateAccount({
-      profileKey: phone.profileKey.serialize(),
-      givenName: m.display,
-      typingIndicators: false,
-    });
-    state = state.addGroup(group, { whitelisted: true }).pinGroup(group);
-    for (const other of members) {
-      if (other === m) {
-        continue;
-      }
-      const o = other.boot.phone;
-      state = state.addContact(o, {
-        whitelisted: true,
-        e164: o.device.number,
-        identityKey: o.publicKey.serialize(),
-        profileKey: o.profileKey.serialize(),
-        givenName: other.display,
-      });
-    }
     // oxlint-disable-next-line no-await-in-loop
-    await phone.setStorageState(state);
+    await writeStorageState(m, members, founders.has(m) ? group : undefined);
   }
 }
 
-/** The server, four phones and the group; no desktop yet. */
+const DISPLAY: Readonly<Record<MemberName, string>> = {
+  alice: 'Alice',
+  bob: 'Bob',
+  carol: 'Carol',
+  dave: 'Dave',
+  erin: 'Erin',
+};
+
+/**
+ * The server, the members' phones and the group; no desktop yet. The group
+ * holds `founders` from creation; `late` members have phones and contacts
+ * but join only through `addToGroup`.
+ */
 export async function setUp({
   artifacts,
   verbose = false,
+  founders = ['alice', 'bob', 'carol', 'dave'],
+  late = [],
 }: {
   artifacts: string;
   verbose?: boolean;
+  founders?: ReadonlyArray<MemberName>;
+  late?: ReadonlyArray<MemberName>;
 }): Promise<Demo> {
   await fs.rm(artifacts, { recursive: true, force: true });
   await fs.mkdir(artifacts, { recursive: true });
@@ -185,18 +224,21 @@ export async function setUp({
   await server.listen(0);
   say(`EvilServer listening on port ${server.address().port}`);
 
-  const member = (name: MemberName, display: string): Member => ({
+  const member = (name: MemberName): Member => ({
     name,
-    display,
-    boot: new Bootstrap({ server, contactCount: 0, phoneName: display }),
+    display: DISPLAY[name],
+    boot: new Bootstrap({ server, contactCount: 0, phoneName: DISPLAY[name] }),
   });
-  const byName = {
-    alice: member('alice', 'Alice'),
-    bob: member('bob', 'Bob'),
-    carol: member('carol', 'Carol'),
-    dave: member('dave', 'Dave'),
+  // Every name has a Member; only the roster's phones are set up.
+  const byName: Record<MemberName, Member> = {
+    alice: member('alice'),
+    bob: member('bob'),
+    carol: member('carol'),
+    dave: member('dave'),
+    erin: member('erin'),
   };
-  const members = [byName.alice, byName.bob, byName.carol, byName.dave];
+  const members = [...founders, ...late].map(name => byName[name]);
+  const founding = new Set(founders.map(name => byName[name]));
   const profiles = new Set<string>();
 
   for (const m of members) {
@@ -205,17 +247,183 @@ export async function setUp({
     m.storagePath = path.dirname(m.boot.logsDir);
     profiles.add(m.storagePath);
     const { aci, pni } = m.boot.phone.device;
-    server.addMember(m.name, pni ? [aci, pni] : [aci]);
+    server.addMember(m.name, pni ? [aci, pni] : [aci], {
+      inGroup: founders.includes(m.name),
+    });
   }
 
   const group = await byName.alice.boot.phone.createGroup({
     title: 'Camping',
-    members: members.map(m => m.boot.phone),
+    members: [...founding].map(m => m.boot.phone),
   });
-  await writeStorageStates(members, group);
-  say(`group "Camping" ${group.id} with ${members.length} members`);
+  await writeStorageStates(members, founding, group);
+  say(
+    `group "Camping" ${group.id} with ${founding.size} members` +
+      (late.length > 0 ? ` (${late.join(', ')} not yet)` : '')
+  );
 
   return { server, members, byName, group, artifacts, profiles, cdn3Path };
+}
+
+/**
+ * Adds `joinerName` to the group as `adderName`'s phone would (a real add,
+ * not a group created with him): the server applies a group change that
+ * adds him at the next revision, signed by the server (the mock has no
+ * `addMembers` of its own, so the harness applies it the way the mock
+ * applies its other changes); then the adder's phone sends the group update
+ * with that signed change to every linked desktop, a sync transcript to its
+ * own; and the joiner's phone storage gets the group, so his desktop sees it
+ * when it links. Returns the new revision.
+ */
+export async function addToGroup(
+  demo: Demo,
+  adderName: MemberName,
+  joinerName: MemberName
+): Promise<number> {
+  const adder = demo.byName[adderName];
+  const joiner = demo.byName[joinerName];
+  const { server } = demo;
+  const serverGroup = await server.getGroup(
+    demo.group.publicParams.serialize()
+  );
+  if (!serverGroup) {
+    throw new Error('the group is not on the server');
+  }
+  const version = serverGroup.revision + 1;
+  const presentation = await server.getProfileKeyPresentation({
+    aci: joiner.boot.phone.device.aci,
+    profileKey: joiner.boot.phone.profileKey,
+    profileKeyCommitment: joiner.boot.phone.device.profileKeyCommitment,
+    groupParams: demo.group.secretParams,
+  });
+  // The mock's ServerGroup keeps these private; the change goes through them
+  // exactly as its own `modify` does.
+  type ServerGroupInternals = {
+    zkSecret: {
+      sign(message: Uint8Array<ArrayBuffer>): {
+        serialize(): Uint8Array<ArrayBuffer>;
+      };
+    };
+    privChanges: {
+      groupChanges: Array<{
+        groupChange: Proto.GroupChange.Params | null;
+        groupState: Proto.Group.Params;
+      }>;
+    };
+    unrollMember(member: Proto.Member.Params): Proto.Member.Params;
+  };
+  const internals = serverGroup as unknown as ServerGroupInternals;
+  const added: Proto.Member.Params = {
+    ...internals.unrollMember({
+      role: Proto.Member.Role.DEFAULT,
+      presentation: presentation.serialize(),
+      userId: null,
+      profileKey: null,
+      joinedAtVersion: null,
+      labelEmoji: null,
+      labelString: null,
+    }),
+    joinedAtVersion: version,
+  };
+  const actions: Proto.GroupChange.Actions.Params = {
+    ...EMPTY_GROUP_ACTIONS,
+    version,
+    sourceUserId: demo.group.encryptServiceId(adder.boot.phone.device.aci),
+    groupId: Buffer.from(serverGroup.id, 'base64'),
+    addMembers: [{ added, joinFromInviteLink: false }],
+  };
+  const encodedActions = Proto.GroupChange.Actions.encode(actions);
+  const serverSignature = internals.zkSecret
+    .sign(Buffer.from(encodedActions))
+    .serialize();
+  const unsigned: Proto.GroupChange.Params = {
+    actions: encodedActions,
+    changeEpoch: 1,
+    serverSignature: null,
+  };
+  internals.privChanges.groupChanges.push({
+    groupChange: unsigned,
+    groupState: {
+      ...serverGroup.state,
+      version,
+      members: [...(serverGroup.state.members ?? []), added],
+    },
+  });
+  const group = new Group({
+    secretParams: demo.group.secretParams,
+    groupState: serverGroup.state,
+  });
+  // The demo's group is the latest revision from now on.
+  // oxlint-disable-next-line no-param-reassign
+  demo.group = group;
+
+  const timestamp = Date.now();
+  const groupV2 = {
+    ...group.toContext(),
+    groupChange: Proto.GroupChange.encode({
+      ...unsigned,
+      serverSignature: new Uint8Array(serverSignature),
+    }),
+  };
+  const dataMessage: Proto.DataMessage.Params = {
+    ...EMPTY_DATA_MESSAGE,
+    groupV2,
+    timestamp: BigInt(timestamp),
+  };
+  const adderPhone = adder.boot.phone;
+  for (const m of demo.members) {
+    if (!m.app) {
+      continue;
+    }
+    const content: Proto.Content.Params =
+      m === adder
+        ? {
+            content: {
+              syncMessage: {
+                content: {
+                  sent: {
+                    timestamp: BigInt(timestamp),
+                    message: dataMessage,
+                    destinationServiceIdBinary: null,
+                    destinationE164: null,
+                    destinationServiceId: null,
+                    expirationStartTimestamp: null,
+                    unidentifiedStatus: null,
+                    isRecipientUpdate: null,
+                    storyMessage: null,
+                    storyMessageRecipients: null,
+                    editMessage: null,
+                  },
+                },
+                read: null,
+                stickerPackOperation: null,
+                viewed: null,
+                padding: null,
+              },
+            },
+            pniSignatureMessage: null,
+            senderKeyDistributionMessage: null,
+          }
+        : {
+            content: { dataMessage },
+            pniSignatureMessage: null,
+            senderKeyDistributionMessage: null,
+          };
+    // oxlint-disable-next-line no-await-in-loop
+    await adderPhone.sendRaw(m.boot.desktop, content, { timestamp });
+  }
+  // The joiner's phone now lists the group (pinned), as after a real add.
+  const joinerPhone = joiner.boot.phone;
+  const previous = await joinerPhone.expectStorageState('group add');
+  await joinerPhone.setStorageState(
+    previous.addGroup(group, { whitelisted: true }).pinGroup(group),
+    previous
+  );
+  server.joinGroup(joiner.name);
+  say(
+    `${adder.display} added ${joiner.display} to "Camping" at revision ${version}`
+  );
+  return version;
 }
 
 /** Links `name`'s desktop and waits until it is loaded. */

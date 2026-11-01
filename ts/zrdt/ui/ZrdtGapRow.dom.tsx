@@ -6,6 +6,7 @@ import type { ZrdtGapState } from './labels.std.ts';
 import type { ZrdtDigestHex } from './words.std.ts';
 import {
   ASK_AGAIN,
+  BOUNDARY_ROW_TEXT,
   contentUnavailableText,
   gapStatus,
   gapTitle,
@@ -20,6 +21,8 @@ export type ZrdtGapRowProps = Readonly<{
   replierName: string;
   /** Display name of the author, once a structure-only relay names it. */
   authorName?: string;
+  /** Display name of the member whose reply carried no content. */
+  responderName?: string;
   /** Missing digests, shown as tags; optional. */
   digests?: ReadonlyArray<ZrdtDigestHex>;
   onAskAgain?: () => void;
@@ -30,6 +33,7 @@ const ROOT_CLASS_NAMES: Record<ZrdtGapState, string> = {
   requested: 'ZrdtGapRow ZrdtGapRow--requested',
   'still-missing': 'ZrdtGapRow ZrdtGapRow--still-missing',
   'content-unavailable': 'ZrdtGapRow ZrdtGapRow--content-unavailable',
+  boundary: 'ZrdtGapRow ZrdtGapRow--boundary',
 };
 
 /**
@@ -37,15 +41,31 @@ const ROOT_CLASS_NAMES: Record<ZrdtGapState, string> = {
  * says the server or a member is at fault.
  */
 export function ZrdtGapRow(props: ZrdtGapRowProps): ReactElement {
-  const { state, count, replierName, authorName, digests, onAskAgain } = props;
+  const {
+    state,
+    count,
+    replierName,
+    authorName,
+    responderName,
+    digests,
+    onAskAgain,
+  } = props;
   const tags =
     digests != null && digests.length > 0 ? formatTagList(digests) : undefined;
+
+  if (state === 'boundary') {
+    return (
+      <div className={ROOT_CLASS_NAMES[state]} role="status">
+        <span className="ZrdtGapRow__title">{BOUNDARY_ROW_TEXT}</span>
+      </div>
+    );
+  }
 
   if (state === 'content-unavailable') {
     return (
       <div className={ROOT_CLASS_NAMES[state]} role="status">
         <span className="ZrdtGapRow__title">
-          {contentUnavailableText(authorName ?? 'a member')}
+          {contentUnavailableText(authorName ?? 'a member', responderName)}
         </span>
         {tags != null && <span className="ZrdtGapRow__tags">{tags}</span>}
       </div>

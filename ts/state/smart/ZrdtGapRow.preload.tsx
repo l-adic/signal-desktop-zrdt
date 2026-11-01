@@ -23,6 +23,7 @@ const SmartZrdtGapRow = memo(function SmartZrdtGapRow(
     replierName,
     referencedByAci,
     authorName,
+    responderName,
   } = props;
   const onAskAgain = useCallback(async () => {
     try {
@@ -46,6 +47,7 @@ const SmartZrdtGapRow = memo(function SmartZrdtGapRow(
         count={Math.max(1, missingDigests.length)}
         replierName={replierName}
         authorName={authorName}
+        responderName={responderName}
         digests={missingDigests}
         onAskAgain={() => drop(onAskAgain())}
       />

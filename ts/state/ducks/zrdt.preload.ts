@@ -51,6 +51,7 @@ import { drop } from '../../util/drop.std.ts';
 import type { ZrdtRejectReason } from '../../zrdt/ui/labels.std.ts';
 import { rejectedText } from '../../zrdt/ui/labels.std.ts';
 import type { ZrdtCompareOutcome } from '../../zrdt/ui/ZrdtCompareModal.dom.tsx';
+import { readBlob3Header } from '../../zrdt/blob.std.ts';
 import {
   classifyCompare,
   encodeCompareCode,
@@ -75,19 +76,11 @@ export function zrdtFromHex(hex: string): Uint8Array<ArrayBuffer> {
   return Bytes.fromHex(hex);
 }
 
-/** Store blob: "zrdtS2" ‖ group(32) ‖ u32 count (big-endian) ‖ … (PLAN.md §3.4). */
+/** The record count of a store blob (`zrdtS3`, ts/zrdt/blob.std.ts). */
 export function zrdtBlobRecordCount(
-  blob: ArrayLike<number>
+  blob: Uint8Array<ArrayBuffer>
 ): number | undefined {
-  const offset = 6 + 32;
-  if (blob.length < offset + 4) {
-    return undefined;
-  }
-  let count = 0;
-  for (let i = 0; i < 4; i += 1) {
-    count = count * 256 + (blob[offset + i] ?? 0);
-  }
-  return count;
+  return readBlob3Header(blob)?.recordCount;
 }
 
 export function zrdtRejectReasonFromOutcome(

@@ -24,7 +24,9 @@ export type ZrdtGapState =
   /** NotFound or timeout: "still missing", with "Ask again". */
   | 'still-missing'
   /** A relay without an opening resolved the link: structure only. */
-  | 'content-unavailable';
+  | 'content-unavailable'
+  // A relative store's boundary row (JOIN_PLAN §6.3).
+  | 'boundary';
 
 export function gapTitle(count: number, replierName: string): string {
   const pronoun = count === 1 ? 'it' : 'them';
@@ -40,15 +42,29 @@ export function gapStatus(state: ZrdtGapState): string | undefined {
     case 'still-missing':
       return 'Still missing';
     case 'content-unavailable':
+    case 'boundary':
       return undefined;
     default:
       throw new Error(`gapStatus: unknown state ${String(state)}`);
   }
 }
 
-export function contentUnavailableText(authorName: string): string {
-  return `A message from ${authorName} (content unavailable)`;
+/**
+ * A record without content. With the responder that sent its structure:
+ * "content not available from <responder>" (JOIN_PLAN §4.4), never "not sent
+ * to you": a responder that lacks the audience cannot tell.
+ */
+export function contentUnavailableText(
+  authorName: string,
+  responderName?: string
+): string {
+  return responderName == null
+    ? `A message from ${authorName} (content unavailable)`
+    : `A message from ${authorName} (content not available from ${responderName})`;
 }
+
+/** The boundary row of a newcomer's store (JOIN_PLAN §6.3). */
+export const BOUNDARY_ROW_TEXT = 'Earlier messages: not available to you';
 
 export const ASK_AGAIN = 'Ask again';
 export const ASK_FOR_IT = 'Ask for it';

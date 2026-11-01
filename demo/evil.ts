@@ -79,11 +79,25 @@ export class EvilServer extends Server {
     super(config);
   }
 
-  /** Names an account (its ACI and PNI) and adds it to the demo group. */
-  public addMember(name: Name, serviceIds: ReadonlyArray<string>): void {
+  /**
+   * Names an account (its ACI and PNI) and adds it to the demo group, unless
+   * `inGroup` is false (a member who joins later, `joinGroup`).
+   */
+  public addMember(
+    name: Name,
+    serviceIds: ReadonlyArray<string>,
+    { inGroup = true }: { inGroup?: boolean } = {}
+  ): void {
     for (const id of serviceIds) {
       this.#names.set(id, name);
     }
+    if (inGroup) {
+      this.#group.add(name);
+    }
+  }
+
+  /** A named account joins the demo group (a group add, after creation). */
+  public joinGroup(name: Name): void {
     this.#group.add(name);
   }
 

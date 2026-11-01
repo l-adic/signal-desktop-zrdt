@@ -9,7 +9,7 @@
 //   1. If message.zrdt exists (a retry), send its frozen Content bytes. Never
 //      recompute links. If the store lacks the record (a crash before ACCEPT
 //      finished, or a lost row), re-accept it from the frozen bytes first.
-//   2. links = HEADS, nonce = 32 random bytes, disown = our disown set, and
+//   2. links = LINKABLE (HEADS for a closed store), nonce = 32 random bytes, disown = our disown set, and
 //      the audience (JOIN_PLAN §3.2, §4.1): the enqueue snapshot's members
 //      still in membersV2, plus us; seated (a key tag) only the enqueue
 //      recipients we hold a key for. AUDIENCE gives the field-201 bytes.
@@ -94,7 +94,9 @@ export type ZrdtSendServiceType = Readonly<{
     conversationId: string,
     groupId: ArrayBytes
   ) => Promise<void>;
-  heads: (conversationId: string) => Promise<ReadonlyArray<AnyBytes>>;
+  // COMMIT's links: HEADS for a closed store; for a relative store, the heads
+  // this device holds live (LINKABLE, JOIN_PLAN §6.2).
+  linkable: (conversationId: string) => Promise<ReadonlyArray<AnyBytes>>;
   disownSet: (conversationId: string) => Promise<ReadonlyArray<AnyBytes>>;
   has: (conversationId: string, digest: ArrayBytes) => Promise<boolean>;
   acceptOwn: (
@@ -282,7 +284,7 @@ export async function freezeZrdtSend(
     return content;
   }
 
-  const links = (await service.heads(conversationId)).map(toArrayBytes);
+  const links = (await service.linkable(conversationId)).map(toArrayBytes);
   const nonce = getRandomBytes(NONCE_BYTES);
   strictAssert(nonce.byteLength === NONCE_BYTES, 'zrdt: bad nonce');
   const disown = (await service.disownSet(conversationId)).map(toArrayBytes);

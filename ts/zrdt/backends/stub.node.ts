@@ -10,9 +10,16 @@
 // PLAN.md sections 3.3 to 3.5 only, not from the Lean code, so that a test
 // that compares the two finds mistakes in either. Keep it small and plain.
 //
-// Protocol 3 (zrdt docs/JOIN_PLAN.md sections 3.2, 5 and 10.2): an ACCEPT or
-// ACCEPT_RECORD with an opening records the opening's audience (field 201),
-// and refuses an opening without one; AUDIENCE, SERVE and ADDRESSED.
+// Protocol 3 (zrdt docs/JOIN_PLAN.md sections 3.2, 5, 6.2 and 10.2): an
+// ACCEPT or ACCEPT_RECORD with an opening records the opening's audience
+// (field 201), and refuses an opening without one; AUDIENCE, SERVE and
+// ADDRESSED. A store is closed (NEW, a closed blob) or relative
+// (NEW_RELATIVE, a relative blob): a relative store holds a boundary,
+// digests with no record, each with the ACI that vouched for it; its links
+// resolve to stored records or boundary digests. ACCEPT_VIEW takes a SERVE
+// reply's entries; LINKABLE gives a new record's links. The store blob is
+// `zrdtS3`: the mode, the boundary, the recorded audiences, then the records
+// as the `zrdtS2` blob of PLAN.md section 3.4.
 
 import { createHash } from 'node:crypto';
 
@@ -53,11 +60,13 @@ import type {
   ServeRequest,
   Status,
   VersionInfo,
+  ViewResult,
   ZrdtBackend,
 } from '../ZrdtBackend.std.ts';
 import {
   audienceOfOpening,
   isEphemeralOpening,
+  parseAudience,
   seatsUnderTag,
 } from '../audience.std.ts';
 import type { Seat } from '../audience.std.ts';
@@ -492,15 +501,21 @@ type Entry = Readonly<{ record: StubRecord; encoded: Bytes; digest: Digest }>;
 export class StubStore {
   readonly group: Bytes;
   readonly hash: RecordHash;
+  /** A relative store takes boundary digests; a closed one never does. */
+  readonly relative: boolean;
   readonly #entries = new Map<string, Entry>();
+  /** Stored digests and boundary digests that no stored record links. */
   readonly #heads = new Set<string>();
   /** The audience table: digests whose opening this store checked. */
   readonly #audiences = new Map<string, ReadonlyArray<Seat>>();
+  /** The boundary: every digest taken, with its voucher. It only grows. */
+  readonly #boundary = new Map<string, { digest: Digest; voucher: Bytes }>();
 
-  constructor(group: Bytes, hash: RecordHash = sha256) {
+  constructor(group: Bytes, hash: RecordHash = sha256, relative = false) {
     checkSize('group', group, GROUP_ID_BYTES);
     this.group = new Uint8Array(group);
     this.hash = hash;
+    this.relative = relative;
   }
 
   get size(): number {
@@ -508,7 +523,7 @@ export class StubStore {
   }
 
   clone(): StubStore {
-    const copy = new StubStore(this.group, this.hash);
+    const copy = new StubStore(this.group, this.hash, this.relative);
     for (const [k, entry] of this.#entries) {
       copy.#entries.set(k, entry);
     }
@@ -518,7 +533,79 @@ export class StubStore {
     for (const [k, seats] of this.#audiences) {
       copy.#audiences.set(k, seats);
     }
+    for (const [k, b] of this.#boundary) {
+      copy.#boundary.set(k, b);
+    }
     return copy;
+  }
+
+  /** Whether `digest` was taken into the boundary (it may be stored since). */
+  inBoundary(digest: Bytes): boolean {
+    return this.#boundary.has(key(digest));
+  }
+
+  /**
+   * Adds `digest` to the boundary with its voucher. Nothing changes if it is
+   * stored or already in the boundary (the first voucher stays). False if
+   * the boundary is full. Never call it on a closed store.
+   */
+  addBoundary(digest: Bytes, voucher: Bytes): boolean {
+    const k = key(digest);
+    if (this.#entries.has(k) || this.#boundary.has(k)) {
+      return true;
+    }
+    if (this.#boundary.size + 1 >= RECORD_COUNT_LIMIT) {
+      return false;
+    }
+    this.#boundary.set(k, {
+      digest: new Uint8Array(digest),
+      voucher: new Uint8Array(voucher),
+    });
+    this.#heads.add(k);
+    return true;
+  }
+
+  /** The boundary, sorted by digest. */
+  boundary(): Array<{ digest: Digest; voucher: Bytes }> {
+    return [...this.#boundary.values()].sort((a, b) =>
+      compareBytes(a.digest, b.digest)
+    );
+  }
+
+  /** The boundary digests with no stored record, sorted. */
+  boundaryDigests(): Array<Digest> {
+    return sortedUnique(
+      [...this.#boundary.entries()]
+        .filter(([k]) => !this.#entries.has(k))
+        .map(([, b]) => b.digest)
+    );
+  }
+
+  /** The recorded audiences of stored records, sorted by digest. */
+  audiences(): Array<{ digest: Digest; seats: ReadonlyArray<Seat> }> {
+    return this.entries().flatMap(({ digest }) => {
+      const seats = this.#audiences.get(key(digest));
+      return seats === undefined ? [] : [{ digest, seats }];
+    });
+  }
+
+  /**
+   * What `accept` would reply for `record` now, without changing the store
+   * (ACCEPT_VIEW's result for a record entry).
+   */
+  probe(record: StubRecord): AcceptResult {
+    return this.clone().accept(record);
+  }
+
+  /**
+   * LINKABLE: a closed store's heads; a relative store's heads that are
+   * stored records in `live`. Sorted.
+   */
+  linkable(live: ReadonlySet<string>): Array<Digest> {
+    if (!this.relative) {
+      return this.heads();
+    }
+    return this.heads().filter(d => this.has(d) && live.has(key(d)));
   }
 
   /** Records the audience of a checked opening of a stored record. */
@@ -559,22 +646,23 @@ export class StubStore {
   heads(): Array<Digest> {
     return sortedUnique(
       [...this.#heads].map(k => {
-        const entry = this.#entries.get(k);
-        if (entry === undefined) {
-          throw new Error('zrdt stub: head is not stored');
+        const digest =
+          this.#entries.get(k)?.digest ?? this.#boundary.get(k)?.digest;
+        if (digest === undefined) {
+          throw new Error('zrdt stub: head is neither stored nor boundary');
         }
-        return entry.digest;
+        return digest;
       })
     );
   }
 
   /** Add a record if its group is right and every link is stored. */
   accept(record: StubRecord): AcceptResult {
-    if (record.links.length > MAX_LINKS) {
-      return { kind: 'tooLarge' };
-    }
     if (!equal(record.group, this.group)) {
       return { kind: 'wrongChat' };
+    }
+    if (record.links.length > MAX_LINKS) {
+      return { kind: 'tooLarge' };
     }
     const encoded = encodeRecord(record);
     const digest = this.hash(encoded);
@@ -585,18 +673,26 @@ export class StubStore {
         ? { kind: 'accepted', digest, record: new Uint8Array(encoded) }
         : { kind: 'collision', digest };
     }
-    const missing = record.links.filter(link => !this.has(link));
-    if (missing.length > 0) {
-      return { kind: 'missing', digests: sortedUnique(missing) };
-    }
     if (this.#entries.size + 1 >= RECORD_COUNT_LIMIT) {
       return { kind: 'tooLarge' };
     }
+    const missing = record.links.filter(
+      link => !this.has(link) && !this.inBoundary(link)
+    );
+    if (missing.length > 0) {
+      return { kind: 'missing', digests: sortedUnique(missing) };
+    }
+    // A promoted boundary digest stays a head only if nothing links it yet.
+    const isHead =
+      !record.links.some(link => equal(link, digest)) &&
+      (!this.#boundary.has(k) || this.#heads.has(k));
     this.#entries.set(k, { record, encoded, digest });
     for (const link of record.links) {
       this.#heads.delete(key(link));
     }
-    this.#heads.add(k);
+    if (isHead) {
+      this.#heads.add(k);
+    }
     return {
       kind: 'accepted',
       digest: new Uint8Array(digest),
@@ -655,7 +751,9 @@ function acceptAll(
   const ready = new Array<number>();
 
   records.forEach((record, i) => {
-    const absent = record.links.filter(link => !store.has(link));
+    const absent = record.links.filter(
+      link => !store.has(link) && !store.inBoundary(link)
+    );
     absentCount[i] = absent.length;
     for (const link of absent) {
       const k = key(link);
@@ -693,14 +791,15 @@ function acceptAll(
 }
 
 // ---------------------------------------------------------------------------
-// Blobs (PLAN.md section 3.4)
+// Blobs (PLAN.md section 3.4; JOIN_PLAN section 3.3)
 // ---------------------------------------------------------------------------
 
 const BLOB_MAGIC = ascii('zrdtS2');
 const BLOB_HEADER_BYTES = BLOB_MAGIC.length + GROUP_ID_BYTES + 4;
+const BLOB3_MAGIC = ascii('zrdtS3');
 
 /** `"zrdtS2" ‖ group(32) ‖ u32 count ‖ (u32 len ‖ record)*`, sorted by digest. */
-function encodeBlob(store: StubStore): Bytes {
+function encodeRecordsBlob(store: StubStore): Bytes {
   const entries = store.entries();
   const parts: Array<Bytes> = [BLOB_MAGIC, store.group, u32(entries.length)];
   for (const { encoded } of entries) {
@@ -709,15 +808,125 @@ function encodeBlob(store: StubStore): Bytes {
   return concat(parts);
 }
 
+/** The field-201 value of an audience: its entries, `aci ‖ tag`, in order. */
+function writeAudience(seats: ReadonlyArray<Seat>): Bytes {
+  return concat(seats.flatMap(seat => [seat.aci, seat.tag]));
+}
+
+/**
+ * `"zrdtS3" ‖ mode u8 (0 closed, 1 relative) ‖ u32 n ‖ n × (digest ‖ voucher
+ * aci) ‖ u32 m ‖ m × (digest ‖ u32 len ‖ field-201 value) ‖ the zrdtS2 blob`.
+ * The boundary and the audiences (of stored records only) are sorted by
+ * digest; a closed store has no boundary.
+ */
+function encodeBlob(store: StubStore): Bytes {
+  const boundary = store.boundary();
+  const audiences = store.audiences();
+  const parts: Array<Bytes> = [
+    BLOB3_MAGIC,
+    Uint8Array.of(store.relative ? 1 : 0),
+    u32(boundary.length),
+  ];
+  for (const { digest, voucher } of boundary) {
+    parts.push(digest, voucher);
+  }
+  parts.push(u32(audiences.length));
+  for (const { digest, seats } of audiences) {
+    const value = writeAudience(seats);
+    parts.push(digest, u32(value.length), value);
+  }
+  parts.push(encodeRecordsBlob(store));
+  return concat(parts);
+}
+
+/** What a `zrdtS3` blob holds before any record is read. */
+type Blob3 = Readonly<{
+  relative: boolean;
+  boundary: Array<{ digest: Digest; voucher: Bytes }>;
+  audiences: Array<{ digest: Digest; seats: Array<Seat> }>;
+  records: Bytes;
+}>;
+
+/**
+ * The framing of a `zrdtS3` blob; undefined for a wrong tag or mode, a count
+ * the input cannot hold, a closed blob with a boundary, an entry cut short,
+ * or an audience that does not parse.
+ */
+function decodeBlob3(bytes: Bytes): Blob3 | undefined {
+  if (
+    bytes.length < 11 ||
+    !equal(bytes.subarray(0, BLOB3_MAGIC.length), BLOB3_MAGIC)
+  ) {
+    return undefined;
+  }
+  const mode = bytes[6];
+  if (mode !== 0 && mode !== 1) {
+    return undefined;
+  }
+  const relative = mode === 1;
+  const n = readU32(bytes, 7);
+  if (
+    n >= RECORD_COUNT_LIMIT ||
+    11 + 48 * n > bytes.length ||
+    (!relative && n !== 0)
+  ) {
+    return undefined;
+  }
+  const boundary = new Array<{ digest: Digest; voucher: Bytes }>();
+  for (let i = 0; i < n; i += 1) {
+    const at = 11 + 48 * i;
+    boundary.push({
+      digest: bytes.slice(at, at + 32),
+      voucher: bytes.slice(at + 32, at + 48),
+    });
+  }
+  const p = 11 + 48 * n;
+  if (p + 4 > bytes.length) {
+    return undefined;
+  }
+  const m = readU32(bytes, p);
+  if (p + 4 + 36 * m > bytes.length) {
+    return undefined;
+  }
+  const audiences = new Array<{ digest: Digest; seats: Array<Seat> }>();
+  let at = p + 4;
+  for (let i = 0; i < m; i += 1) {
+    if (at + 36 > bytes.length) {
+      return undefined;
+    }
+    const digest = bytes.slice(at, at + 32);
+    const len = readU32(bytes, at + 32);
+    if (at + 36 + len > bytes.length) {
+      return undefined;
+    }
+    const seats = parseAudience(bytes.slice(at + 36, at + 36 + len));
+    if (seats === undefined) {
+      return undefined;
+    }
+    audiences.push({ digest, seats });
+    at += 36 + len;
+  }
+  return { relative, boundary, audiences, records: bytes.slice(at) };
+}
+
+/** The records part's count field is 2^24 or more (Lean `blobTooLarge`). */
+function recordsBlobTooLarge(bytes: Bytes): boolean {
+  return (
+    bytes.length >= BLOB_HEADER_BYTES &&
+    equal(bytes.subarray(0, BLOB_MAGIC.length), BLOB_MAGIC) &&
+    readU32(bytes, BLOB_MAGIC.length + GROUP_ID_BYTES) >= RECORD_COUNT_LIMIT
+  );
+}
+
 type Decoded =
   | { kind: 'ok'; group: Bytes | undefined; records: Array<StubRecord> }
   | { kind: 'malformed' }
   | { kind: 'tooLarge' };
 
 /**
- * Strict decode of a blob. A count of 2^24 or more is `tooLarge` before
- * anything else is read; nothing is allocated from the count. Records may
- * come in any order.
+ * Strict decode of a records blob (`zrdtS2`). A count of 2^24 or more is
+ * `tooLarge` before anything else is read; nothing is allocated from the
+ * count. Records may come in any order.
  */
 export function decodeBlob(bytes: Bytes): Decoded {
   if (
@@ -782,13 +991,18 @@ type Opened =
   | Refused;
 
 /**
- * Decode `input` and accept what can be accepted into a new store for
- * `group`. The checks run in this order: malformed, tooLarge (count, then
- * links), wrongChat (the blob's group, then each record's), collision.
+ * Decode a records blob or list and accept what can be accepted into a new
+ * store for `group`, over `boundary` if the store is relative. The checks run
+ * in this order: malformed, tooLarge (count, then links), wrongChat (the
+ * blob's group, then each record's), collision.
  */
-function openInput(group: Bytes, input: OpenInput, hash: RecordHash): Opened {
-  checkSize('group', group, GROUP_ID_BYTES);
-  const decoded = isRecordList(input) ? decodeList(input) : decodeBlob(input);
+function openRecords(
+  group: Bytes,
+  decoded: Decoded,
+  hash: RecordHash,
+  relative: boolean,
+  boundary: ReadonlyArray<{ digest: Digest; voucher: Bytes }>
+): Opened {
   if (decoded.kind !== 'ok') {
     return decoded;
   }
@@ -811,9 +1025,47 @@ function openInput(group: Bytes, input: OpenInput, hash: RecordHash): Opened {
   if (collision !== undefined) {
     return { kind: 'collision', digest: collision };
   }
-  const store = new StubStore(group, hash);
+  const store = new StubStore(group, hash, relative);
+  for (const { digest, voucher } of boundary) {
+    if (!store.addBoundary(digest, voucher)) {
+      return { kind: 'tooLarge' };
+    }
+  }
   const leftovers = acceptAll(store, records);
   return { kind: 'ok', store, leftovers };
+}
+
+/**
+ * OPEN's and SALVAGE's input as a new store for `group`: a `zrdtS3` blob
+ * (closed or relative, with its audiences of stored records), or a list of
+ * encoded records (a closed store).
+ */
+function openInput(group: Bytes, input: OpenInput, hash: RecordHash): Opened {
+  checkSize('group', group, GROUP_ID_BYTES);
+  if (isRecordList(input)) {
+    return openRecords(group, decodeList(input), hash, false, []);
+  }
+  const blob = decodeBlob3(input);
+  if (blob === undefined) {
+    return { kind: 'malformed' };
+  }
+  if (recordsBlobTooLarge(blob.records)) {
+    return { kind: 'tooLarge' };
+  }
+  const opened = openRecords(
+    group,
+    decodeBlob(blob.records),
+    hash,
+    blob.relative,
+    blob.boundary
+  );
+  if (opened.kind === 'ok') {
+    // Last entry wins, as Lean's `ofList`; only stored records keep theirs.
+    for (const { digest, seats } of blob.audiences) {
+      opened.store.recordAudience(digest, seats);
+    }
+  }
+  return opened;
 }
 
 /** The smallest digest shared by two different encodings, if any. */
@@ -834,7 +1086,10 @@ function firstCollision(
   return sortedUnique(clashes)[0];
 }
 
-/** The digests of `leftovers`, and their links that no input record has. */
+/**
+ * The digests of `leftovers`, and their links that point to no stored
+ * record, no boundary digest and no leftover.
+ */
 function report(
   store: StubStore,
   leftovers: ReadonlyArray<StubRecord>
@@ -846,7 +1101,7 @@ function report(
   const missing = new Array<Bytes>();
   for (const record of leftovers) {
     for (const link of record.links) {
-      if (!known.has(key(link))) {
+      if (!known.has(key(link)) && !store.inBoundary(link)) {
         missing.push(link);
       }
     }
@@ -1002,6 +1257,11 @@ export class StubBackend implements ZrdtBackend {
     this.#stores.set(chat, new StubStore(group, this.#hash));
   }
 
+  async createRelative(chat: ChatKey, group: Bytes): Promise<void> {
+    this.#notOpen(chat);
+    this.#stores.set(chat, new StubStore(group, this.#hash, true));
+  }
+
   async open(
     chat: ChatKey,
     group: Bytes,
@@ -1079,6 +1339,93 @@ export class StubBackend implements ZrdtBackend {
     return acceptWithOpening(store, decoded, opening);
   }
 
+  /**
+   * ACCEPT_VIEW (JOIN_PLAN §4.4): each entry is checked as ACCEPT_RECORD
+   * would (and, for an import, refused if ephemeral); a relative store then
+   * takes the boundary entries, vouched by `voucher`; the records that
+   * passed are accepted as one batch; the audiences of their checked
+   * openings are recorded for the stored ones. One result per entry: for a
+   * record, what ACCEPT replies for it in the final store.
+   */
+  async acceptView(
+    chat: ChatKey,
+    voucher: Bytes,
+    forImport: boolean,
+    entries: ReadonlyArray<ServeEntry>
+  ): Promise<Array<ViewResult>> {
+    const store = this.#store(chat);
+    checkSize('voucher', voucher, ACI_BYTES);
+    type Item =
+      | { kind: 'record'; record: StubRecord; seats?: ReadonlyArray<Seat> }
+      | { kind: 'boundary'; digest: Digest }
+      | { kind: 'refused'; result: ViewResult };
+    const items: Array<Item> = entries.map(entry => {
+      if (entry.kind === 'boundary') {
+        return { kind: 'boundary', digest: entry.digest };
+      }
+      const record = decodeRecord(entry.record);
+      if (record === undefined) {
+        return { kind: 'refused', result: { kind: 'malformed' } };
+      }
+      const opening = entry.kind === 'addressed' ? entry.opening : undefined;
+      if (opening === undefined) {
+        return { kind: 'record', record };
+      }
+      if (!opens(record, opening)) {
+        return { kind: 'refused', result: { kind: 'badOpening' } };
+      }
+      const seats = audienceOfOpening(opening);
+      if (seats === undefined) {
+        return { kind: 'refused', result: { kind: 'noAudience' } };
+      }
+      if (forImport && isEphemeralOpening(opening)) {
+        return { kind: 'refused', result: { kind: 'ephemeral' } };
+      }
+      return { kind: 'record', record, seats };
+    });
+    const next = store.clone();
+    if (next.relative) {
+      for (const item of items) {
+        if (item.kind === 'boundary') {
+          next.addBoundary(item.digest, voucher);
+        }
+      }
+    }
+    acceptAll(
+      next,
+      items.flatMap(item => (item.kind === 'record' ? [item.record] : []))
+    );
+    const results = items.map((item): ViewResult => {
+      if (item.kind === 'refused') {
+        return item.result;
+      }
+      if (item.kind === 'boundary') {
+        if (next.has(item.digest) || next.inBoundary(item.digest)) {
+          return { kind: 'ok', digest: new Uint8Array(item.digest) };
+        }
+        return next.relative ? { kind: 'tooLarge' } : { kind: 'ignored' };
+      }
+      const result = next.probe(item.record);
+      if (result.kind === 'accepted') {
+        if (item.seats !== undefined) {
+          next.recordAudience(result.digest, item.seats);
+        }
+        return { kind: 'ok', digest: result.digest };
+      }
+      return result;
+    });
+    this.#stores.set(chat, next);
+    return results;
+  }
+
+  async linkable(
+    chat: ChatKey,
+    live: ReadonlyArray<Digest>
+  ): Promise<Array<Digest>> {
+    const store = this.#store(chat);
+    return store.linkable(new Set(live.map(key)));
+  }
+
   async heads(chat: ChatKey): Promise<Array<Digest>> {
     return this.#store(chat).heads();
   }
@@ -1099,9 +1446,33 @@ export class StubBackend implements ZrdtBackend {
     return this.#store(chat).reachSet(from);
   }
 
+  /**
+   * MERGE a `zrdtS3` blob. Into a closed store: the blob's records part, as
+   * a closed store (a relative blob's records that link its boundary are
+   * unverifiable). Into a relative store: the blob as a store of this chat,
+   * its boundary, then its records. The blob's audiences are not read.
+   */
   async merge(chat: ChatKey, blob: Bytes): Promise<OpenResult> {
     const store = this.#store(chat);
-    const opened = openInput(store.group, blob, this.#hash);
+    let opened: Opened;
+    if (store.relative) {
+      opened = openInput(store.group, blob, this.#hash);
+    } else {
+      const framed = decodeBlob3(blob);
+      if (framed === undefined) {
+        return { kind: 'malformed' };
+      }
+      if (recordsBlobTooLarge(framed.records)) {
+        return { kind: 'tooLarge' };
+      }
+      opened = openRecords(
+        store.group,
+        decodeBlob(framed.records),
+        this.#hash,
+        false,
+        []
+      );
+    }
     if (opened.kind !== 'ok') {
       return opened;
     }
@@ -1115,6 +1486,11 @@ export class StubBackend implements ZrdtBackend {
       return { kind: 'collision', digest: collision };
     }
     const next = store.clone();
+    for (const { digest, voucher } of opened.store.boundary()) {
+      if (!next.addBoundary(digest, voucher)) {
+        return { kind: 'tooLarge' };
+      }
+    }
     const leftovers = acceptAll(
       next,
       incoming.map(({ record }) => record)
@@ -1191,8 +1567,8 @@ function acceptWithOpening(
 // ---------------------------------------------------------------------------
 
 /**
- * The reply to one SERVE request, for a closed store (no boundary of its own;
- * Phase 1). Each stored record gives at most one entry, in digest order:
+ * The reply to one SERVE request. Each stored record gives at most one entry,
+ * in digest order, then each boundary digest of a relative responder:
  *
  * - `addressed`: its audience (from a matching held opening, else the
  *   recorded one) seats the requester, and it is wanted (per-digest) or not
@@ -1301,6 +1677,16 @@ function serveStore(store: StubStore, q: ServeRequest): ServeReply {
       out.push({ kind: 'after', record: new Uint8Array(e.encoded) });
     } else if (perDigest || linkedByUp.has(k) || !linkedAny.has(k)) {
       out.push({ kind: 'boundary', digest: new Uint8Array(e.digest) });
+    }
+  }
+  // Then the responder's own boundary digests (a relative store), sorted.
+  for (const digest of store.boundaryDigests()) {
+    const k = key(digest);
+    if (
+      (!perDigest || wanted.has(k)) &&
+      (perDigest || linkedByUp.has(k) || !linkedAny.has(k))
+    ) {
+      out.push({ kind: 'boundary', digest: new Uint8Array(digest) });
     }
   }
   const headerBytes = concat([q.requesterAci, tag, q.requestId]);

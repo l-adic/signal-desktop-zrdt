@@ -204,6 +204,32 @@ export type ServeEntry =
   | { kind: 'after'; record: Bytes }
   | { kind: 'boundary'; digest: Digest };
 
+/**
+ * What ACCEPT_VIEW did with one entry (JOIN_PLAN §4.4, §6.2), in entry
+ * order.
+ *
+ * - `ok`: a record entry whose record is now stored (its digest), or a
+ *   boundary entry whose digest is now a boundary digest or a stored record;
+ * - `missing`, `collision`, `wrongChat`, `tooLarge`: what ACCEPT would reply
+ *   for the record now (`tooLarge` for a boundary entry: the boundary is
+ *   full);
+ * - `malformed`, `badOpening`, `noAudience`, `ephemeral`: the entry was
+ *   refused before the store was touched (`ephemeral`: an import of a
+ *   disappearing or view-once opening);
+ * - `ignored`: a boundary entry on a closed store, which never takes one.
+ */
+export type ViewResult =
+  | { kind: 'ok'; digest: Digest }
+  | { kind: 'missing'; digests: Array<Digest> }
+  | { kind: 'collision'; digest: Digest }
+  | { kind: 'wrongChat' }
+  | { kind: 'tooLarge' }
+  | { kind: 'malformed' }
+  | { kind: 'badOpening' }
+  | { kind: 'noAudience' }
+  | { kind: 'ephemeral' }
+  | { kind: 'ignored' };
+
 /** SERVE's reply header: who it is for, under which key, for which request. */
 export type ServeHeader = Readonly<{
   requesterAci: Bytes;
@@ -333,6 +359,14 @@ export type ZrdtBackend = {
   create(chat: ChatKey, group: Bytes): Promise<void>;
 
   /**
+   * NEW_RELATIVE: an empty relative store for `group` under `chat`, for a
+   * catch-up or a re-add (JOIN_PLAN §6.1, §6.5). A relative store takes
+   * boundary digests; a closed one never does. Throws `chatOpen` if a store
+   * is there.
+   */
+  createRelative(chat: ChatKey, group: Bytes): Promise<void>;
+
+  /**
    * OPEN: load a store for `group` from a blob or a list of encoded records.
    * On `ok` the store is under `chat`; otherwise nothing changes. Throws
    * `chatOpen` if `chat` already has a store.
@@ -385,6 +419,28 @@ export type ZrdtBackend = {
     record: Bytes,
     opening?: Bytes
   ): Promise<AcceptRecordResult>;
+
+  /**
+   * ACCEPT_VIEW: take a SERVE reply's entries (JOIN_PLAN §4.4), from
+   * `voucher` (the responder). Only replies that passed the §4.4 checks may
+   * be passed. A relative store takes the boundary entries; a closed one
+   * ignores them. The records are accepted as one batch, and each checked
+   * opening's audience is recorded. One result per entry, in order.
+   */
+  acceptView(
+    chat: ChatKey,
+    voucher: Bytes,
+    forImport: boolean,
+    entries: ReadonlyArray<ServeEntry>
+  ): Promise<Array<ViewResult>>;
+
+  /**
+   * LINKABLE: the digests a new record of this device may link (COMMIT's
+   * links, JOIN_PLAN §6.2). A closed store: its heads. A relative store: the
+   * heads that are stored records in `live` (the digests this device holds
+   * live, its own included, or as an author copy).
+   */
+  linkable(chat: ChatKey, live: ReadonlyArray<Digest>): Promise<Array<Digest>>;
 
   /** HEADS: the digests no stored record links, sorted. */
   heads(chat: ChatKey): Promise<Array<Digest>>;

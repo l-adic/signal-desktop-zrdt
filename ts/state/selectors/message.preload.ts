@@ -2195,6 +2195,7 @@ function getPropsForZrdtGap(
     replierName: nameOf(gap?.referencedByAci) ?? 'A member',
     referencedByAci: gap?.referencedByAci,
     authorName: nameOf(gap?.contentUnavailableAuthorAci),
+    responderName: nameOf(gap?.contentUnavailableFromAci),
   };
 }
 

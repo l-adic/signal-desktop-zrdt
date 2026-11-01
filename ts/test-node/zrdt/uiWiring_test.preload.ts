@@ -73,10 +73,32 @@ describe('zrdt UI wiring', () => {
   describe('helpers', () => {
     it('zrdtHex and the blob record count', () => {
       assert.strictEqual(zrdtHex(new Uint8Array([0, 15, 255])), '000fff');
-      const blob = new Uint8Array(6 + 32 + 4 + 3);
-      blob.set([0, 0, 1, 2], 38);
+      // zrdtS3: tag, mode 1, one boundary digest, one audience of 2 bytes,
+      // then the zrdtS2 records blob with its count.
+      const ascii = (text: string) =>
+        Uint8Array.from(text, ch => ch.charCodeAt(0));
+      const parts = [
+        ascii('zrdtS3'),
+        Uint8Array.of(1),
+        Uint8Array.of(0, 0, 0, 1),
+        new Uint8Array(48),
+        Uint8Array.of(0, 0, 0, 1),
+        new Uint8Array(32),
+        Uint8Array.of(0, 0, 0, 2, 7, 7),
+        ascii('zrdtS2'),
+        new Uint8Array(32),
+        Uint8Array.of(0, 0, 1, 2),
+      ];
+      const blob = new Uint8Array(parts.reduce((n, p) => n + p.length, 0));
+      let at = 0;
+      for (const part of parts) {
+        blob.set(part, at);
+        at += part.length;
+      }
       assert.strictEqual(zrdtBlobRecordCount(blob), 258);
       assert.isUndefined(zrdtBlobRecordCount(new Uint8Array(10)));
+      // A zrdtS2 blob alone is not a store blob any more (greenfield).
+      assert.isUndefined(zrdtBlobRecordCount(blob.slice(101)));
     });
 
     it('maps OPEN outcomes to banner reasons', () => {

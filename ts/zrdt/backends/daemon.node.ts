@@ -44,9 +44,11 @@ import type {
   RecordParts,
   RecordStatus,
   SalvageResult,
+  ServeEntry,
   ServeReply,
   ServeRequest,
   VersionInfo,
+  ViewResult,
   ZrdtBackend,
 } from '../ZrdtBackend.std.ts';
 import {
@@ -404,7 +406,12 @@ export class DaemonBackend implements ZrdtBackend {
     }
     if (
       result === undefined &&
-      !(req.op === Op.NEW || req.op === Op.CLOSE || req.op === Op.GET)
+      !(
+        req.op === Op.NEW ||
+        req.op === Op.NEW_RELATIVE ||
+        req.op === Op.CLOSE ||
+        req.op === Op.GET
+      )
     ) {
       const message = `zrdtd sent an unreadable ${Op[req.op]} reply`;
       this.#fail(message);
@@ -420,6 +427,10 @@ export class DaemonBackend implements ZrdtBackend {
 
   async create(chat: ChatKey, group: Bytes): Promise<void> {
     await this.#request({ op: Op.NEW, chat, group });
+  }
+
+  async createRelative(chat: ChatKey, group: Bytes): Promise<void> {
+    await this.#request({ op: Op.NEW_RELATIVE, chat, group });
   }
 
   async open(
@@ -471,6 +482,28 @@ export class DaemonBackend implements ZrdtBackend {
     opening?: Bytes
   ): Promise<AcceptRecordResult> {
     return this.#request({ op: Op.ACCEPT_RECORD, chat, record, opening });
+  }
+
+  async acceptView(
+    chat: ChatKey,
+    voucher: Bytes,
+    forImport: boolean,
+    entries: ReadonlyArray<ServeEntry>
+  ): Promise<Array<ViewResult>> {
+    return this.#request({
+      op: Op.ACCEPT_VIEW,
+      chat,
+      voucher,
+      forImport,
+      entries,
+    });
+  }
+
+  async linkable(
+    chat: ChatKey,
+    live: ReadonlyArray<Digest>
+  ): Promise<Array<Digest>> {
+    return this.#request({ op: Op.LINKABLE, chat, live });
   }
 
   async heads(chat: ChatKey): Promise<Array<Digest>> {

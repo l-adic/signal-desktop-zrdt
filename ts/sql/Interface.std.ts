@@ -84,9 +84,11 @@ import type {
 } from '../types/Megaphone.std.ts';
 import type {
   UpsertZrdtProvenanceOptionsType,
+  ZrdtBoundaryRowType,
   ZrdtPendingRowType,
   ZrdtProvenanceRowType,
   ZrdtRecordRowType,
+  ZrdtStoreModeType,
 } from '../types/Zrdt.std.ts';
 import { sqlFragment, sqlId, sqlJoin } from './util.std.ts';
 import type { MIMEType } from '../types/MIME.std.ts';
@@ -1155,6 +1157,8 @@ type ReadableInterface = {
     digests: ReadonlyArray<string>
   ) => Array<{ digest: string; messageId: string }>;
   getZrdtGapMessageIds: (conversationId: string) => Array<string>;
+  getZrdtStoreMode: (conversationId: string) => ZrdtStoreModeType;
+  getZrdtBoundary: (conversationId: string) => Array<ZrdtBoundaryRowType>;
 
   getMessagesNeedingUpgrade: (
     limit: number,
@@ -1585,6 +1589,9 @@ type WritableInterface = {
     disownedBy: string
   ) => number;
   deleteZrdtForConversation: (conversationId: string) => void;
+  setZrdtStoreMode: (conversationId: string, mode: ZrdtStoreModeType) => void;
+  insertZrdtBoundary: (rows: ReadonlyArray<ZrdtBoundaryRowType>) => number;
+  archiveZrdtConversation: (conversationId: string, archiveId: string) => void;
 
   getAndProtectExistingAttachmentPath: ({
     plaintextHash,

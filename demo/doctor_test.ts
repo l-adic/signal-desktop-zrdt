@@ -16,6 +16,7 @@ import {
   dropContentEntry,
   appendFakes,
   checkOpen,
+  closedHeader,
   defaultDaemon,
   digestOf,
   encodeBlob,
@@ -67,22 +68,44 @@ function chain(): { blob: StoreBlob; d: Array<string> } {
     Buffer.compare(digestOf(a), digestOf(b))
   );
   return {
-    blob: { group, records },
+    // A closed zrdtS3 blob (protocol 3 reads no other).
+    blob: { group, records, header: closedHeader() },
     d: [r1, r2, r3, r4].map(r => hex(digestOf(r))),
   };
 }
 
+// The records part starts after the closed header: tag, mode, two counts.
+const INNER = 6 + 1 + 4 + 4;
+
 void test('blob framing round-trips', () => {
   const { blob } = chain();
   const bytes = encodeBlob(blob);
-  assert.equal(bytes.subarray(0, 6).toString(), 'zrdtS2');
-  assert.equal(bytes.readUInt32BE(38), 4);
+  assert.equal(bytes.subarray(0, 6).toString(), 'zrdtS3');
+  assert.equal(bytes.subarray(INNER, INNER + 6).toString(), 'zrdtS2');
+  assert.equal(bytes.readUInt32BE(INNER + 38), 4);
   const back = parseBlob(bytes);
   assert.deepEqual(back.group, group);
   assert.deepEqual(back.records, blob.records);
+  assert.deepEqual(back.header, closedHeader());
   for (const r of back.records) {
     assert.deepEqual(encodeRecord(parseRecord(r)), r);
   }
+});
+
+void test('blob framing: a relative header with a boundary and audiences', () => {
+  const { blob } = chain();
+  const header = Buffer.concat([
+    Buffer.from('zrdtS3'),
+    Buffer.from([1, 0, 0, 0, 1]),
+    randomBytes(48),
+    Buffer.from([0, 0, 0, 1]),
+    randomBytes(32),
+    Buffer.from([0, 0, 0, 3, 9, 9, 9]),
+  ]);
+  const bytes = encodeBlob({ ...blob, header });
+  const back = parseBlob(bytes);
+  assert.deepEqual(back.header, header);
+  assert.deepEqual(back.records, blob.records);
 });
 
 void test('parseBlob rejects trailing bytes, truncation and huge counts', () => {
@@ -90,7 +113,7 @@ void test('parseBlob rejects trailing bytes, truncation and huge counts', () => 
   assert.throws(() => parseBlob(Buffer.concat([bytes, Buffer.from([0])])));
   assert.throws(() => parseBlob(bytes.subarray(0, -1)));
   const huge = Buffer.from(bytes);
-  huge.writeUInt32BE(2 ** 24, 38);
+  huge.writeUInt32BE(2 ** 24, INNER + 38);
   assert.throws(() => parseBlob(huge), /limit/);
 });
 
@@ -103,7 +126,7 @@ void test('remove drops one linked, non-head record and fixes the count', () => 
   const expected = [d1, d2].sort()[0];
   assert.equal(result.removed, expected);
   const bytes = encodeBlob(result.blob);
-  assert.equal(bytes.readUInt32BE(38), 3);
+  assert.equal(bytes.readUInt32BE(INNER + 38), 3);
   assert.equal(parseBlob(bytes).records.length, 3);
   const items = analyse(result.blob);
   assert.ok(!items.some(i => i.digest === result.removed));
@@ -133,14 +156,14 @@ void test('remove needs a linked record', () => {
     author: alice,
   });
   assert.throws(
-    () => removeLinkedRecord({ group, records: [r] }),
+    () => removeLinkedRecord({ group, records: [r], header: closedHeader() }),
     /no record is linked/
   );
 });
 
 void test('locateBlob: raw, JSON and binary containers', () => {
   const blob = encodeBlob(chain().blob);
-  const next = encodeBlob({ group, records: [] });
+  const next = encodeBlob({ group, records: [], header: closedHeader() });
 
   const raw = locateBlob(blob);
   assert.equal(raw.kind, 'raw');

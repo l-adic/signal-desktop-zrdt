@@ -7,19 +7,24 @@ import type { WritableDB } from '../../../sql/Interface.std.ts';
 import { DataWriter, setupTests } from '../../../sql/Server.node.ts';
 import { sql } from '../../../sql/util.std.ts';
 import {
+  archiveZrdtConversation,
   deleteZrdtForConversation,
   deleteZrdtPending,
   deleteZrdtRecords,
   getMessageIdsByZrdtDigest,
+  getZrdtBoundary,
   getZrdtConversationIds,
   getZrdtGapMessageIds,
   getZrdtPending,
   getZrdtProvenance,
   getZrdtRecords,
+  getZrdtStoreMode,
+  insertZrdtBoundary,
   insertZrdtPending,
   insertZrdtRecord,
   insertZrdtRecords,
   markZrdtDisowned,
+  setZrdtStoreMode,
   upsertZrdtProvenance,
 } from '../../../sql/server/zrdt.std.ts';
 import type { AciString } from '../../../types/ServiceId.std.ts';
@@ -263,6 +268,59 @@ describe('sql/server/zrdt', () => {
     });
   });
 
+  describe('zrdt_stores, zrdt_boundary (JOIN_PLAN §6.2)', () => {
+    it('a store is closed until marked relative', () => {
+      assert.equal(getZrdtStoreMode(db, 'c1'), 'closed');
+      setZrdtStoreMode(db, 'c1', 'relative');
+      assert.equal(getZrdtStoreMode(db, 'c1'), 'relative');
+      assert.equal(getZrdtStoreMode(db, 'c2'), 'closed');
+      assert.deepEqual(getZrdtConversationIds(db), ['c1']);
+      setZrdtStoreMode(db, 'c1', 'closed');
+      assert.equal(getZrdtStoreMode(db, 'c1'), 'closed');
+    });
+
+    it('the boundary only grows, and the first voucher stays', () => {
+      assert.equal(
+        insertZrdtBoundary(db, [
+          { conversationId: 'c1', digest: bytes(9), voucherAci: ALICE },
+          { conversationId: 'c1', digest: bytes(8), voucherAci: ALICE },
+        ]),
+        2
+      );
+      assert.equal(
+        insertZrdtBoundary(db, [
+          { conversationId: 'c1', digest: bytes(9), voucherAci: BOB },
+        ]),
+        0
+      );
+      assert.deepEqual(simplify(getZrdtBoundary(db, 'c1')), [
+        { conversationId: 'c1', digest: hex(bytes(9)), voucherAci: ALICE },
+        { conversationId: 'c1', digest: hex(bytes(8)), voucherAci: ALICE },
+      ]);
+      assert.deepEqual(getZrdtBoundary(db, 'c2'), []);
+      assert.deepEqual(getZrdtConversationIds(db), ['c1']);
+    });
+
+    it('archives a conversation (a re-add): every row moves', () => {
+      insertZrdtRecord(db, {
+        conversationId: 'c1',
+        digest: bytes(1),
+        record: bytes(1),
+      });
+      setZrdtStoreMode(db, 'c1', 'relative');
+      insertZrdtBoundary(db, [
+        { conversationId: 'c1', digest: bytes(9), voucherAci: ALICE },
+      ]);
+      archiveZrdtConversation(db, 'c1', 'c1:archived:1');
+      assert.deepEqual(getZrdtRecords(db, 'c1'), []);
+      assert.deepEqual(getZrdtBoundary(db, 'c1'), []);
+      assert.equal(getZrdtStoreMode(db, 'c1'), 'closed');
+      assert.equal(getZrdtRecords(db, 'c1:archived:1').length, 1);
+      assert.equal(getZrdtBoundary(db, 'c1:archived:1').length, 1);
+      assert.equal(getZrdtStoreMode(db, 'c1:archived:1'), 'relative');
+    });
+  });
+
   describe('cleanup', () => {
     beforeEach(() => {
       for (const conversationId of ['c1', 'c2']) {
@@ -271,6 +329,10 @@ describe('sql/server/zrdt', () => {
           digest: bytes(1),
           record: bytes(1),
         });
+        setZrdtStoreMode(db, conversationId, 'relative');
+        insertZrdtBoundary(db, [
+          { conversationId, digest: bytes(3), voucherAci: ALICE },
+        ]);
         insertZrdtPending(db, {
           conversationId,
           digest: bytes(2),
@@ -289,31 +351,35 @@ describe('sql/server/zrdt', () => {
       }
     });
 
-    function counts(conversationId: string): [number, number, number] {
+    function counts(
+      conversationId: string
+    ): [number, number, number, number, string] {
       return [
         getZrdtRecords(db, conversationId).length,
         getZrdtPending(db, conversationId).length,
         getZrdtProvenance(db, conversationId).length,
+        getZrdtBoundary(db, conversationId).length,
+        getZrdtStoreMode(db, conversationId),
       ];
     }
 
     it('deleteZrdtForConversation removes one conversation', () => {
       deleteZrdtForConversation(db, 'c1');
-      assert.deepEqual(counts('c1'), [0, 0, 0]);
-      assert.deepEqual(counts('c2'), [1, 1, 1]);
+      assert.deepEqual(counts('c1'), [0, 0, 0, 0, 'closed']);
+      assert.deepEqual(counts('c2'), [1, 1, 1, 1, 'relative']);
     });
 
     it('_removeConversation removes its zrdt rows', () => {
       insertData(db, 'conversations', [{ id: 'c1' }]);
       DataWriter._removeConversation(db, 'c1');
-      assert.deepEqual(counts('c1'), [0, 0, 0]);
-      assert.deepEqual(counts('c2'), [1, 1, 1]);
+      assert.deepEqual(counts('c1'), [0, 0, 0, 0, 'closed']);
+      assert.deepEqual(counts('c2'), [1, 1, 1, 1, 'relative']);
     });
 
     it('removeAll clears every zrdt table', () => {
       DataWriter.removeAll(db);
-      assert.deepEqual(counts('c1'), [0, 0, 0]);
-      assert.deepEqual(counts('c2'), [0, 0, 0]);
+      assert.deepEqual(counts('c1'), [0, 0, 0, 0, 'closed']);
+      assert.deepEqual(counts('c2'), [0, 0, 0, 0, 'closed']);
     });
   });
 

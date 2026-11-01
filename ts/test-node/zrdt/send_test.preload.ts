@@ -82,9 +82,9 @@ class FakeService implements ZrdtSendServiceType {
     this.calls.push('ensureConversation');
   };
 
-  heads = async (conversationId: string): Promise<Array<Bytes>> => {
-    this.calls.push('heads');
-    return this.backend.heads(conversationId);
+  linkable = async (conversationId: string): Promise<Array<Bytes>> => {
+    this.calls.push('linkable');
+    return this.backend.linkable(conversationId, []);
   };
 
   disownSet = async (): Promise<Array<Bytes>> => {
@@ -291,14 +291,14 @@ describe('zrdt/send: freeze once', () => {
     assert.isNull(plain.content?.dataMessage?.zrdt);
   });
 
-  it('first attempt: heads, nonce, disown, persist frozen, accept, persist digest', async () => {
+  it('first attempt: links, nonce, disown, persist frozen, accept, persist digest', async () => {
     service.disown = [fill(0xdd)];
     const message = makeMessage(service.calls);
     const built = new Array<ZrdtMetaSendType>();
     const content = await freeze(message, 'hello', built);
 
     assert.deepEqual(service.calls, [
-      'heads',
+      'linkable',
       'disownSet',
       'audience',
       'save:frozen',
@@ -385,7 +385,7 @@ describe('zrdt/send: freeze once', () => {
     const second = Proto.Content.encode(await freeze(message, 'one', built));
     assert.deepEqual(second, first);
     assert.lengthOf(built, 0, 'no rebuild');
-    assert.deepEqual(service.calls, ['has'], 'no heads, no accept');
+    assert.deepEqual(service.calls, ['has'], 'no links, no accept');
     assert.deepEqual(message.attributes.zrdt, frozen);
   });
 

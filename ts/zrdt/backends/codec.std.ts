@@ -13,7 +13,10 @@
 // opening; ACCEPT takes `u8 flag ‖ opening?` after the parts; the status
 // NO_AUDIENCE (0x09); the ops AUDIENCE (0x11), SERVE (0x12) and ADDRESSED
 // (0x13). A SERVE `held` item is `digest ‖ opening` (always an opening); an
-// addressed entry is `record ‖ authorCopy flag ‖ opening?`.
+// addressed entry is `record ‖ authorCopy flag ‖ opening?`. The relative
+// store (JOIN_PLAN §6.2): ACCEPT_VIEW (0x14) takes a SERVE reply's entries
+// and replies one result per entry, with the statuses EPHEMERAL (0x0A) and
+// IGNORED (0x0B); LINKABLE (0x15); NEW_RELATIVE (0x16).
 
 import type {
   AcceptRecordResult,
@@ -37,6 +40,7 @@ import type {
   ServeRequest,
   Status,
   VersionInfo,
+  ViewResult,
 } from '../ZrdtBackend.std.ts';
 import {
   IDENTITY_KEY_BYTES,
@@ -64,6 +68,9 @@ export enum Op {
   AUDIENCE = 0x11,
   SERVE = 0x12,
   ADDRESSED = 0x13,
+  ACCEPT_VIEW = 0x14,
+  LINKABLE = 0x15,
+  NEW_RELATIVE = 0x16,
 }
 
 export enum Code {
@@ -77,6 +84,8 @@ export enum Code {
   NOT_FOUND = 0x07,
   BAD_OPENING = 0x08,
   NO_AUDIENCE = 0x09,
+  EPHEMERAL = 0x0a,
+  IGNORED = 0x0b,
   BAD_REQUEST = 0x80,
   UNKNOWN_OP = 0x81,
   NO_CHAT = 0x82,
@@ -457,7 +466,16 @@ export type Request =
   | { op: Op.ACCEPT_RECORD; chat: ChatKey; record: Bytes; opening?: Bytes }
   | { op: Op.AUDIENCE; members: ReadonlyArray<AudienceMember> }
   | ({ op: Op.SERVE } & ServeRequest)
-  | { op: Op.ADDRESSED; chat: ChatKey; aci: Bytes; key: Bytes };
+  | { op: Op.ADDRESSED; chat: ChatKey; aci: Bytes; key: Bytes }
+  | {
+      op: Op.ACCEPT_VIEW;
+      chat: ChatKey;
+      voucher: Bytes;
+      forImport: boolean;
+      entries: ReadonlyArray<ServeEntry>;
+    }
+  | { op: Op.LINKABLE; chat: ChatKey; live: ReadonlyArray<Digest> }
+  | { op: Op.NEW_RELATIVE; chat: ChatKey; group: Bytes };
 
 /** The body of a request (without the op byte). */
 export function encodeRequestBody(req: Request): Bytes {
@@ -535,6 +553,17 @@ export function encodeRequestBody(req: Request): Bytes {
       ]);
     case Op.ADDRESSED:
       return concatBytes([wStr(req.chat), req.aci, req.key]);
+    case Op.ACCEPT_VIEW:
+      return concatBytes([
+        wStr(req.chat),
+        req.voucher,
+        u8(req.forImport ? 1 : 0),
+        encodeServeEntries(req.entries),
+      ]);
+    case Op.LINKABLE:
+      return concatBytes([wStr(req.chat), wDigests(req.live)]);
+    case Op.NEW_RELATIVE:
+      return concatBytes([wStr(req.chat), req.group]);
     default:
       throw new Error('zrdt codec: unknown op');
   }
@@ -633,6 +662,21 @@ export function decodeRequest(
     case Op.SERVE:
     case Op.ADDRESSED:
       req = readAll(body, r => readProtocol3Request(op, r));
+      break;
+    case Op.ACCEPT_VIEW:
+      req = readAll(body, r => ({
+        op,
+        chat: r.str(),
+        voucher: r.take(16),
+        forImport: r.flag(),
+        entries: r.entries(),
+      }));
+      break;
+    case Op.LINKABLE:
+      req = readAll(body, r => ({ op, chat: r.str(), live: r.digests() }));
+      break;
+    case Op.NEW_RELATIVE:
+      req = readAll(body, r => ({ op, chat: r.str(), group: r.take(32) }));
       break;
     default:
       return Code.UNKNOWN_OP;
@@ -736,6 +780,9 @@ export type ResultOf = {
   [Op.AUDIENCE]: AudienceResult;
   [Op.SERVE]: ServeReply;
   [Op.ADDRESSED]: Array<Digest>;
+  [Op.ACCEPT_VIEW]: Array<ViewResult>;
+  [Op.LINKABLE]: Array<Digest>;
+  [Op.NEW_RELATIVE]: undefined;
 };
 
 /** Replies shared by OPEN, SALVAGE, MERGE, ACCEPT, ACCEPT_RECORD. */
@@ -857,9 +904,32 @@ export function encodeReply<O extends Op>(op: O, result: ResultOf[O]): Bytes {
       return concatBytes([ok, s.headerBytes, s.entriesBytes]);
     }
     case Op.ADDRESSED:
+    case Op.LINKABLE:
       return concatBytes([ok, wDigests(result as Array<Digest>)]);
+    case Op.NEW_RELATIVE:
+      return ok;
+    case Op.ACCEPT_VIEW: {
+      const list = result as Array<ViewResult>;
+      return concatBytes([ok, u32(list.length), ...list.map(wViewResult)]);
+    }
     default:
       throw new Error('zrdt codec: unknown op');
+  }
+}
+
+/** One ACCEPT_VIEW result: a status byte, then its body (module header). */
+function wViewResult(result: ViewResult): Bytes {
+  switch (result.kind) {
+    case 'ok':
+      return concatBytes([u8(Code.OK), result.digest]);
+    case 'missing':
+      return concatBytes([u8(Code.MISSING), wDigests(result.digests)]);
+    case 'ephemeral':
+      return u8(Code.EPHEMERAL);
+    case 'ignored':
+      return u8(Code.IGNORED);
+    default:
+      return refusalBytes(result);
   }
 }
 
@@ -919,6 +989,35 @@ function readRefusal(
       return { kind: 'noAudience' };
     default:
       throw new ReplyError(op, status);
+  }
+}
+
+/** One ACCEPT_VIEW result; throws `Short` for a status no entry can get. */
+function readViewResult(r: Reader): ViewResult {
+  const status = r.u8();
+  switch (status) {
+    case Code.OK:
+      return { kind: 'ok', digest: r.take(32) };
+    case Code.MISSING:
+      return { kind: 'missing', digests: r.digests() };
+    case Code.COLLISION:
+      return { kind: 'collision', digest: r.take(32) };
+    case Code.WRONG_CHAT:
+      return { kind: 'wrongChat' };
+    case Code.TOO_LARGE:
+      return { kind: 'tooLarge' };
+    case Code.MALFORMED:
+      return { kind: 'malformed' };
+    case Code.BAD_OPENING:
+      return { kind: 'badOpening' };
+    case Code.NO_AUDIENCE:
+      return { kind: 'noAudience' };
+    case Code.EPHEMERAL:
+      return { kind: 'ephemeral' };
+    case Code.IGNORED:
+      return { kind: 'ignored' };
+    default:
+      throw new Short();
   }
 }
 
@@ -1072,10 +1171,31 @@ export function decodeReply<O extends Op>(
         return reply as R;
       }
       case Op.ADDRESSED:
+      case Op.LINKABLE:
         if (status !== Code.OK) {
           break;
         }
         return r.digests() as R;
+      case Op.NEW_RELATIVE:
+        if (status !== Code.OK) {
+          break;
+        }
+        return undefined as R;
+      case Op.ACCEPT_VIEW: {
+        if (status !== Code.OK) {
+          break;
+        }
+        const count = r.u32();
+        // Every result takes at least one byte.
+        if (count > body.length) {
+          throw new Short();
+        }
+        const list = new Array<ViewResult>();
+        for (let i = 0; i < count; i += 1) {
+          list.push(readViewResult(r));
+        }
+        return list as R;
+      }
       default:
         break;
     }

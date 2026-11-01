@@ -14,6 +14,8 @@ import type {
   ZrdtPendingRowType,
   ZrdtProvenanceRowType,
   ZrdtRecordRowType,
+  ZrdtBoundaryRowType,
+  ZrdtStoreModeType,
 } from '../../types/Zrdt.std.ts';
 import type { ZrdtBackend } from '../../zrdt/ZrdtBackend.std.ts';
 import { DaemonBackend } from '../../zrdt/backends/daemon.node.ts';
@@ -47,6 +49,7 @@ const OTHER_GROUP = filled(32, 0x68);
 const ALICE = 'a1a1a1a1-a1a1-a1a1-a1a1-a1a1a1a1a1a1';
 const BOB = 'b0b0b0b0-b0b0-b0b0-b0b0-b0b0b0b0b0b0';
 const CAROL = 'c0c0c0c0-c0c0-c0c0-c0c0-c0c0c0c0c0c0';
+const DAVE = 'd0d0d0d0-d0d0-d0d0-d0d0-d0d0d0d0d0d0';
 const CHAT = 'conversation-camping';
 
 // Field 201 (JOIN_PLAN §3.2): one entry, Alice with a non-zero key tag.
@@ -77,14 +80,71 @@ class MemoryStorage implements ZrdtServiceStorage {
   records = new Array<ZrdtRecordRowType>();
   pending = new Array<ZrdtPendingRowType>();
   provenance = new Array<ZrdtProvenanceRowType>();
+  modes = new Map<string, ZrdtStoreModeType>();
+  boundary = new Array<ZrdtBoundaryRowType>();
+  // The openings the host holds (message rows), for the re-OPEN.
+  held = new Array<{ digest: B; opening: B }>();
 
   async getZrdtConversationIds(): Promise<Array<string>> {
     return [
       ...new Set([
         ...this.records.map(r => r.conversationId),
         ...this.pending.map(r => r.conversationId),
+        ...this.modes.keys(),
+        ...this.boundary.map(r => r.conversationId),
       ]),
     ];
+  }
+
+  async getZrdtStoreMode(id: string): Promise<ZrdtStoreModeType> {
+    return this.modes.get(id) ?? 'closed';
+  }
+
+  async setZrdtStoreMode(id: string, mode: ZrdtStoreModeType): Promise<void> {
+    if (mode === 'closed') {
+      this.modes.delete(id);
+    } else {
+      this.modes.set(id, mode);
+    }
+  }
+
+  async getZrdtBoundary(id: string): Promise<Array<ZrdtBoundaryRowType>> {
+    return this.boundary.filter(r => r.conversationId === id);
+  }
+
+  async insertZrdtBoundary(
+    rows: ReadonlyArray<ZrdtBoundaryRowType>
+  ): Promise<number> {
+    let n = 0;
+    for (const row of rows) {
+      if (
+        !this.boundary.some(
+          r =>
+            r.conversationId === row.conversationId &&
+            toHex(r.digest) === toHex(row.digest)
+        )
+      ) {
+        this.boundary.push(row);
+        n += 1;
+      }
+    }
+    return n;
+  }
+
+  async archiveZrdtConversation(id: string, archiveId: string): Promise<void> {
+    const move = <T extends { conversationId: string }>(rows: Array<T>) =>
+      rows.map(r =>
+        r.conversationId === id ? { ...r, conversationId: archiveId } : r
+      );
+    this.records = move(this.records);
+    this.pending = move(this.pending);
+    this.provenance = move(this.provenance);
+    this.boundary = move(this.boundary);
+    const mode = this.modes.get(id);
+    if (mode !== undefined) {
+      this.modes.delete(id);
+      this.modes.set(archiveId, mode);
+    }
   }
 
   async getZrdtRecords(id: string): Promise<Array<ZrdtRecordRowType>> {
@@ -211,6 +271,7 @@ function newService(
     storage,
     groupIdOf: id => (id === CHAT ? GROUP : undefined),
     ourAci: () => me,
+    heldOpenings: async id => (id === CHAT ? storage.held : []),
   });
 }
 
@@ -398,7 +459,8 @@ describe('zrdt service', function (this: Mocha.Suite) {
         );
 
         await service.ensureConversation(CHAT, GROUP);
-        const a = digestOf(await incoming(service, ALICE, 'tent?', []));
+        const first = await incoming(service, ALICE, 'tent?', []);
+        const a = digestOf(first);
         const own = await service.acceptOwn(CHAT, {
           groupId: GROUP,
           authorAci: aciStringToBytes(CAROL),
@@ -406,6 +468,16 @@ describe('zrdt service', function (this: Mocha.Suite) {
           dataMessageBytes: dataMessage('stove'),
           links: await service.heads(CHAT),
         });
+        // The host keeps both openings (message rows): the re-OPEN records
+        // their audiences again, so the blob (zrdtS3, with the audiences)
+        // comes back the same.
+        if (first.status !== 'accepted' || first.opening === undefined) {
+          throw new Error('expected an accepted record with its opening');
+        }
+        storage.held.push(
+          { digest: a, opening: first.opening },
+          { digest: own.digest, opening: own.opening }
+        );
         assert.strictEqual(
           own.opening.length,
           32 + dataMessage('stove').length
@@ -649,6 +721,121 @@ describe('zrdt service', function (this: Mocha.Suite) {
         assert.deepEqual((await fresh2.heads(CHAT)).map(toHex), [toHex(a)]);
       });
 
+      it("a newcomer's relative store: ACCEPT_VIEW, the boundary, LINKABLE, re-open, archive (JOIN_PLAN §6)", async () => {
+        // Bob holds a1 <- b1 <- b2. Dave is sent b1 and b2 (here as
+        // structure-only entries) and gets a1 as a boundary digest.
+        const bob = fresh(new MemoryStorage(), BOB);
+        await bob.ensureConversation(CHAT, GROUP);
+        const a1 = digestOf(await incoming(bob, ALICE, 'a1', []));
+        const b1 = digestOf(await incoming(bob, BOB, 'b1', [a1]));
+        const b2 = digestOf(await incoming(bob, BOB, 'b2', [b1]));
+        const recordOf = async (d: B) => {
+          const got = await bob.get(CHAT, d);
+          if (got === undefined) {
+            throw new Error('Bob lacks a record');
+          }
+          return got.record;
+        };
+
+        const storage = new MemoryStorage();
+        const dave = fresh(storage, DAVE);
+        await dave.init();
+        assert.isFalse(await dave.hasStore(CHAT));
+        assert.deepEqual(await dave.heads(CHAT), [], 'heads makes no store');
+        assert.isFalse(await dave.hasStore(CHAT));
+        assert.strictEqual(await dave.startRelative(CHAT, GROUP), 'relative');
+        assert.isTrue(await dave.isRelative(CHAT));
+        assert.strictEqual(storage.modes.get(CHAT), 'relative');
+
+        // A live record from Alice that links b2 arrives first: it waits.
+        const early = await incoming(dave, ALICE, 'c0', [b2]);
+        assert.strictEqual(early.status, 'missing');
+
+        const boundaryEvents = new Array<Array<string>>();
+        dave.events.on('boundary', (_id, digests) =>
+          boundaryEvents.push(digests)
+        );
+        const outcomes = await dave.acceptView(CHAT, {
+          voucherAci: BOB,
+          forImport: false,
+          items: [
+            {
+              entry: { kind: 'after', record: await recordOf(b2) },
+              provenance: { kind: 'relayed', byAci: BOB },
+            },
+            {
+              entry: { kind: 'after', record: await recordOf(b1) },
+              provenance: { kind: 'relayed', byAci: BOB },
+            },
+            {
+              entry: { kind: 'boundary', digest: a1 },
+              provenance: { kind: 'relayed', byAci: BOB },
+            },
+          ],
+        });
+        assert.deepEqual(
+          outcomes.map(o => [o.result.kind, o.isNew]),
+          [
+            ['ok', true],
+            ['ok', true],
+            ['ok', false],
+          ]
+        );
+        assert.deepEqual(boundaryEvents, [[toHex(a1)]]);
+        assert.deepEqual(
+          storage.boundary.map(r => [toHex(r.digest), r.voucherAci]),
+          [[toHex(a1), BOB]]
+        );
+        // The pending record drained; b1 and b2 are stored, a1 is not.
+        assert.isTrue(await dave.has(CHAT, b2));
+        assert.isFalse(await dave.has(CHAT, a1));
+        assert.deepEqual(storage.pending, []);
+        const c0 = early.digest;
+        if (c0 === undefined) {
+          throw new Error('no digest for the pending record');
+        }
+        assert.deepEqual((await dave.heads(CHAT)).map(toHex), [toHex(c0)]);
+
+        // LINKABLE: only heads held live (c0 is Alice's live record).
+        assert.deepEqual((await dave.linkable(CHAT)).map(toHex), [toHex(c0)]);
+
+        // Re-open after a restart: the same store, still relative.
+        const exported = toHex(await dave.exportBlob(CHAT));
+        const again = fresh(storage, DAVE);
+        await again.init();
+        assert.isTrue(await again.isRelative(CHAT));
+        assert.deepEqual((await again.heads(CHAT)).map(toHex), [toHex(c0)]);
+        assert.strictEqual(toHex(await again.exportBlob(CHAT)), exported);
+
+        // A closed store ignores boundary entries.
+        const carol = fresh(new MemoryStorage(), CAROL);
+        await carol.ensureConversation(CHAT, GROUP);
+        const ignored = await carol.acceptView(CHAT, {
+          voucherAci: BOB,
+          forImport: false,
+          items: [
+            {
+              entry: { kind: 'boundary', digest: a1 },
+              provenance: { kind: 'relayed', byAci: BOB },
+            },
+          ],
+        });
+        assert.deepEqual(
+          ignored.map(o => o.result.kind),
+          ['ignored']
+        );
+        assert.isFalse(await carol.isRelative(CHAT));
+
+        // A re-add archives the store: the conversation has none, and its rows
+        // moved to the archive key.
+        const archiveId = await again.archive(CHAT);
+        assert.isFalse(await again.hasStore(CHAT));
+        assert.isTrue(
+          storage.records.every(r => r.conversationId === archiveId)
+        );
+        assert.strictEqual(storage.modes.get(archiveId), 'relative');
+      });
+
       it('disowns records in our name that we did not create', async () => {
         const storage = new MemoryStorage();
         const carol = fresh(storage, CAROL);
@@ -735,11 +922,16 @@ describe('zrdt service', function (this: Mocha.Suite) {
 });
 
 /** A store blob from encoded records (any order). */
+/** A closed zrdtS3 blob without audiences around these records. */
 function concatBlob(
   group: B,
   records: ReadonlyArray<Uint8Array<ArrayBuffer>>
 ): B {
   const parts: Array<Uint8Array<ArrayBuffer>> = [
+    new TextEncoder().encode('zrdtS3'),
+    Uint8Array.of(0),
+    u32(0),
+    u32(0),
     new TextEncoder().encode('zrdtS2'),
     group,
     u32(records.length),

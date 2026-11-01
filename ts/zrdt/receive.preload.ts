@@ -36,7 +36,11 @@ import { uuidToBytes } from '../util/uuidToBytes.std.ts';
 import { fromAciUuidBytes } from '../util/ServiceId.node.ts';
 import { itemStorage } from '../textsecure/Storage.preload.ts';
 import type { AciString } from '../types/ServiceId.std.ts';
-import { makeZrdtGapMessageAttributes } from '../types/Zrdt.std.ts';
+import {
+  makeZrdtBoundaryMessageAttributes,
+  makeZrdtGapMessageAttributes,
+  makeZrdtUnavailableMessageAttributes,
+} from '../types/Zrdt.std.ts';
 import type {
   ZrdtGapStateType,
   ZrdtStatusAttributesType,
@@ -49,8 +53,17 @@ import {
   relayProvenance,
 } from './resendLogic.std.ts';
 import { zrdtEvents, zrdtService } from './service.preload.ts';
-import type { ZrdtProvenance } from './service.preload.ts';
-import { requestAuthorCopy, zrdtResendScheduler } from './resend.preload.ts';
+import type {
+  ZrdtProvenance,
+  ZrdtViewItem,
+  ZrdtViewOutcome,
+} from './service.preload.ts';
+import type { ServeEntry } from './ZrdtBackend.std.ts';
+import {
+  requestAuthorCopy,
+  startCatchUp,
+  zrdtResendScheduler,
+} from './resend.preload.ts';
 
 const { isEqual } = lodash;
 
@@ -150,6 +163,49 @@ function onAcceptedEvent(conversationId: string, digest: string): void {
   drop(resolveGapsForShownMessage(conversationId, digest));
 }
 
+// A relative store took boundary digests (JOIN_PLAN §6.2): gap rows waiting
+// for them are answered (the boundary row stands for them), and nobody is
+// asked for them again.
+function onBoundaryEvent(
+  conversationId: string,
+  digests: ReadonlyArray<string>
+): void {
+  drop(
+    safely('resolveGapsForBoundary', () =>
+      resolveGapsForBoundary(conversationId, digests)
+    )
+  );
+}
+
+async function resolveGapsForBoundary(
+  conversationId: string,
+  digests: ReadonlyArray<string>
+): Promise<void> {
+  const boundary = new Set(digests);
+  for (const digest of boundary) {
+    zrdtResendScheduler.resolved(conversationId, digest);
+  }
+  for (const row of await loadGapRows(conversationId)) {
+    const gap = row.get('zrdtGap');
+    if (!gap || gap.state === 'boundary') {
+      continue;
+    }
+    const remaining = gap.missingDigests.filter(d => !boundary.has(d));
+    if (remaining.length === gap.missingDigests.length) {
+      continue;
+    }
+    if (remaining.length === 0) {
+      log.info(`gap row ${row.id}: its digests are boundary digests`);
+      // oxlint-disable-next-line no-await-in-loop
+      await DataWriter.removeMessageById(row.id, { cleanupMessages });
+    } else {
+      row.set({ zrdtGap: { ...gap, missingDigests: remaining } });
+      // oxlint-disable-next-line no-await-in-loop
+      await window.MessageCache.saveMessage(row.attributes);
+    }
+  }
+}
+
 let listening = false;
 // Called at startup (background.preload.ts) and on first use.
 export function initZrdtReceive(): void {
@@ -159,6 +215,7 @@ export function initZrdtReceive(): void {
   listening = true;
   zrdtEvents.on('accepted', onAcceptedEvent);
   zrdtEvents.on('classify', scheduleStatusRefresh);
+  zrdtEvents.on('boundary', onBoundaryEvent);
 }
 
 // --- the live step (MessageReceiver) ----------------------------------------------
@@ -227,6 +284,19 @@ export async function zrdtReceiveLive({
       return undefined;
     }
     const conversationId = conversation.id;
+    if (
+      meta.links.length > 0 &&
+      !(await zrdtService.hasStore(conversationId))
+    ) {
+      // This device has no store, and the record links history it does not
+      // hold: catch up (JOIN_PLAN §6.1). The store is relative, so the
+      // record waits in zrdt_pending until the boundary arrives.
+      log.info(`${logId}: no store, and the record links history: catch-up`);
+      await zrdtService.startRelative(conversationId, groupId);
+      drop(
+        startCatchUp(conversation, { reason: 'a live record links history' })
+      );
+    }
     await zrdtService.ensureConversation(conversationId, groupId);
 
     const outcome = await zrdtService.acceptIncoming(conversationId, {
@@ -518,6 +588,7 @@ export async function setGapState(
     if (
       !gap ||
       gap.state === 'content-unavailable' ||
+      gap.state === 'boundary' ||
       !gap.missingDigests.some(digest => wanted.has(digest))
     ) {
       continue;
@@ -537,7 +608,12 @@ export async function setGapState(
 
 type GapResolution =
   | Readonly<{ kind: 'content' }>
-  | Readonly<{ kind: 'unavailable'; authorAci: AciString }>;
+  | Readonly<{
+      kind: 'unavailable';
+      authorAci: AciString;
+      // The member whose SERVE reply carried no content.
+      fromAci?: AciString;
+    }>;
 
 async function resolveGapRow(
   row: MessageModel,
@@ -561,6 +637,7 @@ async function resolveGapRow(
         missingDigests: [digest],
         state: 'content-unavailable',
         contentUnavailableAuthorAci: how.authorAci,
+        contentUnavailableFromAci: how.fromAci,
       },
     });
   } else {
@@ -578,7 +655,7 @@ async function resolveGapRow(
 // checks. ACCEPT_RECORD checks the opening against the record's commit and
 // records its audience; a bad opening, or one without an audience, falls
 // back to structure only. `authorCopy`: the entry was marked author copy.
-export async function acceptRelayedRecord({
+async function acceptRelayedRecord({
   groupId,
   responderAci,
   record,
@@ -652,17 +729,296 @@ export async function acceptRelayedRecord({
   // MessageReceiver queue (like onMessageReceived, it must not wait on the
   // conversation queue).
   drop(
-    safely('onRelayAccepted', () =>
-      onRelayAccepted({
+    safely('onRelayAccepted', async () => {
+      await onRelayAccepted({
         conversationId,
         digest: outcome.digest,
         record: outcome.record,
         responderAci,
         opening: usedOpening,
         authorCopy,
-      })
-    )
+      });
+    })
   );
+}
+
+// --- SERVE replies (ACCEPT_VIEW, JOIN_PLAN §4.4, §6) ---------------------------------
+
+/** The author of an encoded record: its last 16 bytes. */
+function authorOfRecord(
+  record: Uint8Array<ArrayBuffer>
+): AciString | undefined {
+  return record.byteLength >= 16
+    ? aciFromBytes(record.subarray(-16))
+    : undefined;
+}
+
+function viewItem(entry: ServeEntry, responderAci: AciString): ZrdtViewItem {
+  if (entry.kind === 'boundary') {
+    return { entry, provenance: { kind: 'relayed', byAci: responderAci } };
+  }
+  return {
+    entry,
+    provenance: relayProvenance(
+      responderAci,
+      authorOfRecord(entry.record),
+      entry.kind === 'addressed' && entry.authorCopy
+    ),
+  };
+}
+
+/** The DataMessage timestamp an opening commits, or undefined. */
+function openingTimestamp(
+  opening: Uint8Array<ArrayBuffer> | undefined
+): number | undefined {
+  if (!opening || opening.byteLength <= NONCE_BYTES) {
+    return undefined;
+  }
+  try {
+    const decoded = Proto.DataMessage.decode(
+      own(opening.subarray(NONCE_BYTES))
+    );
+    const timestamp = Number(decoded.timestamp ?? 0);
+    return timestamp > 0 ? timestamp : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** A summary of one entry, for logs and the CI hooks (no content). */
+export type ZrdtServedEntrySummary = Readonly<{
+  kind: ServeEntry['kind'];
+  // The record's digest (when ACCEPT_VIEW stored it) or the boundary digest.
+  digest?: string;
+  hasOpening: boolean;
+  authorCopy: boolean;
+  result: string;
+}>;
+
+/**
+ * A sealed SERVE reply that passed the §4.4 checks and opened (the caller,
+ * resend.preload.ts, did both): ACCEPT_VIEW its entries with the responder
+ * as voucher (a closed store ignores boundary entries), then show what came.
+ *
+ * - A catch-up: the records with content are shown in the order they were
+ *   sent, below one boundary row if the store took boundary digests; a
+ *   record without content gets a "content not available from <responder>"
+ *   row.
+ * - A per-digest repair: each record goes on as a relay (gap rows, author
+ *   fast path, own-name alarm). A record whose links are still missing goes
+ *   to zrdt_pending through ACCEPT_RECORD, and its links are asked for.
+ */
+export async function takeServedReply({
+  conversationId,
+  groupId,
+  responderAci,
+  entries,
+  catchUp,
+}: Readonly<{
+  conversationId: string;
+  groupId: Uint8Array<ArrayBuffer>;
+  responderAci: AciString;
+  entries: ReadonlyArray<ServeEntry>;
+  catchUp: boolean;
+}>): Promise<Array<ZrdtServedEntrySummary>> {
+  initZrdtReceive();
+  const conversation = window.ConversationController.get(conversationId);
+  if (
+    !conversation ||
+    !conversation.areWeAGroupMember() ||
+    !conversation.hasMember(responderAci)
+  ) {
+    log.warn('served: not a group we share with the responder; ignored');
+    return [];
+  }
+  await zrdtService.ensureConversation(conversationId, groupId);
+  const items = entries.map(entry => viewItem(entry, responderAci));
+  const outcomes = await zrdtService.acceptView(conversationId, {
+    voucherAci: responderAci,
+    forImport: false,
+    items,
+  });
+  const summary = entries.map((entry, i) => summarize(entry, outcomes[i]));
+  log.info(
+    `served by ${responderAci} (${catchUp ? 'catch-up' : 'per-digest'}): ` +
+      summary.map(e => `${e.kind}:${e.result}`).join(' ')
+  );
+
+  type Taken = {
+    digest: Uint8Array<ArrayBuffer>;
+    record: Uint8Array<ArrayBuffer>;
+    opening: Uint8Array<ArrayBuffer> | undefined;
+    authorCopy: boolean;
+    timestamp: number | undefined;
+  };
+  const taken = new Array<Taken>();
+  let tookBoundary = false;
+  for (const [i, entry] of entries.entries()) {
+    const result = outcomes[i]?.result;
+    if (entry.kind === 'boundary') {
+      tookBoundary ||= result?.kind === 'ok';
+      continue;
+    }
+    const opening = entry.kind === 'addressed' ? entry.opening : undefined;
+    const authorCopy = entry.kind === 'addressed' && entry.authorCopy;
+    if (result?.kind === 'ok') {
+      taken.push({
+        digest: result.digest,
+        record: entry.record,
+        opening,
+        authorCopy,
+        timestamp: openingTimestamp(opening),
+      });
+    } else if (
+      result?.kind === 'missing' ||
+      result?.kind === 'badOpening' ||
+      result?.kind === 'noAudience'
+    ) {
+      // As a relay: pending with its opening, or structure only.
+      // oxlint-disable-next-line no-await-in-loop
+      await acceptRelayedRecord({
+        groupId,
+        responderAci,
+        record: entry.record,
+        opening: result.kind === 'missing' ? opening : undefined,
+        authorCopy,
+      });
+    } else {
+      log.warn(`served: an entry was refused: ${result?.kind ?? 'none'}`);
+    }
+  }
+
+  if (!catchUp) {
+    for (const item of taken) {
+      drop(
+        safely('onRelayAccepted', async () => {
+          await onRelayAccepted({
+            conversationId,
+            digest: item.digest,
+            record: item.record,
+            responderAci,
+            opening: item.opening,
+            authorCopy: item.authorCopy,
+          });
+        })
+      );
+    }
+    return summary;
+  }
+
+  // A catch-up: show in the order the messages were sent.
+  const already = new Set(
+    (
+      await DataReader.getMessageIdsByZrdtDigest(
+        conversationId,
+        taken.map(item => toHex(item.digest))
+      )
+    ).map(row => row.digest)
+  );
+  const fresh = taken.filter(item => !already.has(toHex(item.digest)));
+  const withContent = fresh
+    .filter(item => item.opening != null)
+    .sort((a, b) => (a.timestamp ?? 0) - (b.timestamp ?? 0));
+  if (tookBoundary && (await zrdtService.isRelative(conversationId))) {
+    await ensureBoundaryRow(conversation, withContent[0]?.timestamp);
+  }
+  for (const item of withContent) {
+    // oxlint-disable-next-line no-await-in-loop
+    await safely('onRelayAccepted', async () => {
+      await onRelayAccepted({
+        conversationId,
+        digest: item.digest,
+        record: item.record,
+        responderAci,
+        opening: item.opening,
+        authorCopy: item.authorCopy,
+        wasRequested: true,
+      });
+    });
+  }
+  for (const item of fresh.filter(x => x.opening == null)) {
+    // oxlint-disable-next-line no-await-in-loop
+    await safely('unavailableRow', () =>
+      createUnavailableRow(conversation, item.digest, responderAci)
+    );
+  }
+  scheduleStatusRefresh(conversationId);
+  return summary;
+}
+
+function summarize(
+  entry: ServeEntry,
+  outcome: ZrdtViewOutcome | undefined
+): ZrdtServedEntrySummary {
+  const result = outcome?.result;
+  let digest: string | undefined;
+  if (entry.kind === 'boundary') {
+    digest = toHex(entry.digest);
+  } else if (result?.kind === 'ok') {
+    digest = toHex(result.digest);
+  }
+  return {
+    kind: entry.kind,
+    digest,
+    hasOpening: entry.kind === 'addressed' && entry.opening != null,
+    authorCopy: entry.kind === 'addressed' && entry.authorCopy,
+    result: result?.kind ?? 'none',
+  };
+}
+
+/**
+ * One boundary row per conversation (JOIN_PLAN §6.3): "Earlier messages: not
+ * available to you", just above the earliest message the catch-up brought.
+ */
+async function ensureBoundaryRow(
+  conversation: ConversationModel,
+  earliestSentAt: number | undefined
+): Promise<void> {
+  const rows = await loadGapRows(conversation.id);
+  if (rows.some(row => row.get('zrdtGap')?.state === 'boundary')) {
+    return;
+  }
+  const receivedAt = incrementMessageCounter();
+  const sentAt = (earliestSentAt ?? Date.now()) - 1;
+  const attributes = makeZrdtBoundaryMessageAttributes({
+    id: generateMessageId(receivedAt).id,
+    conversationId: conversation.id,
+    receivedAt,
+    sentAt,
+  });
+  const row = new MessageModel(attributes);
+  await window.MessageCache.saveMessage(row, { forceSave: true });
+  window.MessageCache.register(row);
+  drop(conversation.onNewMessage(row));
+  log.info(`boundary row ${row.id} in ${conversation.idForLogging()}`);
+}
+
+/** A catch-up record without content: one row naming author and responder. */
+async function createUnavailableRow(
+  conversation: ConversationModel,
+  digestBytes: Uint8Array<ArrayBuffer>,
+  responderAci: AciString
+): Promise<void> {
+  const digest = toHex(digestBytes);
+  const held = await zrdtService.get(conversation.id, digestBytes);
+  const authorAci = held ? aciFromBytes(held.authorAci) : undefined;
+  if (!authorAci) {
+    return;
+  }
+  const receivedAt = incrementMessageCounter();
+  const attributes = makeZrdtUnavailableMessageAttributes({
+    id: generateMessageId(receivedAt).id,
+    conversationId: conversation.id,
+    receivedAt,
+    sentAt: Date.now(),
+    digest,
+    authorAci,
+    responderAci,
+  });
+  const row = new MessageModel(attributes);
+  await window.MessageCache.saveMessage(row, { forceSave: true });
+  window.MessageCache.register(row);
+  drop(conversation.onNewMessage(row));
 }
 
 async function safely(what: string, fn: () => Promise<void>): Promise<void> {
@@ -729,17 +1085,17 @@ async function onRelayAccepted({
   opening: Uint8Array<ArrayBuffer> | undefined;
   authorCopy: boolean;
   wasRequested?: boolean;
-}>): Promise<void> {
+}>): Promise<boolean> {
   const conversation = window.ConversationController.get(conversationId);
   if (!conversation) {
-    return;
+    return false;
   }
   const digest = toHex(digestBytes);
   const held = await zrdtService.get(conversationId, digestBytes);
   const authorAci = held ? aciFromBytes(held.authorAci) : undefined;
   if (!authorAci) {
     log.warn(`relay: accepted ${digest.slice(0, 8)} but cannot read author`);
-    return;
+    return false;
   }
   const provenance = relayProvenance(responderAci, authorAci, authorCopy);
   if (provenance.kind === 'live') {
@@ -786,13 +1142,19 @@ async function onRelayAccepted({
       await resolveGapRow(
         row,
         digest,
-        shown ? { kind: 'content' } : { kind: 'unavailable', authorAci }
+        shown
+          ? { kind: 'content' }
+          : { kind: 'unavailable', authorAci, fromAci: responderAci }
       );
     }
   } else if (action === 'structureOnly' || action === 'show') {
     for (const row of gaps) {
       // oxlint-disable-next-line no-await-in-loop
-      await resolveGapRow(row, digest, { kind: 'unavailable', authorAci });
+      await resolveGapRow(row, digest, {
+        kind: 'unavailable',
+        authorAci,
+        fromAci: responderAci,
+      });
     }
   }
 
@@ -804,6 +1166,7 @@ async function onRelayAccepted({
     drop(requestAuthorCopy(conversationId, digest, authorAci));
   }
   scheduleStatusRefresh(conversationId);
+  return action === 'show' && opening != null;
 }
 
 async function isLive(

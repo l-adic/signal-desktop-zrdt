@@ -22,12 +22,24 @@
 //           record; Carol imports it: OPEN fails, the red banner names the
 //           missing message; "Keep what verifies" reports kept and dropped,
 //           and Carol's own chat does not change (she holds every kept one).
-//   beat 5  Dave's desktop is linked; Bob exports; doctor.ts appends two
-//           fakes by Bob on top of the genuine head; Dave imports: all in
-//           the collapsed section, unconfirmed. Alice writes: the genuine
-//           history is "held by Alice", Alice's own "confirmed". Bob writes:
-//           Bob's genuine ones confirmed, the fakes "not confirmed by Bob".
+//   beat 5  Erin's desktop is linked (a member from the start, no store
+//           yet); Bob exports; doctor.ts appends two fakes by Bob on top of
+//           the genuine head; Erin imports: all in the collapsed section,
+//           unconfirmed. Alice writes: the genuine history is "held by
+//           Alice", Alice's own "confirmed". Bob writes: Bob's genuine ones
+//           confirmed, the fakes "not confirmed by Bob".
 //   rules   hold(carol) / release(carol) (no zrdt needed).
+//   beat 6  JOIN (zrdt docs/JOIN_PLAN.md): Alice adds Dave to "Camping" (a
+//           real add through the mock, after everything above); Bob and
+//           Carol write; Dave links his desktop, which has no store: it asks
+//           Alice (the adder) for a catch-up, and SERVE's sealed reply gives
+//           it the messages sent to Dave, with content, and the older heads
+//           as boundary digests. Dave holds every post-join message, shows a
+//           boundary row, and holds no pre-join content anywhere (messages
+//           table, zrdt tables, window); his heads equal Alice's. Live
+//           messages flow both ways. Dave asks Alice and Bob for a pre-join
+//           digest by itself: each reply is that digest, as a boundary
+//           digest only. Alice, Bob and Carol still hold everything.
 //
 // Each check is tagged `harness` (the mock and the villain) or `zrdt` (needs
 // the fork's zrdt lanes: digests on messages, gap rows, resend, compare
@@ -49,6 +61,7 @@ import { getTimelineMessageWithText } from '../ts/test-mock/helpers.node.ts';
 import { sleep } from '../ts/util/sleep.std.ts';
 import {
   ASK_AGAIN,
+  BOUNDARY_ROW_TEXT,
   COPY_COMPARE_CODE,
   KEEP_WHAT_VERIFIES,
   PASTE_COMPARE_CODE,
@@ -75,6 +88,7 @@ import { startPanel } from './panel.ts';
 import {
   REPO,
   absent,
+  addToGroup,
   app,
   configureEnv,
   conversationId,
@@ -110,6 +124,8 @@ const CLASSIFY_MS = 20_000;
 // How often the relayed state is sampled in beat 2 (it lasts
 // ZRDT_AUTHOR_FASTPATH_DELAY_MS, 3 s).
 const RELAY_POLL_MS = 100;
+// The old desktops apply a group change (beat 6).
+const GROUP_UPDATE_MS = 30_000;
 
 type Kind = 'harness' | 'zrdt';
 type Check = {
@@ -344,6 +360,14 @@ async function audienceCommitted(
   });
 }
 
+/** The members of the group from its creation (not the late joiner). */
+function founders(demo: Demo): Array<Member> {
+  return demo.members.filter(m => m.name !== LATE);
+}
+
+// Beat 6's late joiner.
+const LATE = 'dave';
+
 async function post(
   panelUrl: string,
   route: string,
@@ -465,7 +489,7 @@ async function beat1(demo: Demo, trio: ReadonlyArray<Member>): Promise<void> {
     // oxlint-disable-next-line no-await-in-loop
     await sameDigest(`beat1 same zrdtDigest "${sent.text}"`, sent, trio);
   }
-  const audience = await expectedAudience(demo.members);
+  const audience = await expectedAudience(founders(demo));
   for (const sent of sentAll) {
     // oxlint-disable-next-line no-await-in-loop
     await audienceCommitted(
@@ -1096,26 +1120,26 @@ function mismatches(
 }
 
 async function beat5(demo: Demo): Promise<void> {
-  const { alice, bob, dave } = demo.byName;
+  const { alice, bob, erin } = demo.byName;
   const aciOf = (m: Member) => m.boot.phone.device.aci.toLowerCase();
   const nameByAuthorHex = new Map(
     demo.members.map(m => [aciOf(m).replace(/-/g, ''), m.name])
   );
 
   const linkedOk = await attempt(
-    "beat5 Dave's desktop links (empty store)",
+    "beat5 Erin's desktop links (empty store)",
     'harness',
     async () => {
-      await linkDesktop(demo, 'dave');
+      await linkDesktop(demo, 'erin');
       await tile(linked(demo));
-      await openGroup(dave, demo.group);
+      await openGroup(erin, demo.group);
       let heads: string;
       try {
-        heads = await sortedHeads(demo, dave);
+        heads = await sortedHeads(demo, erin);
       } catch (error) {
         heads = `(heads: ${String(error).split('\n')[0]})`;
       }
-      return { ok: true, detail: `Dave's heads: [${heads}]` };
+      return { ok: true, detail: `Erin's heads: [${heads}]` };
     }
   );
   if (!linkedOk) {
@@ -1123,7 +1147,7 @@ async function beat5(demo: Demo): Promise<void> {
   }
   const four = linked(demo);
 
-  // Bob exports; doctor.ts appends two fakes by Bob; Dave's import path.
+  // Bob exports; doctor.ts appends two fakes by Bob; Erin's import path.
   let genuine: Array<Analysed> = [];
   let fakes: ReadonlyArray<string> = [];
   const vias5: Array<string> = [];
@@ -1142,7 +1166,7 @@ async function beat5(demo: Demo): Promise<void> {
         daemon: process.env.ZRDT_DAEMON,
       });
       fakes = result.fakes;
-      const out = await dumpPath(demo, dave);
+      const out = await dumpPath(demo, erin);
       await fs.writeFile(out, located.replace(result.blob));
       const bobHeads = await sortedHeads(demo, bob);
       return {
@@ -1162,14 +1186,14 @@ async function beat5(demo: Demo): Promise<void> {
   const total = genuine.length + fakes.length;
 
   const imported = await attempt(
-    'beat5 Dave imports: everything collapsed and unconfirmed',
+    'beat5 Erin imports: everything collapsed and unconfirmed',
     'zrdt',
     async () => {
-      const imp = await importVia(demo, dave);
+      const imp = await importVia(demo, erin);
       vias5.push(`import: ${imp.how}`);
       const r = { value: imp.status };
       const res = await until(CLASSIFY_MS, async () => {
-        const state = await convState(demo, dave);
+        const state = await convState(demo, erin);
         const items = state?.unconfirmed ?? [];
         const allUnconfirmed = items.every(
           i => i.status.kind === 'unconfirmed'
@@ -1180,7 +1204,7 @@ async function beat5(demo: Demo): Promise<void> {
         };
       });
       const title = unconfirmedSectionTitle(total);
-      const onScreen = await visible(page(dave), title, UI_MS);
+      const onScreen = await visible(page(erin), title, UI_MS);
       return {
         ok: r.value === 'ok' && res.ok && onScreen,
         detail: `import status=${r.value}; ${res.detail}; "${title}" ${onScreen ? 'shown' : 'NOT shown'}`,
@@ -1195,12 +1219,12 @@ async function beat5(demo: Demo): Promise<void> {
   );
   // Open the section so the labels are on screen (one click in the demo).
   try {
-    await page(dave)
+    await page(erin)
       .locator('.ZrdtUnconfirmed__toggle')
       .first()
       .click({ timeout: UI_MS });
   } catch {
-    say('could not expand the unconfirmed section on Dave');
+    say('could not expand the unconfirmed section on Erin');
   }
   await attempt(
     'beat5 imported history shows its verified text; the fakes have none',
@@ -1209,7 +1233,7 @@ async function beat5(demo: Demo): Promise<void> {
       if (!imported) {
         return { ok: false, detail: 'skipped: the import failed' };
       }
-      const state = await convState(demo, dave);
+      const state = await convState(demo, erin);
       const items = state?.unconfirmed ?? [];
       const fakeSet = new Set(fakes);
       const withText = items.filter(i => !fakeSet.has(i.digest) && i.text);
@@ -1220,7 +1244,7 @@ async function beat5(demo: Demo): Promise<void> {
         fakeSet.has(items.at(-1)?.digest ?? '') &&
         fakeSet.has(items.at(-2)?.digest ?? '');
       const onScreen = await visible(
-        page(dave),
+        page(erin),
         "who's bringing the tent?",
         UI_MS
       );
@@ -1242,16 +1266,16 @@ async function beat5(demo: Demo): Promise<void> {
   // Alice writes.
   const fromAlice = {
     from: alice,
-    text: 'welcome Dave! bring a headlamp',
+    text: 'welcome Erin! bring a headlamp',
     ts: 0,
   };
   fromAlice.ts = await send(alice, fromAlice.text);
-  const daveGotAlice = await shown(dave, fromAlice.ts, fromAlice.text);
+  const erinGotAlice = await shown(erin, fromAlice.ts, fromAlice.text);
   check(
-    "beat5 Alice's message reaches Dave",
+    "beat5 Alice's message reaches Erin",
     'harness',
-    daveGotAlice,
-    `dave=${daveGotAlice}`
+    erinGotAlice,
+    `erin=${erinGotAlice}`
   );
   await attempt(
     'beat5 Alice writes: genuine history "held by Alice", her own "confirmed"',
@@ -1272,7 +1296,7 @@ async function beat5(demo: Demo): Promise<void> {
         ...fakes.map(f => ({ digest: f, who: 'fake', want: 'unconfirmed' })),
       ];
       const res = await until(CLASSIFY_MS, async () => {
-        const state = await convState(demo, dave);
+        const state = await convState(demo, erin);
         const bad = mismatches(state?.statuses ?? {}, want);
         return {
           ok: bad.length === 0,
@@ -1284,8 +1308,8 @@ async function beat5(demo: Demo): Promise<void> {
       });
       const title = unconfirmedSectionTitle(fakes.length);
       const [held, titled] = await Promise.all([
-        visible(page(dave), 'held by Alice', UI_MS),
-        visible(page(dave), title, UI_MS),
+        visible(page(erin), 'held by Alice', UI_MS),
+        visible(page(erin), title, UI_MS),
       ]);
       return {
         ok: res.ok && held && titled,
@@ -1296,14 +1320,14 @@ async function beat5(demo: Demo): Promise<void> {
   await screenshots(demo, four, 'beat5-alice');
 
   // Bob writes.
-  const fromBob = { from: bob, text: "I'll drive Dave", ts: 0 };
+  const fromBob = { from: bob, text: "I'll drive Erin", ts: 0 };
   fromBob.ts = await send(bob, fromBob.text);
-  const daveGotBob = await shown(dave, fromBob.ts, fromBob.text);
+  const erinGotBob = await shown(erin, fromBob.ts, fromBob.text);
   check(
-    "beat5 Bob's message reaches Dave",
+    "beat5 Bob's message reaches Erin",
     'harness',
-    daveGotBob,
-    `dave=${daveGotBob}`
+    erinGotBob,
+    `erin=${erinGotBob}`
   );
   await attempt(
     'beat5 Bob writes: his genuine ones confirmed, the fakes "not confirmed by Bob"',
@@ -1330,7 +1354,7 @@ async function beat5(demo: Demo): Promise<void> {
         g => authorName(g) !== 'alice' && authorName(g) !== 'bob'
       );
       const res = await until(CLASSIFY_MS, async () => {
-        const state = await convState(demo, dave);
+        const state = await convState(demo, erin);
         const statuses = state?.statuses ?? {};
         const bad = mismatches(statuses, want);
         // Carol's stay "held by" someone until Carol writes.
@@ -1347,7 +1371,7 @@ async function beat5(demo: Demo): Promise<void> {
         };
       });
       const notConfirmed = await visible(
-        page(dave),
+        page(erin),
         'not confirmed by Bob',
         UI_MS
       );
@@ -1379,6 +1403,442 @@ async function holdRelease(demo: Demo, panelUrl: string): Promise<void> {
   await post(panelUrl, 'clear');
 }
 
+// --- beat 6: a member joins later (JOIN_PLAN) ------------------------------------
+
+type CIMessage = MessageView & {
+  type: string;
+  sent_at: number;
+  zrdtGap?: { state: string; missingDigests: Array<string> };
+};
+
+async function allMessages(demo: Demo, m: Member): Promise<Array<CIMessage>> {
+  const r = await hook<Array<CIMessage>>(
+    m,
+    'allMessages',
+    await conversationId(demo, m)
+  );
+  if (r.missing) {
+    throw new Error('no allMessages hook');
+  }
+  return r.value;
+}
+
+type CatchUpView = {
+  hasStore: boolean;
+  relative: boolean;
+  reason?: string;
+  asked: Array<string>;
+  answeredBy?: string;
+  replies: number;
+};
+
+type ServedView = {
+  responderAci: string;
+  mode: string;
+  wanted: Array<string>;
+  entries: Array<{
+    kind: string;
+    digest?: string;
+    hasOpening: boolean;
+    authorCopy: boolean;
+    result: string;
+  }>;
+};
+
+type TablesView = {
+  relative: boolean;
+  records: Array<string>;
+  pending: Array<string>;
+  boundary: Array<{ digest: string; voucherAci: string }>;
+};
+
+async function hookValue<T>(
+  demo: Demo,
+  m: Member,
+  name: string,
+  ...args: ReadonlyArray<unknown>
+): Promise<T> {
+  const r = await hook<T>(m, name, await conversationId(demo, m), ...args);
+  if (r.missing) {
+    throw new Error(`no ${name} hook`);
+  }
+  return r.value;
+}
+
+const CATCH_UP_MS = 90_000;
+
+async function beat6(demo: Demo): Promise<void> {
+  const { alice, bob, carol, dave } = demo.byName;
+  // The desktops linked so far (Erin's only if beat 5 ran).
+  const old = linked(demo).filter(m => m !== dave);
+  const aciOf = (m: Member) => m.boot.phone.device.aci.toLowerCase();
+
+  // What the group holds before Dave joins: every message with a digest, at
+  // Alice (who holds them all), Bob and Carol.
+  const before = new Map<string, string>();
+  for (const m of [alice, bob, carol]) {
+    // oxlint-disable-next-line no-await-in-loop
+    for (const msg of await allMessages(demo, m)) {
+      if (msg.zrdtDigest && msg.body) {
+        before.set(msg.zrdtDigest, msg.body);
+      }
+    }
+  }
+  const preDigests = new Set(before.keys());
+  const preTexts = [...new Set(before.values())];
+  check(
+    'beat6 pre-join history to protect',
+    'harness',
+    preDigests.size >= 3,
+    `${preDigests.size} messages (${preTexts.length} texts) before the add`
+  );
+
+  // The add: Alice's phone adds Dave; every old desktop applies it.
+  const added = await attempt(
+    'beat6 Alice adds Dave; every old desktop sees him as a member',
+    'harness',
+    async () => {
+      const revision = await addToGroup(demo, 'alice', 'dave');
+      const res = await until(GROUP_UPDATE_MS, async () => {
+        const seen = await Promise.all(
+          old.map(async m =>
+            (await hookValue<Array<string>>(demo, m, 'memberAcis'))
+              .map(a => a.toLowerCase())
+              .includes(aciOf(dave))
+          )
+        );
+        return {
+          ok: seen.every(Boolean),
+          detail: old.map((m, i) => `${m.name}=${seen[i]}`).join(' '),
+        };
+      });
+      return { ok: res.ok, detail: `revision ${revision}; ${res.detail}` };
+    }
+  );
+  if (!added) {
+    return;
+  }
+
+  // Post-join messages written before Dave's desktop exists: only the
+  // catch-up can bring them to it.
+  const postJoin: Array<Sent> = [];
+  for (const [from, text] of [
+    [bob, 'Dave is coming too'],
+    [carol, 'great, two tents then'],
+  ] as const) {
+    // oxlint-disable-next-line no-await-in-loop
+    const ts = await send(from, text);
+    const sent = { from, text, ts };
+    postJoin.push(sent);
+    const others = old.filter(o => o !== from);
+    // oxlint-disable-next-line no-await-in-loop
+    const ok = await Promise.all(others.map(o => shown(o, ts, text)));
+    check(
+      `beat6 delivered "${text}"`,
+      'harness',
+      ok.every(Boolean),
+      others.map((o, i) => `${o.name}=${ok[i]}`).join(' ')
+    );
+  }
+  const five = await expectedAudience([...founders(demo), dave]);
+  for (const sent of postJoin) {
+    // oxlint-disable-next-line no-await-in-loop
+    await audienceCommitted(
+      `beat6 field 201 seats the five members "${sent.text}"`,
+      sent,
+      old,
+      five
+    );
+  }
+
+  // Dave links his desktop: no store, so it catches up from the adder.
+  const linkedOk = await attempt(
+    "beat6 Dave's desktop links and shows Camping",
+    'harness',
+    async () => {
+      await linkDesktop(demo, 'dave');
+      // Four windows at most side by side: five leave no room for the
+      // composer. Erin's window stays where it is, under the others.
+      await tile([alice, bob, carol, dave]);
+      await openGroup(dave, demo.group);
+      return { ok: true, detail: 'linked' };
+    }
+  );
+  if (!linkedOk) {
+    return;
+  }
+  const four = linked(demo).filter(m => m !== dave);
+  const caughtUp = await attempt(
+    'beat6 catch-up: Dave asks Alice (the adder); her sealed SERVE reply fills a relative store',
+    'zrdt',
+    async () => {
+      const res = await until(CATCH_UP_MS, async () => {
+        const state = await hookValue<CatchUpView>(demo, dave, 'catchUpState');
+        const ok =
+          state.relative &&
+          state.replies > 0 &&
+          state.answeredBy?.toLowerCase() === aciOf(alice);
+        return {
+          ok,
+          detail:
+            `reason=${state.reason} relative=${state.relative} ` +
+            `asked=${state.asked.map(a => a.slice(0, 8)).join(',')} ` +
+            `answeredBy=${state.answeredBy?.slice(0, 8)} replies=${state.replies}`,
+        };
+      });
+      const state = await hookValue<CatchUpView>(demo, dave, 'catchUpState');
+      const firstAsked = state.asked[0]?.toLowerCase();
+      return {
+        ok: res.ok && firstAsked === aciOf(alice),
+        detail: `${res.detail}; first asked ${firstAsked === aciOf(alice) ? 'Alice' : firstAsked}`,
+      };
+    }
+  );
+
+  await attempt(
+    'beat6 Dave holds every post-join message, with content and the same digest',
+    'zrdt',
+    async () => {
+      const results = await Promise.all(
+        postJoin.map(async sent => {
+          const ok = await shown(dave, sent.ts, sent.text, CATCH_UP_MS);
+          const [mine, alices] = await Promise.all([
+            messageAt(dave, sent),
+            messageAt(alice, sent),
+          ]);
+          return {
+            ok:
+              ok &&
+              mine?.zrdtDigest !== undefined &&
+              mine.zrdtDigest === alices?.zrdtDigest &&
+              mine.zrdtOpening !== undefined,
+            what: `"${sent.text}" ${ok ? 'shown' : 'missing'} ${mine?.zrdtDigest?.slice(0, 8)}/${alices?.zrdtDigest?.slice(0, 8)} ${mine?.label ?? ''}`,
+          };
+        })
+      );
+      return {
+        ok: results.every(r => r.ok),
+        detail: results.map(r => r.what).join('; '),
+      };
+    }
+  );
+
+  await attempt('beat6 Dave shows the boundary row', 'zrdt', async () => {
+    const onScreen = await visible(page(dave), BOUNDARY_ROW_TEXT, UI_MS * 2);
+    const rows = (
+      await hookValue<Array<CIMessage>>(demo, dave, 'getGapRows')
+    ).filter(r => r.zrdtGap?.state === 'boundary');
+    const tables = await hookValue<TablesView>(demo, dave, 'tables');
+    const boundaryPre = tables.boundary.filter(b => preDigests.has(b.digest));
+    return {
+      ok:
+        onScreen &&
+        rows.length === 1 &&
+        tables.relative &&
+        tables.boundary.length > 0 &&
+        boundaryPre.length === tables.boundary.length,
+      detail:
+        `"${BOUNDARY_ROW_TEXT}" ${onScreen ? 'shown' : 'NOT shown'}; ` +
+        `${rows.length} boundary row(s); ${tables.boundary.length} boundary digest(s), ` +
+        `${boundaryPre.length} of them pre-join, vouched by ` +
+        [...new Set(tables.boundary.map(b => b.voucherAci.slice(0, 8)))].join(
+          ','
+        ),
+    };
+  });
+  await screenshots(demo, [...four, dave], 'beat6-caught-up');
+
+  // Live messages, both ways.
+  const live: Array<Sent> = [];
+  const fromAlice = { from: alice, text: 'Dave, bring a headlamp', ts: 0 };
+  fromAlice.ts = await send(alice, fromAlice.text);
+  live.push(fromAlice);
+  const daveGot = await shown(dave, fromAlice.ts, fromAlice.text);
+  check(
+    "beat6 Alice's live message reaches Dave",
+    'harness',
+    daveGot,
+    `dave=${daveGot}`
+  );
+  const fromDave = { from: dave, text: 'thanks, see you there', ts: 0 };
+  fromDave.ts = await send(dave, fromDave.text);
+  live.push(fromDave);
+  const got = await Promise.all(
+    four.map(o => shown(o, fromDave.ts, fromDave.text))
+  );
+  check(
+    "beat6 Dave's message reaches everyone",
+    'harness',
+    got.every(Boolean),
+    four.map((o, i) => `${o.name}=${got[i]}`).join(' ')
+  );
+  for (const sent of live) {
+    // oxlint-disable-next-line no-await-in-loop
+    await sameDigest(`beat6 same zrdtDigest "${sent.text}"`, sent, [
+      ...four,
+      dave,
+    ]);
+  }
+  await attempt("beat6 Dave's heads equal Alice's", 'zrdt', async () => {
+    const res = await until(CLASSIFY_MS, async () => {
+      const [a, d] = await Promise.all([
+        sortedHeads(demo, alice),
+        sortedHeads(demo, dave),
+      ]);
+      return {
+        ok: a === d && a.length > 0,
+        detail: `alice [${a.split(',').map(tag).join(' ')}] dave [${d.split(',').map(tag).join(' ')}]`,
+      };
+    });
+    return res;
+  });
+
+  // The adversarial request: Dave asks for a pre-join digest by itself.
+  const [target] = [...before.entries()].filter(
+    ([, text]) => text === "who's bringing the tent?"
+  );
+  const preDigest = target?.[0] ?? [...preDigests][0];
+  for (const responder of [alice, bob]) {
+    // oxlint-disable-next-line no-await-in-loop
+    await attempt(
+      `beat6 Dave asks ${responder.display} for a pre-join digest: a boundary digest only`,
+      'zrdt',
+      async () => {
+        if (!caughtUp || preDigest === undefined) {
+          return { ok: false, detail: 'skipped: no catch-up or no digest' };
+        }
+        const conv = await conversationId(demo, dave);
+        const r = await hook(
+          dave,
+          'requestDigests',
+          conv,
+          responder.boot.phone.device.aci,
+          [preDigest]
+        );
+        if (r.missing) {
+          throw new Error('no requestDigests hook');
+        }
+        const res = await until(COMPARE_MS, async () => {
+          const log = await hookValue<Array<ServedView>>(
+            demo,
+            dave,
+            'servedLog'
+          );
+          const reply = log.find(
+            item =>
+              item.mode === 'perDigest' &&
+              item.wanted.includes(preDigest) &&
+              item.responderAci.toLowerCase() === aciOf(responder)
+          );
+          if (!reply) {
+            return { ok: false, detail: 'no reply yet' };
+          }
+          const kinds = reply.entries.map(
+            e =>
+              `${e.kind}${e.hasOpening ? '+opening' : ''}:${e.digest ? tag(e.digest) : '?'}`
+          );
+          const ok =
+            reply.entries.length === 1 &&
+            reply.entries[0]?.kind === 'boundary' &&
+            reply.entries[0]?.digest === preDigest &&
+            !reply.entries.some(e => e.hasOpening || e.kind !== 'boundary');
+          return {
+            ok,
+            detail: `asked ${tag(preDigest)}; reply [${kinds.join(' ')}]`,
+          };
+        });
+        return res;
+      }
+    );
+  }
+
+  // No pre-join content anywhere on Dave's desktop.
+  await attempt(
+    'beat6 Dave holds no pre-join content: messages table, zrdt tables, window',
+    'zrdt',
+    async () => {
+      const scan = await hook<{
+        scanned: number;
+        hits: Array<{ text: string; type: string; where: string }>;
+      }>(dave, 'scanMessages', preTexts);
+      if (scan.missing) {
+        throw new Error('no scanMessages hook');
+      }
+      const tables = await hookValue<TablesView>(demo, dave, 'tables');
+      const stored = tables.records.filter(d => preDigests.has(d));
+      const pending = tables.pending.filter(d => preDigests.has(d));
+      const msgs = await allMessages(demo, dave);
+      const withPreDigest = msgs.filter(
+        m => m.zrdtDigest !== undefined && preDigests.has(m.zrdtDigest)
+      );
+      const onScreen = new Array<string>();
+      for (const text of preTexts) {
+        // oxlint-disable-next-line no-await-in-loop
+        const n = await page(dave).getByText(text, { exact: true }).count();
+        if (n > 0) {
+          onScreen.push(text);
+        }
+      }
+      const ok =
+        scan.value.hits.length === 0 &&
+        stored.length === 0 &&
+        pending.length === 0 &&
+        withPreDigest.length === 0 &&
+        onScreen.length === 0;
+      return {
+        ok,
+        detail:
+          `scanned ${scan.value.scanned} message rows for ${preTexts.length} texts: ` +
+          `${scan.value.hits.length} hits${scan.value.hits.length ? ` (${scan.value.hits.map(h => `"${h.text}" in ${h.where}`).join(', ')})` : ''}; ` +
+          `zrdt_records ${tables.records.length} (pre-join ${stored.length}), ` +
+          `zrdt_pending ${tables.pending.length} (pre-join ${pending.length}), ` +
+          `boundary ${tables.boundary.length}; messages with a pre-join digest ${withPreDigest.length}; ` +
+          `pre-join texts on screen ${onScreen.length}${onScreen.length ? ` (${onScreen.join(', ')})` : ''}`,
+      };
+    }
+  );
+
+  // Alice, Bob and Carol still hold everything.
+  await attempt(
+    'beat6 Alice, Bob and Carol still hold every message, before and after the add',
+    'zrdt',
+    async () => {
+      const wanted = [
+        ...preTexts,
+        ...postJoin.map(x => x.text),
+        ...live.map(x => x.text),
+      ];
+      const lacking = new Array<string>();
+      for (const m of [alice, bob, carol]) {
+        // oxlint-disable-next-line no-await-in-loop
+        const scan = await hook<{
+          hits: Array<{ text: string; where: string }>;
+        }>(m, 'scanMessages', wanted);
+        if (scan.missing) {
+          throw new Error('no scanMessages hook');
+        }
+        const held = new Set(
+          scan.value.hits.filter(h => h.where === 'body').map(h => h.text)
+        );
+        const missing = wanted.filter(t => !held.has(t));
+        if (missing.length > 0) {
+          lacking.push(
+            `${m.name} lacks ${missing.map(t => `"${t}"`).join(', ')}`
+          );
+        }
+      }
+      return {
+        ok: lacking.length === 0,
+        detail:
+          lacking.length === 0
+            ? `${wanted.length} texts held by each`
+            : lacking.join('; '),
+      };
+    }
+  );
+  await screenshots(demo, [...four, dave], 'beat6-done');
+}
+
 async function main(): Promise<void> {
   const onlyHarness = process.argv.includes('--only-harness');
   say(configureEnv());
@@ -1386,7 +1846,12 @@ async function main(): Promise<void> {
     process.env.ZRDT_SMOKE_OUT ?? path.join(REPO, 'demo', 'artifacts', 'smoke')
   );
   const t0 = Date.now();
-  const demo = await setUp({ artifacts });
+  // Erin is in the group from the start (beat 5); Dave joins in beat 6.
+  const demo = await setUp({
+    artifacts,
+    founders: ['alice', 'bob', 'carol', 'erin'],
+    late: [LATE],
+  });
   const panel = await startPanel({ villain: demo.server, port: 0 });
   try {
     const { alice, bob, carol } = demo.byName;
@@ -1421,7 +1886,7 @@ async function main(): Promise<void> {
     }
 
     const only = new Set(
-      (process.env.ZRDT_SMOKE_BEATS ?? '1,2,3,4,5')
+      (process.env.ZRDT_SMOKE_BEATS ?? '1,2,3,4,5,6')
         .split(',')
         .map(x => x.trim())
     );
@@ -1439,6 +1904,9 @@ async function main(): Promise<void> {
       await timed('beat 5', () => beat5(demo));
     }
     await timed('rules', () => holdRelease(demo, panel.url));
+    if (!onlyHarness && only.has('6')) {
+      await timed('beat 6', () => beat6(demo));
+    }
   } catch (error) {
     check(
       'harness',

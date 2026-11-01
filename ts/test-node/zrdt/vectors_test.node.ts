@@ -37,6 +37,7 @@ import type {
   Digest,
   ProvenanceFact,
   RecordParts,
+  ServeEntry,
   ZrdtBackend,
 } from '../../zrdt/ZrdtBackend.std.ts';
 import {
@@ -191,6 +192,18 @@ async function runTyped(
       return backend.serve(req);
     case Op.ADDRESSED:
       return backend.addressed(req.chat, req.aci, req.key);
+    case Op.ACCEPT_VIEW:
+      return backend.acceptView(
+        req.chat,
+        req.voucher,
+        req.forImport,
+        req.entries
+      );
+    case Op.LINKABLE:
+      return backend.linkable(req.chat, req.live);
+    case Op.NEW_RELATIVE:
+      await backend.createRelative(req.chat, req.group);
+      return undefined;
     default:
       throw new Error('unknown op');
   }
@@ -335,7 +348,13 @@ describe('zrdt rung 7: stub vs Lean (vectors.json, zrdtd)', function (this: Moch
           assert.strictEqual(result.kind, 'unverifiable', v.name);
           continue;
         }
-        assert.strictEqual(hex(await stub.encode('blob')), v.blob, v.name);
+        // ENCODE writes zrdtS3: a closed store with no boundary and no
+        // recorded audiences, then the records blob (the vector).
+        assert.strictEqual(
+          hex(await stub.encode('blob')),
+          `${hex(new TextEncoder().encode('zrdtS3'))}00${'00000000'.repeat(2)}${v.blob}`,
+          v.name
+        );
       }
     });
 
@@ -522,15 +541,66 @@ describe('zrdt rung 7: stub vs Lean (vectors.json, zrdtd)', function (this: Moch
         };
 
         for (const chat of chats) {
+          // The third chat is a relative store (JOIN_PLAN §6.2).
+          const op = chat === 'third' ? Op.NEW_RELATIVE : Op.NEW;
           // oxlint-disable-next-line no-await-in-loop
-          await both({ op: Op.NEW, chat, group: pick(groups) }, `NEW ${chat}`);
+          await both({ op, chat, group: pick(groups) }, `${Op[op]} ${chat}`);
         }
+
+        // An ACCEPT_VIEW entry: a boundary digest (known or made up), a
+        // record's structure (maybe cut short), or an addressed record with
+        // no opening or a junk one.
+        const viewEntry = (): ServeEntry => {
+          const r = random();
+          if (r < 0.4 || records.length === 0) {
+            return {
+              kind: 'boundary',
+              digest:
+                known.length > 0 && random() < 0.5 ? pick(known) : bytes(32),
+            };
+          }
+          const record = pick(records);
+          if (r < 0.75) {
+            return {
+              kind: 'after',
+              record: random() < 0.1 ? record.subarray(1) : record,
+            };
+          }
+          return random() < 0.5
+            ? { kind: 'addressed', record, authorCopy: random() < 0.5 }
+            : {
+                kind: 'addressed',
+                record,
+                authorCopy: false,
+                opening: bytes(32 + Math.floor(random() * 6)),
+              };
+        };
 
         for (let i = 0; i < 400; i += 1) {
           const chat = pick(chats);
+          const special = random();
           const roll = random();
           let req: Request;
-          if (roll < 0.35) {
+          if (special < 0.08) {
+            const entries = new Array<ServeEntry>();
+            const n = 1 + Math.floor(random() * 4);
+            for (let j = 0; j < n; j += 1) {
+              entries.push(viewEntry());
+            }
+            req = {
+              op: Op.ACCEPT_VIEW,
+              chat,
+              voucher: pick(authors),
+              forImport: random() < 0.3,
+              entries,
+            };
+          } else if (special < 0.12) {
+            req = {
+              op: Op.LINKABLE,
+              chat,
+              live: known.filter(() => random() < 0.5),
+            };
+          } else if (roll < 0.35) {
             const links = new Array<Digest>();
             const n = Math.floor(random() * 4);
             for (let j = 0; j < n; j += 1) {
