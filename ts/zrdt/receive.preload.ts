@@ -169,7 +169,15 @@ export async function zrdtReceiveLive({
   receivedAtDate: number;
 }>): Promise<ZrdtLiveStepResult | undefined> {
   const meta = dataMessage.zrdt;
-  if (meta == null || groupId == null || !isZrdtRecordMessage(dataMessage)) {
+  if (
+    meta == null ||
+    groupId == null ||
+    !isZrdtRecordMessage({
+      isGroupV2: dataMessage.groupV2 != null,
+      isEdit: false,
+      dataMessage,
+    })
+  ) {
     return undefined;
   }
   initZrdtReceive();
@@ -817,7 +825,13 @@ async function showRelayedMessage({
       expireTimerVersion: null,
       zrdt: null,
     };
-    if (!isZrdtRecordMessage(safe)) {
+    if (
+      !isZrdtRecordMessage({
+        isGroupV2: true,
+        isEdit: false,
+        dataMessage: safe,
+      })
+    ) {
       log.warn(`relay: ${digest.slice(0, 8)} is not a plain group message`);
       return false;
     }

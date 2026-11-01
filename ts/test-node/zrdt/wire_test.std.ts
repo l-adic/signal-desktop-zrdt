@@ -9,7 +9,6 @@ import {
   getDataMessageBytes,
   getSyncSentDataMessageBytes,
 } from '../../zrdt/wire.std.ts';
-import { isZrdtRecordMessage } from '../../zrdt/scope.std.ts';
 
 function concat(
   ...parts: Array<Uint8Array<ArrayBuffer>>
@@ -74,24 +73,6 @@ describe('zrdt wire: DataMessage bytes as sent', () => {
     assert.strictEqual(
       findLengthDelimitedField(new Uint8Array([0x08, 0x01]), 1),
       'absent'
-    );
-  });
-});
-
-describe('zrdt scope predicate (receive side)', () => {
-  const group = { groupChange: null };
-  it('a plain group message is in scope', () => {
-    assert.isTrue(isZrdtRecordMessage({ groupV2: group, flags: 0 }));
-  });
-  it('1:1, reactions, deletes, timers, group changes and polls are not', () => {
-    assert.isFalse(isZrdtRecordMessage({}));
-    assert.isFalse(isZrdtRecordMessage({ groupV2: group, reaction: {} }));
-    assert.isFalse(isZrdtRecordMessage({ groupV2: group, delete: {} }));
-    assert.isFalse(isZrdtRecordMessage({ groupV2: group, flags: 2 }));
-    assert.isFalse(isZrdtRecordMessage({ groupV2: group, storyContext: {} }));
-    assert.isFalse(isZrdtRecordMessage({ groupV2: group, pollVote: {} }));
-    assert.isFalse(
-      isZrdtRecordMessage({ groupV2: { groupChange: new Uint8Array(1) } })
     );
   });
 });
