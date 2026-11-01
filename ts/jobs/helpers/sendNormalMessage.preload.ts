@@ -310,6 +310,9 @@ export async function sendNormalMessage(
       // or sending a story to a group where all other users don't have the stories
       // capabilities (effectively a 'lonely group' in the context of stories)
       log.info('sending sync message only');
+      // TODO(zrdt): for a frozen group message (message.zrdt), sync the frozen
+      // DataMessage bytes instead, so our other zrdt devices get the links.
+      // The demo has one zrdt device per account.
       const dataMessage = await messaging.getDataOrEditMessage({
         attachments,
         body,

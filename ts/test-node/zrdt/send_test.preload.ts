@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 import { assert } from 'chai';
+import * as sinon from 'sinon';
 
 import { SignalService as Proto } from '../../protobuf/index.std.ts';
 import * as Bytes from '../../Bytes.std.ts';
@@ -31,6 +32,7 @@ import type {
   ZrdtSendServiceType,
 } from '../../zrdt/send.preload.ts';
 import { generateAci } from '../../test-helpers/serviceIdUtils.std.ts';
+import { itemStorage } from '../../textsecure/Storage.preload.ts';
 import { createLogger } from '../../logging/log.std.ts';
 
 const log = createLogger('zrdt/send_test');
@@ -607,5 +609,51 @@ describe('zrdt/send: isZrdtGroupSend', () => {
     for (const options of cases) {
       assert.isFalse(isZrdtGroupSend(options));
     }
+  });
+});
+
+describe('zrdt/send: getAttrsFromGroupOptions', () => {
+  let sandbox: sinon.SinonSandbox;
+
+  beforeEach(() => {
+    sandbox = sinon.createSandbox();
+  });
+
+  afterEach(() => {
+    sandbox.restore();
+  });
+
+  it('passes zrdt through to Message.toProto', async () => {
+    const ourAci = generateAci();
+    const other = generateAci();
+    sandbox.stub(itemStorage.user, 'getCheckedAci').returns(ourAci);
+    sandbox
+      .stub(itemStorage.blocked, 'getBlockedServiceIds')
+      .returns(new Map());
+    sandbox.stub(itemStorage.blocked, 'getBlockedNumbers').returns(new Map());
+
+    const zrdt: ZrdtMetaSendType = {
+      links: [fill(1)],
+      nonce: fill(2),
+      version: ZRDT_META_VERSION,
+      disown: [fill(3)],
+    };
+    const attrs = messageSender.getAttrsFromGroupOptions({
+      timestamp: 1,
+      body: 'hi',
+      groupV2: {
+        masterKey: MASTER_KEY,
+        revision: 1,
+        members: [ourAci, other],
+      },
+      zrdt,
+    });
+    assert.strictEqual(attrs.zrdt, zrdt);
+    assert.deepEqual(attrs.recipients, [other]);
+
+    const content = await messageSender.getContentMessage(attrs);
+    const decoded = Proto.Content.decode(Proto.Content.encode(content));
+    assert.deepEqual(decoded.content?.dataMessage?.zrdt?.links, [fill(1)]);
+    assert.deepEqual(decoded.content?.dataMessage?.zrdt?.disown, [fill(3)]);
   });
 });

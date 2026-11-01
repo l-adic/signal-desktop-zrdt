@@ -728,9 +728,7 @@ class Message {
       pinMessage,
       unpinMessage,
 
-      // Handled separately
-      pollVote: null,
-      pollTerminate: null,
+      // zrdt: present (even with no links) on in-scope group sends only
       zrdt: this.zrdt
         ? {
             links: this.zrdt.links.slice(),
@@ -739,6 +737,10 @@ class Message {
             disown: this.zrdt.disown.slice(),
           }
         : null,
+
+      // Handled separately
+      pollVote: null,
+      pollTerminate: null,
 
       expireTimer: this.expireTimer ?? null,
       expireTimerVersion: this.expireTimerVersion ?? null,
