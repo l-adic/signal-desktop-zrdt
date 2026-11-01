@@ -392,6 +392,20 @@ export class ZrdtServiceCore implements ZrdtServiceType {
     }
   }
 
+  /**
+   * Extra: after the backend failed (zrdtd exited), start a new one and
+   * re-OPEN every conversation from its rows. No-op while it is available.
+   */
+  async restart(): Promise<void> {
+    if (this.#backend?.isAvailable() && this.#info.available) {
+      return;
+    }
+    this.#backend = undefined;
+    this.#state.clear();
+    this.#initPromise = undefined;
+    await this.init();
+  }
+
   backendInfo(): ZrdtBackendInfo {
     return { ...this.#info };
   }

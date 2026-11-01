@@ -81,6 +81,11 @@ export function rejectionOf(
   return core.rejection(conversationId);
 }
 
+/** Extra: start a new backend after zrdtd exited, and re-OPEN every chat. */
+export function restartZrdt(): Promise<void> {
+  return core.restart();
+}
+
 /** Extra: "Keep what verifies" from the conversation's own rows. */
 export function salvageStored(
   conversationId: string

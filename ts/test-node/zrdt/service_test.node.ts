@@ -630,6 +630,12 @@ describe('zrdt service', function (this: Mocha.Suite) {
     await down;
     assert.isFalse(service.backendInfo().available);
     await assert.isRejected(service.heads(CHAT), /unavailable/);
+
+    // restart(): a new zrdtd, every chat re-opened.
+    await service.restart();
+    assert.isTrue(service.backendInfo().available);
+    assert.deepEqual(await service.heads(CHAT), []);
+    daemon?.dispose();
   });
 });
 
