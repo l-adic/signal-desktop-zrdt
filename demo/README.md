@@ -24,9 +24,11 @@ node --import tsx demo/launch.ts          # add --link-dave to link Dave at once
 # open the panel URL it prints (default http://127.0.0.1:7357/)
 ```
 
-It sets `SIGNAL_MOCK_TESTS_BACKGROUND=1`, `ZRDT_DAEMON` and
-`ZRDT_RESEND_DELAY_MS=4000` for the desktops (an existing value wins). Startup
-to READY takes about 7 s on the Mac mini. Ctrl-C closes everything.
+It sets `SIGNAL_MOCK_TESTS_BACKGROUND=1`, `ZRDT_DAEMON`,
+`ZRDT_RESEND_DELAY_MS=4000` and `ZRDT_AUTHOR_FASTPATH_DELAY_MS=3000` (beat 2:
+"relayed by Bob" shows about 3 s before "confirmed by Alice") for the desktops
+(an existing value wins). Startup to READY takes about 7 s on the Mac mini.
+Ctrl-C closes everything.
 
 Panel routes (also usable with curl):
 
