@@ -97,10 +97,10 @@ with that digest in `missing`. `append` drives `zrdtd`: OPEN under a scratch
 chat key, ACCEPT two records by the author whose links are the current heads
 (random commits), ENCODE, and a check that the result passes OPEN.
 
-`doctor.ts` accepts a raw store blob (what lane T3 exports), a JSON file
-holding it as base64, or a binary container holding it (a u32 length right
-before it is fixed up). TODO(zrdt T4): drop the removed record's content entry
-once exports carry a content section.
+`doctor.ts` accepts the app's JSON dump (the blob as base64 plus a content
+section; `remove` drops the removed record's content entry too), a raw store
+blob, or a binary container holding it (a u32 length right before it is fixed
+up).
 
 ## Tests
 
