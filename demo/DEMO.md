@@ -21,7 +21,9 @@ copy. Read it once with the kit running before the demo.
 ## The kit
 
 Everything runs on the MacBook from one folder. Nothing is built there and no
-network is needed: the Signal server is a mock, on 127.0.0.1.
+network is needed: the Signal server is a mock, on 127.0.0.1. It needs an
+Apple-silicon Mac with macOS 13.5 or later (Node's minimum; Electron and the
+native modules need 13.0). It was tested on macOS 27.0.1 (Mac mini M4).
 
 - **Build** (on the Mac mini, in a fully built fork tree): `demo/pack.sh`.
   It writes `~/demo-kit-build/zrdt-demo-kit.tar.gz` (about 560 MB; 1.8 GB
