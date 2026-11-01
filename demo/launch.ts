@@ -8,22 +8,34 @@
 // warm-up message from each (sender keys), and starts the villain's panel.
 // No rule is armed. Dave's desktop is linked on demand, just before beat 5:
 // the panel's "Link Dave's desktop" button, `POST /actions/link-dave`, or
-// `--link-dave` (link right after the warm-up, for rehearsals).
+// `--link-dave` (link right after the warm-up, for rehearsals). Dave is a
+// member from the group's creation, so his new desktop, which has no store,
+// catches up from Alice by itself (zrdt JOIN_PLAN §6.1) within seconds.
 //
 // doctor.ts runs on the live exports by itself (RESTORE_PLAN.md §6): when
 // Carol exports (Settings → Internal → Export store), one linked, non-head
 // record is removed from her file in place (beat 4; the original is kept as
-// .orig); when Bob exports and Dave's desktop is linked, two fakes by Bob are
-// appended and the result is written where Dave's "Import file" reads (beat
-// 5). `--no-auto-doctor` turns this off (then use the panel's doctor actions).
+// .orig); when Bob exports for Dave (Settings → Internal → Export for: Dave →
+// Export store: SERVE for Dave, sealed to Dave's key, JOIN_PLAN §4.5) and
+// Dave's desktop is linked, two fakes by Bob are appended in a section sealed
+// to Dave's key, and the result is written where Dave's "Import file" reads
+// (beat 5). Bob's own export is not used: only Bob could import it.
+// `--no-auto-doctor` turns this off (then use the panel's doctor actions).
 //
 // Run from the repository root (build zrdtd first: cd zrdt/core && lake build):
 //   node --import tsx demo/launch.ts [--link-dave] [--no-auto-doctor]
-//        [--port 7357] [--verbose]
+//        [--port 7357] [--verbose] [--beat5]
 //
 // Then open the panel URL it prints. Ctrl-C (or POST /actions/quit) closes
 // every desktop and the server. Artifacts (villain log, screenshots, desktop
 // logs) go to demo/artifacts/demo/ (ZRDT_DEMO_OUT to change).
+//
+// `--beat5` is a check, not the demo: after READY it types the script's
+// messages of beats 1 to 3, then plays beat 5 the way the presenter does
+// (the panel's link-dave route, Bob's and Dave's Settings → Internal clicks,
+// the auto-doctor, the toggle, Alice and Bob typing), checks what Dave's
+// window shows at each step (demo/beat5.ts), and exits 0 only if every check
+// passes.
 //
 // Environment: see demo/harness.ts (SIGNAL_MOCK_TESTS_BACKGROUND,
 // ZRDT_DAEMON, ZRDT_RESEND_DELAY_MS); ZRDT_PANEL_PORT for the panel port.
@@ -33,10 +45,17 @@ import os from 'node:os';
 import path from 'node:path';
 
 import { getTimelineMessageWithText } from '../ts/test-mock/helpers.node.ts';
+import { checkBeat5 } from './beat5.ts';
+import type { DoctorEvent } from './beat5.ts';
 import { formatEntry } from './evil.ts';
 import { startPanel } from './panel.ts';
 import type { PanelAction } from './panel.ts';
-import { doctorAppend, doctorRemove, doctoredPath } from './doctor.ts';
+import {
+  asServedExport,
+  doctorAppend,
+  doctorRemove,
+  doctoredPath,
+} from './doctor.ts';
 import {
   REPO,
   configureEnv,
@@ -65,6 +84,7 @@ type Options = {
   autoDoctor: boolean;
   port: number;
   verbose: boolean;
+  beat5: boolean;
 };
 
 function parseArgs(argv: ReadonlyArray<string>): Options {
@@ -73,6 +93,7 @@ function parseArgs(argv: ReadonlyArray<string>): Options {
     autoDoctor: true,
     port: Number(process.env.ZRDT_PANEL_PORT ?? DEFAULT_PORT),
     verbose: false,
+    beat5: false,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
@@ -82,12 +103,20 @@ function parseArgs(argv: ReadonlyArray<string>): Options {
       opts.autoDoctor = false;
     } else if (a === '--verbose') {
       opts.verbose = true;
+    } else if (a === '--beat5') {
+      opts.beat5 = true;
     } else if (a === '--port') {
       opts.port = Number(argv[i + 1]);
       i += 1;
     } else {
       throw new Error(`unknown argument ${a}`);
     }
+  }
+  if (opts.beat5 && (opts.linkDave || !opts.autoDoctor)) {
+    throw new Error(
+      '--beat5 links Dave through the panel and relies on the auto-doctor: ' +
+        'drop --link-dave and --no-auto-doctor'
+    );
   }
   return opts;
 }
@@ -120,13 +149,52 @@ function fileParam(value: string): string {
 }
 
 /**
+ * Beat 5's doctoring: two fakes by Bob appended to Bob's export for Dave (in
+ * a section sealed to Dave's key, on Bob's heads), written to `out`. Throws a
+ * presenter-friendly error when `file` is not an export for Dave: Bob's own
+ * export ("Export for: this account") is sealed to Bob's key and only Bob's
+ * account may import it, so Dave's import would be refused.
+ */
+async function doctorBobsExportForDave(
+  demo: Demo,
+  file: string,
+  out: string
+): Promise<string> {
+  const { bob, dave } = demo.byName;
+  const doc = asServedExport(await fs.readFile(file));
+  const daveAci = dave.boot.phone.device.aci.toLowerCase();
+  if (doc?.to.toLowerCase() !== daveAci) {
+    throw new Error(
+      `${file} is ${doc ? `an export for ${doc.to}` : "Bob's own export"}, ` +
+        'not one for Dave, who could not import it. Bob: Settings → ' +
+        'Internal → Export for: Dave, then Export store again'
+    );
+  }
+  return doctorAppend(file, bob.boot.phone.device.aci, out, {
+    links: await bobHeads(demo),
+  });
+}
+
+type AutoDoctor = Readonly<{
+  stop: () => void;
+  // What it did, oldest first (the --beat5 check waits on these).
+  events: ReadonlyArray<DoctorEvent>;
+}>;
+
+/**
  * Watches Carol's and Bob's export files (once a second) and runs doctor.ts
  * on each new export: beat 4 removes a linked record from Carol's file in
- * place; beat 5 appends two fakes by Bob and writes Dave's import path (only
- * once Dave's desktop is linked). Returns a stop function.
+ * place; beat 5 appends two fakes by Bob to Bob's export for Dave and writes
+ * Dave's import path (only once Dave's desktop is linked; Bob's own export is
+ * left alone, with a hint in the terminal).
  */
-function startAutoDoctor(demo: Demo): () => void {
+function startAutoDoctor(demo: Demo): AutoDoctor {
   const { carol, bob, dave } = demo.byName;
+  const events = new Array<DoctorEvent>();
+  const note = (event: DoctorEvent) => {
+    events.push(event);
+    say(`auto-doctor, ${event.what}: ${event.summary}`);
+  };
   const seen = new Map<string, number>();
   let carolFile: string | undefined;
   let bobFile: string | undefined;
@@ -167,17 +235,20 @@ function startAutoDoctor(demo: Demo): () => void {
         if (t !== undefined) {
           seen.set(carolFile, t);
         }
-        say(`auto-doctor, beat 4 (Carol's export): ${summary}`);
+        note({ beat: 4, ok: true, what: "beat 4 (Carol's export)", summary });
       }
       if (dave.app && (await fresh(bobFile))) {
-        const out = await dumpPath(demo, dave);
-        const summary = await doctorAppend(
-          bobFile,
-          bob.boot.phone.device.aci,
-          out,
-          { links: await bobHeads(demo) }
-        );
-        say(`auto-doctor, beat 5 (Bob's export -> Dave): ${summary}`);
+        const what = "beat 5 (Bob's export for Dave -> Dave)";
+        try {
+          const summary = await doctorBobsExportForDave(
+            demo,
+            bobFile,
+            await dumpPath(demo, dave)
+          );
+          note({ beat: 5, ok: true, what, summary });
+        } catch (error) {
+          note({ beat: 5, ok: false, what, summary: errorText(error) });
+        }
       }
     } catch (error) {
       say(`auto-doctor: ${String(error)}`);
@@ -189,10 +260,14 @@ function startAutoDoctor(demo: Demo): () => void {
     void tick();
   }, 1_000);
   say(
-    "auto-doctor on: Carol's export loses a linked record; Bob's export " +
-      "gains two fakes by Bob, written to Dave's import path"
+    "auto-doctor on: Carol's export loses a linked record; Bob's export for " +
+      "Dave gains two fakes by Bob, written to Dave's import path"
   );
-  return () => clearInterval(timer);
+  return { stop: () => clearInterval(timer), events };
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 /**
@@ -223,19 +298,27 @@ function actions(demo: Demo, quit: () => void): Record<string, PanelAction> {
     },
     export: {
       label:
-        "Export a member's store (rehearsal; the demo clicks Settings → Internal)",
-      fields: ['member'],
+        'Export a member\'s store; with "for", the export for that member ' +
+        '(beat 5: member bob, for dave). Rehearsal; the demo clicks ' +
+        'Settings → Internal',
+      fields: ['member', 'for'],
       run: async p => {
         const m = memberParam(demo, p.member);
-        const r = await hook<unknown>(
-          m,
-          'exportStore',
-          await conversationId(demo, m)
-        );
+        const conv = await conversationId(demo, m);
+        const forMember = p.for?.trim() ? memberParam(demo, p.for) : undefined;
+        const r = forMember
+          ? await hook<unknown>(
+              m,
+              'exportStoreFor',
+              conv,
+              forMember.boot.phone.device.aci.toLowerCase()
+            )
+          : await hook<unknown>(m, 'exportStore', conv);
         if (r.missing) {
-          throw new Error('no window.SignalCI.zrdt.exportStore hook yet');
+          throw new Error('no window.SignalCI.zrdt export hook yet');
         }
-        return `${m.name}: ${JSON.stringify(r.value)} (${await dumpPath(demo, m)})`;
+        const kind = forMember ? `for ${forMember.name}` : 'own export';
+        return `${m.name} (${kind}): ${JSON.stringify(r.value)} (${await dumpPath(demo, m)})`;
       },
     },
     import: {
@@ -269,19 +352,27 @@ function actions(demo: Demo, quit: () => void): Record<string, PanelAction> {
     },
     'doctor-append': {
       label:
-        "Beat 5: append two fakes by Bob to Bob's export, written where " +
-        "Dave's desktop imports from. Automatic unless --no-auto-doctor",
+        "Beat 5: append two fakes by Bob to Bob's export for Dave, written " +
+        "where Dave's desktop imports from. Automatic unless --no-auto-doctor",
       fields: ['file'],
       run: async p => {
         const file = p.file?.trim()
           ? fileParam(p.file)
           : await needExport(await dumpPath(demo, byName.bob), 'Bob');
-        const out = byName.dave.app
-          ? await dumpPath(demo, byName.dave)
-          : doctoredPath(file);
-        return doctorAppend(file, byName.bob.boot.phone.device.aci, out, {
-          links: await bobHeads(demo),
-        });
+        if (!byName.dave.app) {
+          // Rehearsing the doctor alone: any export, next to the file.
+          return doctorAppend(
+            file,
+            byName.bob.boot.phone.device.aci,
+            doctoredPath(file),
+            { links: await bobHeads(demo) }
+          );
+        }
+        return doctorBobsExportForDave(
+          demo,
+          file,
+          await dumpPath(demo, byName.dave)
+        );
       },
     },
     send: {
@@ -348,7 +439,7 @@ async function main(): Promise<void> {
   process.once('SIGTERM', () => quit());
 
   const demo = await setUp({ artifacts, verbose: opts.verbose });
-  let stopAutoDoctor: () => void = () => undefined;
+  let autoDoctor: AutoDoctor | undefined;
   let panel: Awaited<ReturnType<typeof startPanel>> | undefined;
   try {
     const { alice, bob, carol, dave } = demo.byName;
@@ -365,7 +456,7 @@ async function main(): Promise<void> {
     await warmUp(first);
     await screenshots(demo, first, 'ready');
     if (opts.autoDoctor) {
-      stopAutoDoctor = startAutoDoctor(demo);
+      autoDoctor = startAutoDoctor(demo);
     }
 
     if (opts.linkDave) {
@@ -386,13 +477,22 @@ async function main(): Promise<void> {
         .map(m => `${m.name}=${m.boot.phone.device.aci}`)
         .join(' ')}`
     );
+    if (opts.beat5 && autoDoctor) {
+      const passed = await checkBeat5({
+        demo,
+        panelUrl: panel.url,
+        doctorEvents: autoDoctor.events,
+      });
+      process.exitCode = passed ? 0 : 1;
+      quit();
+    }
     await quitting;
   } catch (error) {
     say(`FAILED: ${String((error as Error)?.stack ?? error)}`);
     process.exitCode = 1;
   } finally {
     say('closing');
-    stopAutoDoctor();
+    autoDoctor?.stop();
     await panel?.close();
     await fs.writeFile(
       path.join(artifacts, 'evil-log.txt'),

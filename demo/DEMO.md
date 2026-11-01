@@ -41,16 +41,17 @@ native modules need 13.0). It was tested on macOS 27.0.1 (Mac mini M4).
 
 `run-demo.sh` flags:
 
-| Command               | What it does                                                                                       |
-| --------------------- | -------------------------------------------------------------------------------------------------- |
-| `run-demo.sh`         | The live demo: Alice, Bob and Carol linked, warm-ups sent, the villain panel opened in the browser |
-| `run-demo.sh --smoke` | The automatic test of beats 1 to 5 (about 60 s); prints GO or NO-GO                                |
-| `run-demo.sh --stop`  | Closes a demo that is still running, then kills leftover desktops                                  |
-| `--link-dave`         | Links Dave at once (for rehearsals)                                                                |
-| `--no-open`           | Does not open the panel                                                                            |
-| `--port N`            | Panel port (default 7357)                                                                          |
-| `--resign`            | Re-signs `zrdtd`, node and Electron ad hoc first                                                   |
-| `--background`        | Windows do not wait to become visible (only for a locked screen or SSH)                            |
+| Command               | What it does                                                                                                   |
+| --------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `run-demo.sh`         | The live demo: Alice, Bob and Carol linked, warm-ups sent, the villain panel opened in the browser             |
+| `run-demo.sh --smoke` | The automatic test of beats 1 to 5 (about 60 s); prints GO or NO-GO                                            |
+| `run-demo.sh --beat5` | Plays beat 5 of the live demo, clicking as you will, and checks Dave's window (about 30 s); prints GO or NO-GO |
+| `run-demo.sh --stop`  | Closes a demo that is still running, then kills leftover desktops                                              |
+| `--link-dave`         | Links Dave at once (for rehearsals)                                                                            |
+| `--no-open`           | Does not open the panel                                                                                        |
+| `--port N`            | Panel port (default 7357)                                                                                      |
+| `--resign`            | Re-signs `zrdtd`, node and Electron ad hoc first                                                               |
+| `--background`        | Windows do not wait to become visible (only for a locked screen or SSH)                                        |
 
 The script sets these variables:
 
@@ -68,8 +69,10 @@ rehearsals).
 **The day before, or at least an hour before:**
 
 1. [ ] Unpack the kit, then run `~/zrdt-demo-kit/run-demo.sh --smoke`. You
-       should see `GO: all 41 checks passed` after about 60 s. Any failure:
-       stop and read _If something fails_.
+       should see `GO: all 73 checks passed` after about 60 s. Then run
+       `~/zrdt-demo-kit/run-demo.sh --beat5`. You should see
+       `BEAT5 GO: all 10 checks passed` after about 30 s. Any failure: stop
+       and read _If something fails_.
 2. [ ] Click away every macOS prompt this first run raises: firewall
        ("accept incoming connections" for node or Electron): **Allow**;
        notifications: **Don't Allow**.
@@ -197,32 +200,41 @@ Present this as "a tampered backup is caught", not as a server attack.
 
 Transition into beat 5: while you say the beat-4 line, click **Link Dave's
 desktop (before beat 5)** in the panel. Dave's window appears on the right
-within a few seconds, and the four windows re-tile. Dave's chat is empty: a
-new laptop.
+within a few seconds, and the four windows re-tile. Dave's desktop is a new
+laptop with no chat. Dave has been in the group from the start, so his app
+asks Alice for the chat by itself: about 2 s later the nine messages appear
+in Dave's chat. Bob's messages read "confirmed by Bob" and Carol's "confirmed
+by Carol" (green). Alice's messages came from her, so they have no label.
 
 ### Beat 5: restore from anyone (60 s)
 
-| Do                                                                                                                                                                                       | The audience sees                                                                                                                                                                                                                                                                                                                        |
-| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Bob: Settings → **Internal** → **Export store**, then back to the chat (the speech-bubble icon at the top of the left rail)                                                              | A result line                                                                                                                                                                                                                                                                                                                            |
-| Wait for the terminal line `auto-doctor, beat 5 (Bob's export -> Dave): appended ·xxxx ·yyyy …` (1 to 2 s; Dave must be linked first). Do **not** click the panel's Beat 5 doctor button | Nothing on screen                                                                                                                                                                                                                                                                                                                        |
-| Dave: Settings → **Internal** → **Import file**, then back to the chat (the speech-bubble Chats icon at the top of the left rail)                                                        | At the top of Dave's chat, a grey collapsed row: "▸ 11 messages not yet confirmed by any member"                                                                                                                                                                                                                                         |
-| Dave: click that row once to open it. It stays open from now on                                                                                                                          | Eleven grey entries, each "·xxxx · attributed to Alice/Bob/Carol" with its time and text. The two fakes, attributed to Bob, are the last two, with no time and "(content unavailable)"                                                                                                                                                   |
-| Alice types `found the poles!`                                                                                                                                                           | The title becomes "2 messages not yet confirmed by any member". The genuine entries read "held by Alice", and Alice's own read "confirmed by Alice" (green). The two fakes have no label                                                                                                                                                 |
-| Bob types `great, see you at 9`                                                                                                                                                          | The title becomes "Imported history: 11 messages". Bob's genuine entries read "confirmed by Bob" (green). The two fakes read **"not confirmed by Bob"** (red). Carol's entries keep a "held by" label until Carol writes: "held by Alice" or "held by Bob", whichever of the two has the smaller account ID (it changes from run to run) |
+| Do                                                                                                                                                                                                | The audience sees                                                                                                                                                                                 |
+| ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Bob: Settings → **Internal** → **Export for**: pick **Dave** (the menu under "File") → **Export store**, then back to the chat (the speech-bubble Chats icon at the top of the left rail)         | "Exported for Dave: 9 entries, sealed to their key …" under the section                                                                                                                           |
+| Wait for the terminal line `auto-doctor, beat 5 (Bob's export for Dave -> Dave): appended ·xxxx ·yyyy …` (1 to 2 s; Dave must be linked first). Do **not** click the panel's Beat 5 doctor button | Nothing on screen                                                                                                                                                                                 |
+| Dave: Settings → **Internal** → **Import file**. Dave's app goes back to the chat by itself                                                                                                       | At the top of Dave's chat, a grey collapsed row: "▸ 2 messages not yet confirmed by any member"                                                                                                   |
+| Dave: click that row once to open it. It stays open from now on                                                                                                                                   | Two grey entries, each "·xxxx · attributed to Bob" with no time and "(content unavailable)": the two fakes. Dave's nine messages do not change                                                    |
+| Alice types `found the poles!`                                                                                                                                                                    | It reaches Dave like any message. The row still reads "2 messages not yet confirmed by any member", and the two fakes have no label: Alice never had them, so her message does not vouch for them |
+| Bob types `great, see you at 9`                                                                                                                                                                   | The row becomes "Imported history: 2 messages". Both fakes read **"not confirmed by Bob"** (red)                                                                                                  |
 
-Say: "Dave is new, so he restores the chat from a file Bob sent him. But
-someone slipped two fake 'Bob' messages into it. Dave's app trusts none of it
-yet: it is all grey. One message from Alice vouches for everything she holds.
-One message from Bob exposes the two fakes in his name."
+Say: "Dave's new laptop already fetched the chat from Alice, and every
+message in it checks out. Bob also sends him a copy of the chat, made for
+Dave and sealed to Dave's key. But someone slipped two fake 'Bob' messages
+into it. Dave's app takes the file but does not trust the fakes: they wait
+in grey, confirmed by nobody. Alice's message does not vouch for them. One
+message from Bob exposes the two fakes in his name."
 
-Exports carry each message's text with its opening, and Dave's app shows a
-text only if it matches the message's commitment, so the nine genuine messages
-show their text and the two fakes show "(content unavailable)". The imported
-text is kept in memory only. The genuine messages do not leave the grey
-section; they get their labels inside it. With four windows on a laptop
-screen, Dave's window is narrow: point at the red "not confirmed by Bob"
-pills.
+The export for Dave holds only the messages Dave was sent, sealed to Dave's
+key. Bob's own export ("Export for: this account", the default) would not
+work: only Bob's account can import it, and Dave's app refuses it. If you
+exported it by mistake, the terminal says `… is Bob's own export, not one for
+Dave …`: pick Dave under **Export for** and click **Export store** again. The
+doctor cannot read the sealed copy. It appends the two fakes in a new section
+sealed to Dave's key, on top of Bob's newest message. The fakes have no text
+that matches a commitment, so they show "(content unavailable)". Dave already
+holds the nine genuine messages, so the import adds only the two fakes. With
+four windows on a laptop screen, Dave's window is narrow: point at the red
+"not confirmed by Bob" pills.
 
 ### Close (30 s)
 
@@ -241,18 +253,19 @@ To stop afterwards: the panel's **Quit**, or Ctrl-C once in the terminal.
 
 Decide quickly: losing more than 20 s means switching to the fallback.
 
-| Symptom                                                                        | Do                                                                                                                                                           |
-| ------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| "cannot be opened", "damaged" or "unidentified developer" at start             | `~/zrdt-demo-kit/run-demo.sh --resign`; else run `xattr -dr com.apple.quarantine ~/zrdt-demo-kit` and use System Settings → Privacy & Security → Open Anyway |
-| `ERROR: port 7357 is in use`                                                   | `~/zrdt-demo-kit/run-demo.sh --stop`, then start again                                                                                                       |
-| `FAILED:` in the terminal at start, or a window stays blank for more than 60 s | Ctrl-C, `run-demo.sh --stop`, start again (startup takes 10 to 20 s)                                                                                         |
-| A message does not arrive within about 10 s                                    | Panel: **clear (villain off)**. If it is still stuck, panel: **Restart a member's desktop** (member, about 10 s)                                             |
-| Badge says `stub` or "zrdt unavailable"                                        | Stop. The kit's `zrdtd` did not start: `run-demo.sh --stop`, then `run-demo.sh` and read its `zrdtd:` line                                                   |
-| Beat 2: no gap row after 10 s                                                  | Narrate from `~/zrdt-fallback/beat2-gap.png` and `beat2-recovered.png`                                                                                       |
-| Beat 3: no red box after 20 s                                                  | Narrate from `beat3-withheld.png`; panel **clear**, then go on                                                                                               |
-| Settings → Internal is missing, or a button does nothing                       | Use the panel's rehearsal actions instead: **Export a member's store** and **Import into a member's chat** (field `member`: `carol`, `bob` or `dave`)        |
-| Panel buttons do nothing                                                       | Use curl from the terminal, for example `curl -X POST 'http://127.0.0.1:7357/rules/dropGroupMsg?from=alice&to=carol'` (more in `app/demo/README.md`)         |
-| Anything worse                                                                 | Fallback below                                                                                                                                               |
+| Symptom                                                                        | Do                                                                                                                                                                                             |
+| ------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| "cannot be opened", "damaged" or "unidentified developer" at start             | `~/zrdt-demo-kit/run-demo.sh --resign`; else run `xattr -dr com.apple.quarantine ~/zrdt-demo-kit` and use System Settings → Privacy & Security → Open Anyway                                   |
+| `ERROR: port 7357 is in use`                                                   | `~/zrdt-demo-kit/run-demo.sh --stop`, then start again                                                                                                                                         |
+| `FAILED:` in the terminal at start, or a window stays blank for more than 60 s | Ctrl-C, `run-demo.sh --stop`, start again (startup takes 10 to 20 s)                                                                                                                           |
+| A message does not arrive within about 10 s                                    | Panel: **clear (villain off)**. If it is still stuck, panel: **Restart a member's desktop** (member, about 10 s)                                                                               |
+| Badge says `stub` or "zrdt unavailable"                                        | Stop. The kit's `zrdtd` did not start: `run-demo.sh --stop`, then `run-demo.sh` and read its `zrdtd:` line                                                                                     |
+| Beat 2: no gap row after 10 s                                                  | Narrate from `~/zrdt-fallback/beat2-gap.png` and `beat2-recovered.png`                                                                                                                         |
+| Beat 3: no red box after 20 s                                                  | Narrate from `beat3-withheld.png`; panel **clear**, then go on                                                                                                                                 |
+| Settings → Internal is missing, or a button does nothing                       | Use the panel's rehearsal actions instead: **Export a member's store** (beat 4: `member` carol; beat 5: `member` bob, `for` dave) and **Import into a member's chat** (`member` carol or dave) |
+| Beat 5: the terminal says `… is Bob's own export, not one for Dave …`          | Bob: Settings → Internal → **Export for**: **Dave** → **Export store** again                                                                                                                   |
+| Panel buttons do nothing                                                       | Use curl from the terminal, for example `curl -X POST 'http://127.0.0.1:7357/rules/dropGroupMsg?from=alice&to=carol'` (more in `app/demo/README.md`)                                           |
+| Anything worse                                                                 | Fallback below                                                                                                                                                                                 |
 
 **Fallback.**
 

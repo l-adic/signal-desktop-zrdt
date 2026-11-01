@@ -8,6 +8,8 @@
 #                             villain's panel opened in the browser
 #   run-demo.sh --smoke       the F2 smoke test instead (beats 1-3, ~1 min);
 #                             exit 0 only when every check passes
+#   run-demo.sh --beat5       the live demo's beat 5 played and checked
+#                             (launch.ts --beat5, ~1 min); exit 0 = GO
 #   run-demo.sh --stop        kill desktops a crashed run left behind
 #
 # Flags: --background (windows do not wait to become visible: only for a
@@ -45,6 +47,7 @@ LAUNCH_ARGS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --smoke) MODE=smoke ;;
+    --beat5) MODE=beat5 ;;
     --stop) MODE=stop ;;
     --background) BACKGROUND=1 ;;
     --no-open) NO_OPEN=1 ;;
@@ -60,7 +63,7 @@ while [ $# -gt 0 ]; do
       shift
       ;;
     -h | --help)
-      sed -n '2,21p' "$0"
+      sed -n '2,23p' "$0"
       exit 0
       ;;
     *) die "unknown argument $1 (try --help)" ;;
@@ -217,7 +220,13 @@ if [ "$MODE" = smoke ]; then
   exit $rc
 fi
 
-# The live demo. The panel port must be free (a previous run still up?).
+# The live demo, or its beat-5 check (no browser). The panel port must be
+# free (a previous run still up?).
+if [ "$MODE" = beat5 ]; then
+  NO_OPEN=1
+  LAUNCH_ARGS+=(--beat5)
+  say "beat-5 check (launch.ts --beat5); artifacts in $ROOT/demo/artifacts/demo"
+fi
 if lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1; then
   die "port $PORT is in use (a previous demo still running? $0 --stop, or --port N)"
 fi

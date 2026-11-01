@@ -13,7 +13,8 @@ Everything here runs from the repository root with Node 24 and `tsx`. Build
 | `evil.ts`    | `EvilServer`: Signal's mock server with the rules in front of the linked desktops (`handleMessage` + `prepareMultiDeviceMessage`); `arm`, `release(to)`, `clear()` |
 | `panel.ts`   | the control panel: HTTP on 127.0.0.1 and a one-page HTML front end                                                                                                 |
 | `harness.ts` | the demo world: four phones (Alice, Bob, Carol, Dave), group "Camping", link, tile, warm-up, restart, teardown                                                     |
-| `launch.ts`  | the live demo: links Alice, Bob, Carol; warms up; starts the panel; links Dave on demand                                                                           |
+| `launch.ts`  | the live demo: links Alice, Bob, Carol; warms up; starts the panel; links Dave on demand; `--beat5` plays and checks beat 5                                        |
+| `beat5.ts`   | the `--beat5` check: beat 5 the way the presenter plays it (panel, Settings → Internal clicks, typing), with Dave's window checked at each step                    |
 | `doctor.ts`  | beats 4 and 5: edits an exported store                                                                                                                             |
 | `smoke.ts`   | the F2 go/no-go test: beats 1–5 through the harness and the panel, then beat 6 (a member added later catches up, JOIN_PLAN)                                        |
 
@@ -33,10 +34,16 @@ mini. Ctrl-C closes everything.
 `doctor.ts` runs by itself on the live exports (`--no-auto-doctor` turns it
 off): when Carol clicks Settings → Internal → Export store, one linked,
 non-head record is removed from her file in place (beat 4; the original is
-kept as `.orig`); when Bob exports and Dave's desktop is linked, two fakes by
-Bob are appended and the result is written where Dave's Import file reads
-(beat 5). The terminal prints what it did (`auto-doctor, beat 4: removed ·61b5
-…`).
+kept as `.orig`); when Bob exports for Dave (Export for: Dave) and Dave's
+desktop is linked, two fakes by Bob are appended in a section sealed to
+Dave's key and the result is written where Dave's Import file reads (beat 5).
+Bob's own export is left alone (only Bob's account could import it), with a
+hint in the terminal. The terminal prints what it did (`auto-doctor, beat 4
+(Carol's export): removed ·61b5 …`).
+
+Dave is a member from the group's creation, so his new desktop catches up
+from Alice by itself when it links (zrdt JOIN_PLAN §6.1): his chat holds the
+nine messages before beat 5 starts, and the import adds only the two fakes.
 
 ### Presenter clicks, beats 4 and 5
 
@@ -44,10 +51,12 @@ Bob are appended and the result is written where Dave's Import file reads
   **Import file** (back to the chat: red banner "This copy of the chat does not
   verify: message ·xxxx is missing"); **Keep what verifies** ("Kept N messages
   that verify. Dropped 1 message: ·yyyy."); **OK**.
-- Beat 5: panel **Link Dave's desktop**; Bob: Settings → Internal → **Export
-  store**; (auto-doctor); Dave: Settings → Internal → **Import file**, back to
-  Camping; expand "N messages not yet confirmed by any member"; Alice writes;
-  Bob writes.
+- Beat 5: panel **Link Dave's desktop** (Dave catches up from Alice); Bob:
+  Settings → Internal → **Export for: Dave** → **Export store**, back to
+  Camping; (auto-doctor); Dave: Settings → Internal → **Import file** (back to
+  Camping by itself); expand "2 messages not yet confirmed by any member";
+  Alice writes (the fakes stay unconfirmed); Bob writes (the fakes read "not
+  confirmed by Bob").
 
 Panel routes (also usable with curl):
 
@@ -62,8 +71,8 @@ curl -X POST "$P/actions/link-dave"                        # just before beat 5
 curl -X POST "$P/actions/export" -d '{"member":"carol"}'    # rehearsal: the T3 export hook
 curl -X POST "$P/actions/doctor-remove"                    # beat 4, on Carol's export, in place
 curl -X POST "$P/actions/import" -d '{"member":"carol"}'
-curl -X POST "$P/actions/export" -d '{"member":"bob"}'
-curl -X POST "$P/actions/doctor-append"                    # beat 5: Bob's export -> Dave's import path
+curl -X POST "$P/actions/export" -d '{"member":"bob","for":"dave"}'  # Bob's export for Dave
+curl -X POST "$P/actions/doctor-append"                    # beat 5: Bob's export for Dave -> Dave's import path
 curl -X POST "$P/actions/import" -d '{"member":"dave"}'
 curl -X POST "$P/actions/send" -d '{"member":"alice","text":"hi"}'
 curl -X POST "$P/actions/restart" -d '{"member":"carol"}'  # app.close(); app.start()
@@ -118,7 +127,20 @@ up).
 ```sh
 node --import tsx --test demo/*_test.ts          # rules, panel, doctor (+ zrdtd)
 node --import tsx demo/smoke.ts                  # launches up to five desktops
+node --import tsx demo/launch.ts --beat5 --port 7465   # beat 5 of the live demo, checked
 ```
+
+`launch.ts --beat5` (or `run-demo.sh --beat5`) starts the live demo, types
+the script's lines of beats 1 to 3, then plays beat 5 as DEMO.md has it:
+the panel's link-dave route, Bob's Settings → Internal → Export for: Dave →
+Export store and the Chats tab, the auto-doctor, Dave's Import file, one
+click on the section, Alice and Bob typing. It checks that Dave caught up
+from Alice, that the file is an export for Dave with no text in the clear,
+that Dave's import is accepted and returns to the chat, that the two fakes
+wait unconfirmed (also after Alice writes) while the genuine history is
+confirmed, and that Bob's message turns them "not confirmed by Bob". It
+writes `beat5.json` (checks and step timings) and `beat5-*.png` to
+`demo/artifacts/demo/` and exits 0 only if every check passes.
 
 `smoke.ts` tags each check `harness` or `zrdt`, writes
 `demo/artifacts/smoke/run.json` (every check with `atMs`/`ms`, and
