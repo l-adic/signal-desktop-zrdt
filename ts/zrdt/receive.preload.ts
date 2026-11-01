@@ -103,6 +103,8 @@ function getGroupConversation(
 type PendingRelay = Readonly<{
   opening: Uint8Array<ArrayBuffer> | undefined;
   responderAci: AciString;
+  // Whether we had asked for it (decided when it arrived).
+  wasRequested: boolean;
 }>;
 const pendingRelays = new Map<string, PendingRelay>();
 
@@ -114,7 +116,6 @@ async function getPendingDigests(conversationId: string): Promise<Set<string>> {
 // The service emits 'accepted' for every record it stores, including pending
 // records it drains after another accept.
 function onAcceptedEvent(conversationId: string, digest: string): void {
-  zrdtResendScheduler.resolved(conversationId, digest);
   const key = `${conversationId}:${digest}`;
   const relay = pendingRelays.get(key);
   if (relay) {
@@ -228,6 +229,9 @@ export async function zrdtReceiveLive({
     let missing: Array<string> = [];
     if (outcome.status === 'accepted') {
       log.info(`${logId}: zrdt accepted ${digest?.slice(0, 8)}`);
+      if (digest) {
+        zrdtResendScheduler.resolved(conversationId, digest);
+      }
       await recordDisown(conversationId, authorAci, meta.disown);
     } else {
       // Records waiting in zrdt_pending are held here, just not linked up
@@ -575,9 +579,13 @@ export async function acceptRelayedRecord({
   if (outcome.status === 'missing') {
     const digest = outcome.digest ? toHex(outcome.digest) : undefined;
     if (digest) {
+      const gaps = await findGapsFor(conversationId, digest);
       pendingRelays.set(`${conversationId}:${digest}`, {
         opening: usedOpening,
         responderAci,
+        wasRequested:
+          zrdtResendScheduler.isOutstanding(conversationId, digest) ||
+          gaps.length > 0,
       });
       // Answered; it now waits for its own links.
       zrdtResendScheduler.resolved(conversationId, digest);
@@ -638,6 +646,7 @@ async function afterDrainedRelay(
       record: held.record,
       responderAci: relay.responderAci,
       opening,
+      wasRequested: relay.wasRequested,
     });
   } catch (error) {
     log.error('afterDrainedRelay failed', Errors.toLogFormat(error));
@@ -650,12 +659,14 @@ async function onRelayAccepted({
   record,
   responderAci,
   opening,
+  wasRequested: knownRequested,
 }: Readonly<{
   conversationId: string;
   digest: Uint8Array<ArrayBuffer>;
   record: Uint8Array<ArrayBuffer>;
   responderAci: AciString;
   opening: Uint8Array<ArrayBuffer> | undefined;
+  wasRequested?: boolean;
 }>): Promise<void> {
   const conversation = window.ConversationController.get(conversationId);
   if (!conversation) {
@@ -687,6 +698,7 @@ async function onRelayAccepted({
     ourAci,
     hasOpening: opening != null,
     wasRequested:
+      knownRequested === true ||
       zrdtResendScheduler.isOutstanding(conversationId, digest) ||
       gaps.length > 0,
     ownLive,
