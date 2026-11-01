@@ -102,6 +102,35 @@ export class EvilServer extends Server {
     this.#rules = [];
   }
 
+  /**
+   * Turns the villain off: removes every rule and delivers everything still
+   * held. Returns the number of envelopes delivered. Dropped (blackholed)
+   * envelopes are gone for good; the app has to ask for them again.
+   */
+  public async clear(): Promise<number> {
+    this.#rules = [];
+    const all = this.#held.splice(0);
+    for (const h of all) {
+      // oxlint-disable-next-line no-await-in-loop
+      await h.deliver();
+    }
+    return all.length;
+  }
+
+  /** How many envelopes are held, per recipient. */
+  public heldCounts(): Record<Name, number> {
+    const counts: Record<Name, number> = {};
+    for (const h of this.#held) {
+      counts[h.to] = (counts[h.to] ?? 0) + 1;
+    }
+    return counts;
+  }
+
+  /** The demo group's members, by short name. */
+  public get members(): ReadonlyArray<Name> {
+    return [...this.#group];
+  }
+
   /** Removes `to`'s hold rule and delivers what was held for `to`. */
   public async release(to: Name): Promise<number> {
     this.#rules = this.#rules.filter(r => r.id !== hold(to).id);
