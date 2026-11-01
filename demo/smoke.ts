@@ -681,6 +681,109 @@ async function sortedHeads(demo: Demo, m: Member): Promise<string> {
   return [...r.value].sort().join(',');
 }
 
+// --- Settings → Internal, the presenter's path for beats 4 and 5 ----------------
+
+async function internalResult(m: Member): Promise<string> {
+  const r = await hook<string | undefined>(m, 'getInternalResult');
+  return r.missing ? '' : (r.value ?? '');
+}
+
+/**
+ * Clicks Settings → Internal → `button` in `m`'s window, waits for the
+ * result line to change, and goes back to the chat. Returns the line.
+ */
+async function clickInternal(
+  demo: Demo,
+  m: Member,
+  button: 'Export store' | 'Import file'
+): Promise<string> {
+  const p = page(m);
+  const before = await internalResult(m);
+  await p.getByRole('tab', { name: 'Settings' }).click({ timeout: UI_MS });
+  const settings = p.getByRole('tabpanel', { name: 'Settings' });
+  await settings
+    .getByRole('button', { name: 'Internal', exact: true })
+    .click({ timeout: UI_MS });
+  await settings
+    .getByRole('button', { name: button, exact: true })
+    .click({ timeout: UI_MS });
+  const deadline = Date.now() + UI_MS * 2;
+  let after = await internalResult(m);
+  while (after === before && Date.now() < deadline) {
+    // oxlint-disable-next-line no-await-in-loop
+    await sleep(100);
+    // oxlint-disable-next-line no-await-in-loop
+    after = await internalResult(m);
+  }
+  // "Import file" returns to the chat by itself; Export stays in Settings.
+  if ((await p.getByRole('tabpanel', { name: 'Settings' }).count()) > 0) {
+    await p.getByRole('tab', { name: 'Chats' }).click({ timeout: UI_MS });
+  }
+  await openGroup(m, demo.group);
+  if (after === before) {
+    throw new Error(`no new result line after "${button}" (still "${before}")`);
+  }
+  return after;
+}
+
+type Via = { how: 'settings' | 'hook'; note: string };
+
+/** Export through Settings → Internal, else the hook. Returns the file. */
+async function exportVia(
+  demo: Demo,
+  m: Member
+): Promise<{ file: string | undefined } & Via> {
+  const file = await dumpPath(demo, m);
+  try {
+    const line = await clickInternal(demo, m, 'Export store');
+    if (line.startsWith('Exported')) {
+      return { file, how: 'settings', note: line };
+    }
+    throw new Error(line);
+  } catch (error) {
+    const note = `Settings path failed: ${String(error).split('\n')[0]}`;
+    say(`${m.display}: ${note}; using the exportStore hook`);
+    const r = await hook<string | undefined>(
+      m,
+      'exportStore',
+      await conversationId(demo, m)
+    );
+    if (r.missing) {
+      throw new Error('no exportStore hook');
+    }
+    return { file: r.value, how: 'hook', note };
+  }
+}
+
+/** Import through Settings → Internal, else the hook. Returns the status. */
+async function importVia(
+  demo: Demo,
+  m: Member
+): Promise<{ status: string | undefined } & Via> {
+  try {
+    const line = await clickInternal(demo, m, 'Import file');
+    if (/: ok\b/.test(line)) {
+      return { status: 'ok', how: 'settings', note: line };
+    }
+    if (line.includes('does not verify')) {
+      return { status: 'unverifiable', how: 'settings', note: line };
+    }
+    throw new Error(line);
+  } catch (error) {
+    const note = `Settings path failed: ${String(error).split('\n')[0]}`;
+    say(`${m.display}: ${note}; using the importStore hook`);
+    const r = await hook<string | undefined>(
+      m,
+      'importStore',
+      await conversationId(demo, m)
+    );
+    if (r.missing) {
+      throw new Error('no importStore hook');
+    }
+    return { status: r.value, how: 'hook', note };
+  }
+}
+
 async function beat4(demo: Demo, trio: ReadonlyArray<Member>): Promise<void> {
   const { carol } = demo.byName;
   const conv = await conversationId(demo, carol);
@@ -689,22 +792,24 @@ async function beat4(demo: Demo, trio: ReadonlyArray<Member>): Promise<void> {
   let count = 0;
   let removed: string | undefined;
   let unverifiable: ReadonlyArray<string> = [];
+  const vias: Array<string> = [];
 
   const exported = await attempt(
     'beat4 Carol exports her store',
     'zrdt',
     async () => {
-      const r = await hook<string | undefined>(carol, 'exportStore', conv);
-      if (r.missing) {
-        throw new Error('no exportStore hook');
-      }
-      file = r.value;
+      const r = await exportVia(demo, carol);
+      vias.push(`export: ${r.how}`);
+      file = r.file;
       if (file === undefined) {
-        return { ok: false, detail: 'export failed (see internalResult)' };
+        return { ok: false, detail: `export failed (${r.note})` };
       }
       count = parseBlob(locateBlob(await fs.readFile(file)).blob).records
         .length;
-      return { ok: count >= 2, detail: `${count} records -> ${file}` };
+      return {
+        ok: count >= 2,
+        detail: `${count} records -> ${file} (via ${r.how})`,
+      };
     }
   );
   const doctored =
@@ -742,10 +847,9 @@ async function beat4(demo: Demo, trio: ReadonlyArray<Member>): Promise<void> {
         if (removed === undefined) {
           return { ok: false, detail: 'nothing removed' };
         }
-        const r = await hook<string | undefined>(carol, 'importStore', conv);
-        if (r.missing) {
-          throw new Error('no importStore hook');
-        }
+        const imp = await importVia(demo, carol);
+        vias.push(`import: ${imp.how}`);
+        const r = { value: imp.status };
         const text = rejectedText({ kind: 'unverifiable', missing: [removed] });
         const banner = page(carol).locator('.ZrdtBanner--error');
         const onScreen = await visible(page(carol), text, UI_MS * 2);
@@ -760,6 +864,12 @@ async function beat4(demo: Demo, trio: ReadonlyArray<Member>): Promise<void> {
       }
     ));
   await screenshots(demo, trio, 'beat4-rejected');
+  check(
+    'beat4 presenter path: Settings → Internal buttons',
+    'zrdt',
+    vias.length === 2 && vias.every(v => v.endsWith('settings')),
+    vias.join(', ') || 'not reached'
+  );
 
   await attempt(
     'beat4 "Keep what verifies" reports kept and dropped',
@@ -886,19 +996,17 @@ async function beat5(demo: Demo): Promise<void> {
   // Bob exports; doctor.ts appends two fakes by Bob; Dave's import path.
   let genuine: Array<Analysed> = [];
   let fakes: ReadonlyArray<string> = [];
+  const vias5: Array<string> = [];
   const doctored = await attempt(
     'beat5 Bob exports; doctor appends two fakes by Bob on the genuine head',
     'zrdt',
     async () => {
-      const r = await hook<string | undefined>(
-        bob,
-        'exportStore',
-        await conversationId(demo, bob)
-      );
-      if (r.missing || r.value === undefined) {
-        return { ok: false, detail: 'Bob could not export' };
+      const r = await exportVia(demo, bob);
+      vias5.push(`export: ${r.how}`);
+      if (r.file === undefined) {
+        return { ok: false, detail: `Bob could not export (${r.note})` };
       }
-      const located = locateBlob(await fs.readFile(r.value));
+      const located = locateBlob(await fs.readFile(r.file));
       genuine = analyse(parseBlob(located.blob));
       const result = await appendFakes(located.blob, aciBytes(aciOf(bob)), {
         daemon: process.env.ZRDT_DAEMON,
@@ -927,14 +1035,9 @@ async function beat5(demo: Demo): Promise<void> {
     'beat5 Dave imports: everything collapsed and unconfirmed',
     'zrdt',
     async () => {
-      const r = await hook<string | undefined>(
-        dave,
-        'importStore',
-        await conversationId(demo, dave)
-      );
-      if (r.missing) {
-        throw new Error('no importStore hook');
-      }
+      const imp = await importVia(demo, dave);
+      vias5.push(`import: ${imp.how}`);
+      const r = { value: imp.status };
       const res = await until(CLASSIFY_MS, async () => {
         const state = await convState(demo, dave);
         const items = state?.unconfirmed ?? [];
@@ -953,6 +1056,12 @@ async function beat5(demo: Demo): Promise<void> {
         detail: `import status=${r.value}; ${res.detail}; "${title}" ${onScreen ? 'shown' : 'NOT shown'}`,
       };
     }
+  );
+  check(
+    'beat5 presenter path: Settings → Internal buttons',
+    'zrdt',
+    vias5.length === 2 && vias5.every(v => v.endsWith('settings')),
+    vias5.join(', ') || 'not reached'
   );
   // Open the section so the labels are on screen (one click in the demo).
   try {
