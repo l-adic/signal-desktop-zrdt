@@ -13,15 +13,11 @@
 // The readers below accept both the old and the new reply layouts (by body
 // length), so the host works with either zrdtd.
 //
-// Protocol 3 (zrdt docs/JOIN_PLAN.md section 10.2): ACCEPT takes
-// `u8 flag ‖ opening?` after the parts; the status NO_AUDIENCE (0x09); the ops
-// AUDIENCE (0x11), SERVE (0x12) and ADDRESSED (0x13).
-// TODO(zrdt join lane D): NO_AUDIENCE's byte, AUDIENCE's `u8 hasKey ‖ key?`
-// (the key only when hasKey is 1), SERVE's held items
-// (`digest ‖ u8 flag ‖ opening?`) and the entry layout (`u8 kind` 0 addressed,
-// 1 after, 2 boundary) are this lane's reading of JOIN_PLAN section 10.2.
-// Check them against lane B's core/Zrdt/Proto.lean once origin/join-core
-// lands.
+// Protocol 3 (zrdt docs/JOIN_PLAN.md section 10.2; core/Zrdt/Proto.lean of
+// zrdt join-core 59a9d08): ACCEPT takes `u8 flag ‖ opening?` after the parts;
+// the status NO_AUDIENCE (0x09); the ops AUDIENCE (0x11), SERVE (0x12) and
+// ADDRESSED (0x13). A SERVE `held` item is `digest ‖ opening` (always an
+// opening); an addressed entry is `record ‖ authorCopy flag ‖ opening?`.
 
 import type {
   AcceptRecordResult,
@@ -203,7 +199,7 @@ function wMember(member: AudienceMember): Bytes {
 const SERVE_MODES: ReadonlyArray<ServeMode> = ['catchup', 'perDigest'];
 
 function wHeld(held: ServeHeld): Bytes {
-  return concatBytes([held.digest, wOptionalBytes(held.opening)]);
+  return concatBytes([held.digest, wBytes(held.opening)]);
 }
 
 /** One SERVE entry: `u8 kind` (0 addressed, 1 after, 2 boundary), then its fields. */
@@ -213,8 +209,8 @@ function wEntry(entry: ServeEntry): Bytes {
       return concatBytes([
         u8(0),
         wBytes(entry.record),
-        wOptionalBytes(entry.opening),
         u8(entry.authorCopy ? 1 : 0),
+        wOptionalBytes(entry.opening),
       ]);
     case 'after':
       return concatBytes([u8(1), wBytes(entry.record)]);
@@ -371,8 +367,7 @@ class Reader {
 
   held(): ServeHeld {
     const digest = this.take(32);
-    const opening = this.optionalBytes();
-    return opening === undefined ? { digest } : { digest, opening };
+    return { digest, opening: this.bytes() };
   }
 
   entry(): ServeEntry {
@@ -380,8 +375,8 @@ class Reader {
     switch (kind) {
       case 0: {
         const record = this.bytes();
-        const opening = this.optionalBytes();
         const authorCopy = this.flag();
+        const opening = this.optionalBytes();
         return opening === undefined
           ? { kind: 'addressed', record, authorCopy }
           : { kind: 'addressed', record, opening, authorCopy };
@@ -529,8 +524,12 @@ export function encodeRequestBody(req: Request): Bytes {
         req.key,
         req.requestId,
         wDigests(req.since),
-        u8(SERVE_MODES.indexOf(req.mode)),
-        wDigests(req.wanted),
+        wDigests(req.ownSince),
+        // `u8` mode (0 catch-up, 1 per-digest), then the wanted digests in
+        // per-digest mode only.
+        req.mode === 'perDigest'
+          ? concatBytes([u8(1), wDigests(req.wanted)])
+          : u8(0),
         u8(req.forExport ? 1 : 0),
         u8(req.strict ? 1 : 0),
         wDigests(req.live),
@@ -685,11 +684,12 @@ function readProtocol3Request(
   const key = r.take(IDENTITY_KEY_BYTES);
   const requestId = r.take(REQUEST_ID_BYTES);
   const since = r.digests();
+  const ownSince = r.digests();
   const mode = SERVE_MODES[r.u8()];
   if (mode === undefined) {
     throw new Short();
   }
-  const wanted = r.digests();
+  const wanted = mode === 'perDigest' ? r.digests() : [];
   const forExport = r.flag();
   const strict = r.flag();
   const live = r.digests();
@@ -707,6 +707,7 @@ function readProtocol3Request(
     key,
     requestId,
     since,
+    ownSince,
     mode,
     wanted,
     forExport,
@@ -878,9 +879,13 @@ export function encodeReply<O extends Op>(
       return concatBytes([ok, wBytes(result as Bytes)]);
     case Op.AUDIENCE: {
       const a = result as AudienceResult;
-      return a.kind === 'tooLarge'
-        ? u8(Code.TOO_LARGE)
-        : concatBytes([ok, wBytes(a.audience)]);
+      if (a.kind === 'tooLarge') {
+        return u8(Code.TOO_LARGE);
+      }
+      if (a.kind === 'malformed') {
+        return u8(Code.MALFORMED);
+      }
+      return concatBytes([ok, wBytes(a.audience)]);
     }
     case Op.SERVE: {
       const s = result as ServeReply;
@@ -1087,6 +1092,9 @@ export function decodeReply<O extends Op>(
       case Op.AUDIENCE:
         if (status === Code.TOO_LARGE) {
           return { kind: 'tooLarge' } as R;
+        }
+        if (status === Code.MALFORMED) {
+          return { kind: 'malformed' } as R;
         }
         if (status !== Code.OK) {
           break;

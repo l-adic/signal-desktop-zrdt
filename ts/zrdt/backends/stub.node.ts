@@ -448,11 +448,11 @@ export function stubKeyTag(identityKey: Bytes): Bytes {
 export function buildAudience(
   members: ReadonlyArray<AudienceMember>
 ): AudienceResult {
-  if (members.length === 0) {
-    throw new ZrdtBackendError('badInput', 'an audience has a member');
-  }
   if (members.length > MAX_AUDIENCE) {
     return { kind: 'tooLarge' };
+  }
+  if (members.length === 0) {
+    return { kind: 'malformed' };
   }
   const entries = members.map(member => {
     checkSize('aci', member.aci, ACI_BYTES);
@@ -471,7 +471,7 @@ export function buildAudience(
       b !== undefined &&
       equal(a.subarray(0, ACI_BYTES), b.subarray(0, ACI_BYTES))
     ) {
-      throw new ZrdtBackendError('badInput', 'an ACI appears twice');
+      return { kind: 'malformed' };
     }
   }
   return { kind: 'ok', audience: concat(entries) };
@@ -1212,7 +1212,7 @@ function serveStore(store: StubStore, q: ServeRequest): ServeReply {
     aud !== undefined && seatsUnderTag(aud, q.requesterAci, tag);
   const live = new Set(q.live.map(key));
   const disown = new Set(q.disown.map(key));
-  const held = new Map<string, Bytes | undefined>();
+  const held = new Map<string, Bytes>();
   for (const item of q.held) {
     held.set(key(item.digest), item.opening);
   }
@@ -1239,7 +1239,7 @@ function serveStore(store: StubStore, q: ServeRequest): ServeReply {
     !(q.forExport && isEphemeralOpening(o)) &&
     (!q.strict || authorCopy(k, r));
 
-  const sinceReach = store.reach(q.since);
+  const sinceReach = store.reach([...q.since, ...q.ownSince]);
   const entitled = new Set<string>();
   const linkedBy = new Map<string, Array<string>>();
   const linkedAny = new Set<string>();

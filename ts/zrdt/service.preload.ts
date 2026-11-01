@@ -16,7 +16,7 @@
 
 import type { EventEmitter } from 'node:events';
 
-import { fromBase64 } from '../Bytes.std.ts';
+import { fromBase64, fromHex, toHex } from '../Bytes.std.ts';
 import { DataReader, DataWriter } from '../sql/Client.preload.ts';
 import { itemStorage } from '../textsecure/Storage.preload.ts';
 import {
@@ -68,6 +68,28 @@ const core = new ZrdtServiceCore({
   },
   groupIdOf,
   ourAci: () => itemStorage.user.getAci(),
+  heldOpenings: async conversationId => {
+    const rows = await DataReader.getZrdtRecords(conversationId);
+    const ids = await DataReader.getMessageIdsByZrdtDigest(
+      conversationId,
+      rows.map(row => toHex(row.digest))
+    );
+    const held = new Array<{
+      digest: Uint8Array<ArrayBuffer>;
+      opening: Uint8Array<ArrayBuffer>;
+    }>();
+    for (const { digest, messageId } of ids) {
+      // oxlint-disable-next-line no-await-in-loop
+      const message = await DataReader.getMessageById(messageId);
+      if (message?.zrdtOpening != null) {
+        held.push({
+          digest: fromHex(digest),
+          opening: fromBase64(message.zrdtOpening),
+        });
+      }
+    }
+    return held;
+  },
 });
 
 export const zrdtService: ZrdtServiceType = core;

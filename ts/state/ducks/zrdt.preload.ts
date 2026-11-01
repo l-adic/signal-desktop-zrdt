@@ -236,6 +236,7 @@ async function getExportContent(
     key: new Uint8Array(ourKeys.publicKey.serialize()),
     requestId: globalThis.crypto.getRandomValues(new Uint8Array(16)),
     since: [],
+    ownSince: [],
     mode: 'catchup',
     wanted: [],
     forExport: true,
@@ -246,9 +247,7 @@ async function getExportContent(
   });
   const digestOfOpening = new Map<string, string>();
   for (const item of held) {
-    if (item.opening) {
-      digestOfOpening.set(Bytes.toBase64(item.opening), zrdtHex(item.digest));
-    }
+    digestOfOpening.set(Bytes.toBase64(item.opening), zrdtHex(item.digest));
   }
   const content = new Map<string, Uint8Array<ArrayBuffer>>();
   for (const entry of reply.entries) {

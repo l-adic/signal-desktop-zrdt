@@ -223,6 +223,7 @@ function request(
     key: key(overrides.requesterAci),
     requestId: fill(0x1d, 16),
     since: [],
+    ownSince: [],
     mode: 'catchup',
     wanted: [],
     forExport: false,
@@ -288,8 +289,10 @@ describe('zrdt protocol 3 on the stub (JOIN_PLAN §3.2, §5)', () => {
       }));
       assert.deepEqual(buildAudience(many.slice(0, 256)).kind, 'ok');
       assert.deepEqual(buildAudience(many), { kind: 'tooLarge' });
-      assert.throws(() => buildAudience([seat(ALICE), { aci: ALICE }]));
-      assert.throws(() => buildAudience([]));
+      assert.deepEqual(buildAudience([seat(ALICE), { aci: ALICE }]), {
+        kind: 'malformed',
+      });
+      assert.deepEqual(buildAudience([]), { kind: 'malformed' });
     });
 
     it('parseAudience: 1..256 entries, strictly increasing', () => {
@@ -605,14 +608,22 @@ describe('zrdt protocol 3 on the stub (JOIN_PLAN §3.2, §5)', () => {
         since: [s.r1.digest],
         forExport: true,
         strict: true,
+        ownSince: [s.r4.digest],
         held: [
           { digest: s.r2.digest, opening: s.r2.opening },
-          { digest: s.r3.digest },
+          { digest: s.r3.digest, opening: s.r3.opening },
         ],
       });
       const body = encodeRequestBody({ op: Op.SERVE, ...req });
       const decoded = decodeRequest(concat([Uint8Array.of(Op.SERVE), body]));
       assert.deepEqual(decoded, { op: Op.SERVE, ...req });
+      // Catch-up carries no wanted list (mode byte 0, then the export flag).
+      const catchup = request(s, { requesterAci: BOB });
+      const catchupBody = encodeRequestBody({ op: Op.SERVE, ...catchup });
+      assert.deepEqual(
+        decodeRequest(concat([Uint8Array.of(Op.SERVE), catchupBody])),
+        { op: Op.SERVE, ...catchup }
+      );
 
       const reply = await s.backend.serve(req);
       const payload = encodeReply(Op.SERVE, reply, { extended: true });

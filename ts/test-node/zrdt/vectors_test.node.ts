@@ -38,6 +38,7 @@ import {
   Code,
   Op,
   concatBytes,
+  decodeReply,
   decodeRequest,
   encodeReply,
   encodeRequestBody,
@@ -660,6 +661,169 @@ describe('zrdt rung 7: stub vs Lean (vectors.json, zrdtd)', function (this: Moch
           await both({ op: Op.ENCODE, chat }, `final ENCODE ${chat}`);
         }
         assert.isAbove(known.length, 10, 'the run accepted records');
+      });
+    }
+  });
+
+  // Protocol 3 (JOIN_PLAN §3.2, §5): records with audiences, then AUDIENCE,
+  // ACCEPT with an opening, SERVE and ADDRESSED with random queries, on the
+  // stub and on zrdtd, replies compared byte for byte.
+  describeDaemon('randomized SERVE differential: stub vs zrdtd', () => {
+    let daemon: DaemonBackend | undefined;
+    afterEach(() => {
+      daemon?.dispose();
+      daemon = undefined;
+    });
+
+    const seedCount = Number(process.env.ZRDT_DIFF_SEEDS ?? 4);
+    for (let seed = 1; seed <= seedCount; seed += 1) {
+      it(`seed ${seed}: 150 records and queries give the same replies`, async () => {
+        daemon = new DaemonBackend({ path: ZRDTD });
+        const stub = new StubBackend({ env: {} });
+        const lean: ZrdtBackend = daemon;
+        const random = prng(1000 + seed);
+        const pick = <T>(items: ReadonlyArray<T>): T => {
+          const item = items[Math.floor(random() * items.length)];
+          if (item === undefined) {
+            throw new Error('empty');
+          }
+          return item;
+        };
+        const some = <T>(items: ReadonlyArray<T>, p: number): Array<T> =>
+          items.filter(() => random() < p);
+        const fill = (n: number, b: number): Bytes => new Uint8Array(n).fill(b);
+        const group = fill(32, 0x67);
+        const chat = 'camping';
+        const members = [0xa1, 0xb0, 0xc0, 0xd0].map(b => fill(16, b));
+        const keys = [0x05, 0x06, 0x07, 0x08, 0x09].map(b => fill(33, b));
+        const known = new Array<Digest>();
+        const openings = new Array<{ digest: Digest; opening: Bytes }>();
+        let nonceByte = 0;
+        // What the SERVE replies held, so the run is known to reach content.
+        let served = 0;
+        let content = 0;
+        let structure = 0;
+
+        const both = async (req: Request, label: string): Promise<Bytes> => {
+          const payload = concatBytes([
+            Uint8Array.of(req.op),
+            encodeRequestBody(req),
+          ]);
+          const opts = { extended: true, withAcceptRecord: true };
+          const [a, b] = await Promise.all([
+            serve(stub, payload, opts),
+            serve(lean, payload, opts),
+          ]);
+          assert.strictEqual(hex(a), hex(b), `seed ${seed}: ${label}`);
+          return a;
+        };
+
+        await both({ op: Op.NEW, chat, group }, 'NEW');
+        for (let i = 0; i < 150; i += 1) {
+          // A record: its author's audience, committed, accepted with it.
+          const author = pick(members);
+          const audienceMembers = some(members, 0.7).map(aci =>
+            random() < 0.8 ? { aci, key: pick(keys) } : { aci }
+          );
+          // oxlint-disable-next-line no-await-in-loop
+          const aud = await both(
+            { op: Op.AUDIENCE, members: audienceMembers },
+            `step ${i} AUDIENCE`
+          );
+          const body = new TextEncoder().encode(`m${i}`);
+          const field201 =
+            aud[0] === Code.OK && random() < 0.9
+              ? [0xca, 0x0c, aud.length - 5, ...aud.subarray(5)]
+              : [];
+          const ephemeral = random() < 0.15 ? [0x28, 60] : [];
+          const dataMessage = new Uint8Array([
+            0x0a,
+            body.length,
+            ...body,
+            ...ephemeral,
+            ...field201,
+          ]);
+          nonceByte = (nonceByte + 1) % 256;
+          const nonce = fill(32, nonceByte);
+          // oxlint-disable-next-line no-await-in-loop
+          const committed = await stub.commit(
+            group,
+            author,
+            nonce,
+            dataMessage
+          );
+          if (committed.kind !== 'ok') {
+            continue;
+          }
+          const links = some(known, 0.2).slice(0, 3);
+          const opening = random() < 0.9 ? committed.opening : undefined;
+          // oxlint-disable-next-line no-await-in-loop
+          const accepted = await both(
+            {
+              op: Op.ACCEPT,
+              chat,
+              parts: { group, commit: committed.commit, links, author },
+              opening,
+            },
+            `step ${i} ACCEPT`
+          );
+          if (accepted[0] === Code.OK) {
+            const digest = accepted.slice(1, 33);
+            known.push(digest);
+            if (opening !== undefined && random() < 0.8) {
+              openings.push({ digest, opening });
+            }
+          }
+
+          if (random() < 0.4 && known.length > 0) {
+            const perDigest = random() < 0.4;
+            // oxlint-disable-next-line no-await-in-loop
+            const reply = await both(
+              {
+                op: Op.SERVE,
+                chat,
+                ownAci: pick(members),
+                requesterAci: pick(members),
+                key: pick(keys),
+                requestId: fill(16, i % 256),
+                since: some(known, 0.1),
+                ownSince: some(known, 0.05),
+                mode: perDigest ? 'perDigest' : 'catchup',
+                wanted: perDigest ? some(known, 0.3) : [],
+                forExport: random() < 0.3,
+                strict: random() < 0.2,
+                live: some(known, 0.5),
+                disown: some(known, 0.1),
+                held: some(openings, 0.7),
+              },
+              `step ${i} SERVE`
+            );
+            const decoded = decodeReply(
+              Op.SERVE,
+              reply[0] ?? 0,
+              reply.slice(1)
+            );
+            served += 1;
+            for (const entry of decoded?.entries ?? []) {
+              if (entry.kind === 'addressed' && entry.opening) {
+                content += 1;
+              } else if (entry.kind !== 'boundary') {
+                structure += 1;
+              }
+            }
+          }
+          if (random() < 0.2) {
+            // oxlint-disable-next-line no-await-in-loop
+            await both(
+              { op: Op.ADDRESSED, chat, aci: pick(members), key: pick(keys) },
+              `step ${i} ADDRESSED`
+            );
+          }
+        }
+        assert.isAbove(known.length, 10, 'the run accepted records');
+        assert.isAbove(served, 10, 'the run served');
+        assert.isAbove(content, 0, 'some replies carried content');
+        assert.isAbove(structure, 0, 'some replies carried structure');
       });
     }
   });

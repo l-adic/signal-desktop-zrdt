@@ -149,16 +149,20 @@ export type AcceptRecordResult =
  */
 export type AudienceMember = Readonly<{ aci: Bytes; key?: Bytes }>;
 
-/** The reply to `audience()`: the field-201 bytes, or more than 256 members. */
+/**
+ * The reply to `audience()`: the field-201 bytes; `tooLarge`, more than 256
+ * members; `malformed`, no members or an ACI given twice.
+ */
 export type AudienceResult =
   | { kind: 'ok'; audience: Bytes }
-  | { kind: 'tooLarge' };
+  | { kind: 'tooLarge' }
+  | { kind: 'malformed' };
 
 /** SERVE's mode: the whole view, or a repair of the wanted digests. */
 export type ServeMode = 'catchup' | 'perDigest';
 
 /** An opening the host holds for a stored record, for SERVE. */
-export type ServeHeld = Readonly<{ digest: Digest; opening?: Bytes }>;
+export type ServeHeld = Readonly<{ digest: Digest; opening: Bytes }>;
 
 /**
  * A SERVE request (JOIN_PLAN §5, §10.2). `requesterAci` is the
@@ -174,6 +178,8 @@ export type ServeRequest = Readonly<{
   key: Bytes;
   requestId: Bytes;
   since: ReadonlyArray<Digest>;
+  /** This device's own `since` for the requester's account (JOIN_PLAN §6.5). */
+  ownSince: ReadonlyArray<Digest>;
   mode: ServeMode;
   wanted: ReadonlyArray<Digest>;
   forExport: boolean;

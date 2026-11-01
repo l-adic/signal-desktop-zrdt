@@ -301,6 +301,90 @@ describe('zrdt service', function (this: Mocha.Suite) {
         return s;
       };
 
+      it('refuses a message without an audience (NO_AUDIENCE, JOIN_PLAN §3.2)', async () => {
+        const storage = new MemoryStorage();
+        const service = fresh(storage);
+        await service.init();
+        await service.ensureConversation(CHAT, GROUP);
+        const body = new TextEncoder().encode('no field 201');
+        const outcome = await service.acceptIncoming(CHAT, {
+          groupId: GROUP,
+          authorAci: aciStringToBytes(ALICE),
+          nonce: nonce(),
+          dataMessageBytes: new Uint8Array([0x0a, body.length, ...body]),
+          links: [],
+          provenance: { kind: 'live' },
+        });
+        assert.deepEqual(outcome, { status: 'noAudience' });
+        assert.strictEqual(storage.records.length, 0);
+      });
+
+      it('records audiences, and records them again from held openings after a restart', async () => {
+        const storage = new MemoryStorage();
+        const service = fresh(storage);
+        await service.init();
+        await service.ensureConversation(CHAT, GROUP);
+        const aliceAci = aciStringToBytes(ALICE);
+        const key = filled(33, 0x05);
+        const audience = await service.audience([{ aci: aliceAci, key }]);
+        assert.notStrictEqual(audience, 'tooLarge');
+        const aud = audience === 'tooLarge' ? new Uint8Array(0) : audience;
+        const body = new TextEncoder().encode('seated');
+        const outcome = await service.acceptIncoming(CHAT, {
+          groupId: GROUP,
+          authorAci: aliceAci,
+          nonce: nonce(),
+          dataMessageBytes: new Uint8Array([
+            0x0a,
+            body.length,
+            ...body,
+            0xca,
+            0x0c,
+            aud.length,
+            ...aud,
+          ]),
+          links: [],
+          provenance: { kind: 'live' },
+        });
+        const digest = digestOf(outcome);
+        const opening =
+          outcome.status === 'accepted' ? outcome.opening : undefined;
+        assert.isOk(opening);
+        assert.deepEqual(
+          (await service.addressed(CHAT, aliceAci, key)).map(toHex),
+          [toHex(digest)]
+        );
+        assert.deepEqual(
+          await service.addressed(CHAT, aliceAci, filled(33, 0x06)),
+          [],
+          'another key is not seated'
+        );
+
+        // A restart re-OPENs the rows; the audiences are not in them.
+        const bare = fresh(storage);
+        await bare.init();
+        assert.deepEqual(await bare.addressed(CHAT, aliceAci, key), []);
+
+        // With the openings the host holds, they are recorded again.
+        if (make === undefined || opening === undefined) {
+          return;
+        }
+        const withOpenings = new ZrdtServiceCore({
+          createBackend: make,
+          intendedKind: () => 'stub',
+          storage,
+          groupIdOf: id => (id === CHAT ? GROUP : undefined),
+          ourAci: () => CAROL,
+          heldOpenings: async () => [{ digest, opening }],
+        });
+        services.push(withOpenings);
+        await withOpenings.init();
+        assert.deepEqual(
+          (await withOpenings.addressed(CHAT, aliceAci, key)).map(toHex),
+          [toHex(digest)]
+        );
+      });
+
       it('accepts own and incoming messages, writes rows, and re-opens after a restart', async () => {
         const storage = new MemoryStorage();
         const service = fresh(storage);

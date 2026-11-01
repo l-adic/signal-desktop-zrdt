@@ -239,6 +239,17 @@ export type ZrdtServiceDeps = Readonly<{
   groupIdOf: (conversationId: string) => Uint8Array<ArrayBuffer> | undefined;
   /** Our ACI (uuid string), if registered. */
   ourAci: () => string | undefined;
+  /**
+   * The openings the host holds for a conversation's records. zrdtd keeps
+   * the audiences it recorded only while a store is open (Proto.lean, "The
+   * table of open stores"), so after OPEN they are re-sent with
+   * ACCEPT_RECORD (JOIN_PLAN §4.2).
+   */
+  heldOpenings?: (
+    conversationId: string
+  ) => Promise<
+    Array<{ digest: Uint8Array<ArrayBuffer>; opening: Uint8Array<ArrayBuffer> }>
+  >;
 }>;
 
 // ---------------------------------------------------------------------------
@@ -550,8 +561,41 @@ export class ZrdtServiceCore implements ZrdtServiceType {
         return;
       }
       this.#state.set(conversationId, { kind: 'open', group });
+      await this.#reRecordAudiences(conversationId, rows);
     }
     await this.#drain(conversationId);
+  }
+
+  /** Re-sends the openings we hold, so zrdtd records their audiences again. */
+  async #reRecordAudiences(
+    conversationId: string,
+    rows: ReadonlyArray<ZrdtRecordRowType>
+  ): Promise<void> {
+    const held = (await this.#deps.heldOpenings?.(conversationId)) ?? [];
+    if (held.length === 0) {
+      return;
+    }
+    const backend = this.#ready();
+    const records = new Map(rows.map(row => [toHex(row.digest), row.record]));
+    let recorded = 0;
+    for (const { digest, opening } of held) {
+      const record = records.get(toHex(digest));
+      if (record === undefined) {
+        continue;
+      }
+      // oxlint-disable-next-line no-await-in-loop
+      const result = await backend.acceptRecord(
+        conversationId,
+        own(record),
+        own(opening)
+      );
+      if (result.kind === 'accepted') {
+        recorded += 1;
+      } else {
+        log.warn(`zrdt: re-recording an audience: ${result.kind}`);
+      }
+    }
+    log.info(`zrdt: ${conversationId}: ${recorded} audience(s) recorded`);
   }
 
   /** NEW unless a store is open; throws for a rejected conversation. */
@@ -965,6 +1009,12 @@ export class ZrdtServiceCore implements ZrdtServiceType {
           : { aci: own(m.aci), key: own(m.key) }
       )
     );
+    if (result.kind === 'malformed') {
+      throw new ZrdtServiceError(
+        'notAccepted',
+        'AUDIENCE: no members, or an ACI twice'
+      );
+    }
     return result.kind === 'ok' ? result.audience : 'tooLarge';
   }
 

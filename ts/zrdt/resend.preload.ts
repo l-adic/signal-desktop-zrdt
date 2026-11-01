@@ -416,6 +416,8 @@ async function onServeRequest(
       key,
       requestId: new Uint8Array(requestId),
       since: digestsOf(request.since),
+      // Phase 1: no responder `since` yet (JOIN_PLAN §6.5, Phase 2).
+      ownSince: [],
       mode,
       wanted,
       forExport: false,
