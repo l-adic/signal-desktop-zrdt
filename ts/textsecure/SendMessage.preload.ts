@@ -146,6 +146,8 @@ export type OutgoingQuoteType = Readonly<{
   text?: string;
   attachments: ReadonlyArray<OutgoingQuoteAttachmentType>;
   bodyRanges?: ReadonlyArray<RawBodyRange>;
+  // zrdt: a stripped quote's target digest (ts/zrdt/quote.preload.ts)
+  zrdtRef?: Uint8Array<ArrayBuffer>;
 }>;
 
 export type OutgoingLinkPreviewType = Readonly<{
@@ -206,13 +208,15 @@ export type SendDeleteForEveryoneType = Readonly<{
   targetAuthorAci: AciString;
 }>;
 
-// zrdt: DataMessage.zrdt for an in-scope group message (zrdt APP.md §4).
+// zrdt: DataMessage.zrdt for an in-scope group message (zrdt APP.md §4),
+// and the audience, DataMessage.zrdtAudience (field 201, JOIN_PLAN §3.2).
 // Set only by ts/zrdt/send.preload.ts when it freezes a send.
 export type ZrdtMetaSendType = Readonly<{
   links: ReadonlyArray<Uint8Array<ArrayBuffer>>;
   nonce: Uint8Array<ArrayBuffer>;
   version: number;
   disown: ReadonlyArray<Uint8Array<ArrayBuffer>>;
+  audience: Uint8Array<ArrayBuffer>;
 }>;
 
 export type SharedMessageOptionsType = Readonly<{
@@ -552,6 +556,7 @@ class Message {
           };
         }),
         bodyRanges: this.quote.bodyRanges?.map(toBodyRange) ?? null,
+        zrdtRef: this.quote.zrdtRef ?? null,
       };
 
       if (quote?.bodyRanges?.length) {
@@ -737,6 +742,7 @@ class Message {
             disown: this.zrdt.disown.slice(),
           }
         : null,
+      zrdtAudience: this.zrdt ? this.zrdt.audience : null,
 
       // Handled separately
       pollVote: null,
@@ -939,6 +945,7 @@ export class MessageSender {
       unpinMessage: null,
       adminDelete: null,
       zrdt: null,
+      zrdtAudience: null,
     };
   }
 
@@ -1032,6 +1039,7 @@ export class MessageSender {
       unpinMessage: null,
       adminDelete: null,
       zrdt: null,
+      zrdtAudience: null,
     };
   }
 

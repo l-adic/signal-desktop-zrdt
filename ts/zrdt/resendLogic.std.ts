@@ -1,9 +1,10 @@
 // Copyright 2026 zrdt contributors
 // SPDX-License-Identifier: AGPL-3.0-only
 
-// The decisions of the resend protocol (APP.md §5 steps 3, 6, 7, 11), without
+// The decisions of the resend protocol (APP.md §5 steps 3, 7, 11), without
 // Signal: the preload modules (resend.preload.ts, receive.preload.ts) supply
-// the effects. Digests are lowercase hex here.
+// the effects. Digests are lowercase hex here. What a responder sends is
+// SERVE's decision (zrdtd), not this module's.
 
 import { drop } from '../util/drop.std.ts';
 
@@ -246,103 +247,17 @@ export class ResendScheduler {
   }
 }
 
-// --- responder ------------------------------------------------------------------
-
-export type HeldRecord = Readonly<{
-  digest: Hex;
-  record: Uint8Array<ArrayBuffer>;
-  authorAci: string;
-  // Our message row for this record, if we still have one.
-  message?: Readonly<{
-    sentAt: number;
-    // base64(nonce ‖ DataMessage without fields 15 and 200), if not erased
-    opening?: string;
-  }>;
-  // The sendLog still has our original for the requester (own messages only).
-  inSendLog: boolean;
-}>;
-
-export type ResendPlan = Readonly<{
-  // Our own messages: re-send the original via the SavedProto job. If the
-  // sendLog entry is gone by then (pruned on a delivery receipt, or expired),
-  // relay the record with `fallbackOpening`, our stored opening.
-  savedProto: ReadonlyArray<{
-    digest: Hex;
-    sentAt: number;
-    fallbackOpening?: string;
-  }>;
-  // Everything else we hold: ZrdtResend 1:1.
-  relay: ReadonlyArray<{
-    digest: Hex;
-    record: Uint8Array<ArrayBuffer>;
-    opening?: string;
-  }>;
-  // One ZrdtNotFound for these.
-  notFound: ReadonlyArray<Hex>;
-}>;
-
-// APP.md §5 step 6. `requesterIsMember`: a current member (the request is
-// ignored otherwise). `requesterWasMemberAtSend`: whether to include the
-// opening (A9); the demo group is static, so callers pass membership now.
-export function planResendResponse({
-  digests,
-  held,
-  ourAci,
-  requesterIsMember,
-  requesterWasMemberAtSend,
-}: Readonly<{
-  digests: ReadonlyArray<Hex>;
-  held: ReadonlyMap<Hex, HeldRecord>;
-  ourAci: string;
-  requesterIsMember: boolean;
-  requesterWasMemberAtSend: (sentAt: number | undefined) => boolean;
-}>): ResendPlan {
-  const savedProto: Array<{
-    digest: Hex;
-    sentAt: number;
-    fallbackOpening?: string;
-  }> = [];
-  const relay: Array<{
-    digest: Hex;
-    record: Uint8Array<ArrayBuffer>;
-    opening?: string;
-  }> = [];
-  const notFound: Array<Hex> = [];
-  if (!requesterIsMember) {
-    return { savedProto, relay, notFound };
-  }
-  for (const digest of new Set(digests)) {
-    const item = held.get(digest);
-    if (!item) {
-      notFound.push(digest);
-      continue;
-    }
-    const opening =
-      item.message?.opening != null &&
-      requesterWasMemberAtSend(item.message.sentAt)
-        ? item.message.opening
-        : undefined;
-    if (item.authorAci === ourAci && item.message && item.inSendLog) {
-      savedProto.push({
-        digest,
-        sentAt: item.message.sentAt,
-        ...(opening != null ? { fallbackOpening: opening } : {}),
-      });
-      continue;
-    }
-    relay.push({ digest, record: item.record, opening });
-  }
-  return { savedProto, relay, notFound };
-}
-
 // --- receiver of a relay -------------------------------------------------------
 
-// APP.md §5 step 7: live if the responder is the record's author.
+// JOIN_PLAN §4.4: live only if the entry is marked author copy and the reply
+// came from the record's author; otherwise relayed by the responder, even
+// when the responder is the author (A8 confirmation then upgrades it).
 export function relayProvenance(
   responderAci: string,
-  authorAci: string | undefined
+  authorAci: string | undefined,
+  authorCopy: boolean
 ): Readonly<{ kind: 'live' }> | Readonly<{ kind: 'relayed'; byAci: string }> {
-  return authorAci != null && authorAci === responderAci
+  return authorCopy && authorAci != null && authorAci === responderAci
     ? { kind: 'live' }
     : { kind: 'relayed', byAci: responderAci };
 }

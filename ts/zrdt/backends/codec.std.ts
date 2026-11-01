@@ -13,14 +13,20 @@
 // The readers below accept both the old and the new reply layouts (by body
 // length), so the host works with either zrdtd.
 //
-// TODO(zrdt T0): ACCEPT_RECORD's op byte (0x10), BAD_OPENING's status byte
-// (0x08) and the optional opening as `u8 flag ‖ bytes` are this lane's guess
-// at T5's layout. Check them against core/Zrdt/Proto.lean once build/t5-core
+// Protocol 3 (zrdt docs/JOIN_PLAN.md section 10.2): ACCEPT takes
+// `u8 flag ‖ opening?` after the parts; the status NO_AUDIENCE (0x09); the ops
+// AUDIENCE (0x11), SERVE (0x12) and ADDRESSED (0x13).
+// TODO(zrdt join lane D): NO_AUDIENCE's byte, AUDIENCE's `u8 hasKey ‖ key?`
+// (the key only when hasKey is 1), SERVE's held items
+// (`digest ‖ u8 flag ‖ opening?`) and the entry layout (`u8 kind` 0 addressed,
+// 1 after, 2 boundary) are this lane's reading of JOIN_PLAN section 10.2.
+// Check them against lane B's core/Zrdt/Proto.lean once origin/join-core
 // lands.
 
 import type {
   AcceptRecordResult,
-  AcceptResult,
+  AudienceMember,
+  AudienceResult,
   Bytes,
   ChatKey,
   CommitResult,
@@ -32,8 +38,18 @@ import type {
   RecordParts,
   RecordStatus,
   SalvageResult,
+  ServeEntry,
+  ServeHeld,
+  ServeMode,
+  ServeReply,
+  ServeRequest,
   Status,
   VersionInfo,
+} from '../ZrdtBackend.std.ts';
+import {
+  IDENTITY_KEY_BYTES,
+  REQUEST_ID_BYTES,
+  SERVE_HEADER_BYTES,
 } from '../ZrdtBackend.std.ts';
 
 export enum Op {
@@ -53,6 +69,9 @@ export enum Op {
   ENCODE = 0x0e,
   CLOSE = 0x0f,
   ACCEPT_RECORD = 0x10,
+  AUDIENCE = 0x11,
+  SERVE = 0x12,
+  ADDRESSED = 0x13,
 }
 
 export enum Code {
@@ -65,6 +84,7 @@ export enum Code {
   UNVERIFIABLE = 0x06,
   NOT_FOUND = 0x07,
   BAD_OPENING = 0x08,
+  NO_AUDIENCE = 0x09,
   BAD_REQUEST = 0x80,
   UNKNOWN_OP = 0x81,
   NO_CHAT = 0x82,
@@ -167,6 +187,47 @@ function wStatus(status: Status): Bytes {
     default:
       throw new Error('zrdt codec: unknown status');
   }
+}
+
+/** `u8 flag ‖ bytes?`: an optional opening. */
+function wOptionalBytes(bytes: Uint8Array<ArrayBuffer> | undefined): Bytes {
+  return bytes === undefined ? u8(0) : concatBytes([u8(1), wBytes(bytes)]);
+}
+
+function wMember(member: AudienceMember): Bytes {
+  return member.key === undefined
+    ? concatBytes([member.aci, u8(0)])
+    : concatBytes([member.aci, u8(1), member.key]);
+}
+
+const SERVE_MODES: ReadonlyArray<ServeMode> = ['catchup', 'perDigest'];
+
+function wHeld(held: ServeHeld): Bytes {
+  return concatBytes([held.digest, wOptionalBytes(held.opening)]);
+}
+
+/** One SERVE entry: `u8 kind` (0 addressed, 1 after, 2 boundary), then its fields. */
+function wEntry(entry: ServeEntry): Bytes {
+  switch (entry.kind) {
+    case 'addressed':
+      return concatBytes([
+        u8(0),
+        wBytes(entry.record),
+        wOptionalBytes(entry.opening),
+        u8(entry.authorCopy ? 1 : 0),
+      ]);
+    case 'after':
+      return concatBytes([u8(1), wBytes(entry.record)]);
+    case 'boundary':
+      return concatBytes([u8(2), entry.digest]);
+    default:
+      throw new Error('zrdt codec: unknown entry');
+  }
+}
+
+/** SERVE's entries: `u32 count ‖ entries`. These are the bytes the host seals. */
+export function encodeServeEntries(entries: ReadonlyArray<ServeEntry>): Bytes {
+  return concatBytes([u32(entries.length), ...entries.map(wEntry)]);
 }
 
 // ---------------------------------------------------------------------------
@@ -291,12 +352,75 @@ class Reader {
     }
   }
 
+  flag(): boolean {
+    const f = this.u8();
+    if (f > 1) {
+      throw new Short();
+    }
+    return f === 1;
+  }
+
+  optionalBytes(): Bytes | undefined {
+    return this.flag() ? this.bytes() : undefined;
+  }
+
+  member(): AudienceMember {
+    const aci = this.take(16);
+    return this.flag() ? { aci, key: this.take(IDENTITY_KEY_BYTES) } : { aci };
+  }
+
+  held(): ServeHeld {
+    const digest = this.take(32);
+    const opening = this.optionalBytes();
+    return opening === undefined ? { digest } : { digest, opening };
+  }
+
+  entry(): ServeEntry {
+    const kind = this.u8();
+    switch (kind) {
+      case 0: {
+        const record = this.bytes();
+        const opening = this.optionalBytes();
+        const authorCopy = this.flag();
+        return opening === undefined
+          ? { kind: 'addressed', record, authorCopy }
+          : { kind: 'addressed', record, opening, authorCopy };
+      }
+      case 1:
+        return { kind: 'after', record: this.bytes() };
+      case 2:
+        return { kind: 'boundary', digest: this.take(32) };
+      default:
+        throw new Short();
+    }
+  }
+
+  entries(): Array<ServeEntry> {
+    const count = this.u32();
+    // Every entry takes at least 5 bytes.
+    if (count * 5 > this.#bytes.length - this.#offset) {
+      throw new Short();
+    }
+    const out = new Array<ServeEntry>();
+    for (let i = 0; i < count; i += 1) {
+      out.push(this.entry());
+    }
+    return out;
+  }
+
   /** Throws unless every byte was read. */
   end(): void {
     if (!this.done) {
       throw new Short();
     }
   }
+}
+
+/** SERVE's entries (`u32 count ‖ entries`), or undefined if they do not parse. */
+export function decodeServeEntries(
+  bytes: Uint8Array<ArrayBuffer>
+): Array<ServeEntry> | undefined {
+  return readAll(bytes, r => r.entries());
 }
 
 /** Runs `read` on `bytes`; undefined if a field is cut short or bytes are left. */
@@ -333,13 +457,16 @@ export type Request =
       dataMessage: Bytes;
     }
   | { op: Op.HASH; parts: RecordParts }
-  | { op: Op.ACCEPT; chat: ChatKey; parts: RecordParts }
+  | { op: Op.ACCEPT; chat: ChatKey; parts: RecordParts; opening?: Bytes }
   | { op: Op.HEADS | Op.ENCODE | Op.CLOSE; chat: ChatKey }
   | { op: Op.HAS | Op.GET; chat: ChatKey; digest: Digest }
   | { op: Op.REACH_SET; chat: ChatKey; from: ReadonlyArray<Digest> }
   | { op: Op.MERGE; chat: ChatKey; blob: Bytes }
   | { op: Op.CLASSIFY; chat: ChatKey; facts: ReadonlyArray<ProvenanceFact> }
-  | { op: Op.ACCEPT_RECORD; chat: ChatKey; record: Bytes; opening?: Bytes };
+  | { op: Op.ACCEPT_RECORD; chat: ChatKey; record: Bytes; opening?: Bytes }
+  | { op: Op.AUDIENCE; members: ReadonlyArray<AudienceMember> }
+  | ({ op: Op.SERVE } & ServeRequest)
+  | { op: Op.ADDRESSED; chat: ChatKey; aci: Bytes; key: Bytes };
 
 /** The body of a request (without the op byte). */
 export function encodeRequestBody(req: Request): Bytes {
@@ -361,7 +488,11 @@ export function encodeRequestBody(req: Request): Bytes {
     case Op.HASH:
       return wParts(req.parts);
     case Op.ACCEPT:
-      return concatBytes([wStr(req.chat), wParts(req.parts)]);
+      return concatBytes([
+        wStr(req.chat),
+        wParts(req.parts),
+        wOptionalBytes(req.opening),
+      ]);
     case Op.HEADS:
     case Op.ENCODE:
     case Op.CLOSE:
@@ -383,10 +514,32 @@ export function encodeRequestBody(req: Request): Bytes {
       return concatBytes([
         wStr(req.chat),
         wBytes(req.record),
-        req.opening === undefined
-          ? u8(0)
-          : concatBytes([u8(1), wBytes(req.opening)]),
+        wOptionalBytes(req.opening),
       ]);
+    case Op.AUDIENCE:
+      return concatBytes([
+        u32(req.members.length),
+        ...req.members.map(wMember),
+      ]);
+    case Op.SERVE:
+      return concatBytes([
+        wStr(req.chat),
+        req.ownAci,
+        req.requesterAci,
+        req.key,
+        req.requestId,
+        wDigests(req.since),
+        u8(SERVE_MODES.indexOf(req.mode)),
+        wDigests(req.wanted),
+        u8(req.forExport ? 1 : 0),
+        u8(req.strict ? 1 : 0),
+        wDigests(req.live),
+        wDigests(req.disown),
+        u32(req.held.length),
+        ...req.held.map(wHeld),
+      ]);
+    case Op.ADDRESSED:
+      return concatBytes([wStr(req.chat), req.aci, req.key]);
     default:
       throw new Error('zrdt codec: unknown op');
   }
@@ -396,11 +549,15 @@ export function encodeRequestBody(req: Request): Bytes {
  * A request payload (`op ‖ body`) as a typed request, or the host error
  * zrdtd replies with: BAD_REQUEST (empty payload, wrong layout) or
  * UNKNOWN_OP. `withAcceptRecord` is false for a protocol without
- * ACCEPT_RECORD.
+ * ACCEPT_RECORD; `protocol` below 3 reads ACCEPT without the opening flag
+ * and knows no protocol-3 op.
  */
 export function decodeRequest(
   payload: Uint8Array<ArrayBuffer>,
-  { withAcceptRecord = true }: { withAcceptRecord?: boolean } = {}
+  {
+    withAcceptRecord = true,
+    protocol = 3,
+  }: { withAcceptRecord?: boolean; protocol?: number } = {}
 ): Request | Code.BAD_REQUEST | Code.UNKNOWN_OP {
   if (payload.length === 0) {
     return Code.BAD_REQUEST;
@@ -437,7 +594,17 @@ export function decodeRequest(
       req = readAll(body, r => ({ op, parts: r.parts() }));
       break;
     case Op.ACCEPT:
-      req = readAll(body, r => ({ op, chat: r.str(), parts: r.parts() }));
+      req = readAll(body, r => {
+        const chat = r.str();
+        const parts = r.parts();
+        if (protocol < 3) {
+          return { op, chat, parts };
+        }
+        const opening = r.optionalBytes();
+        return opening === undefined
+          ? { op, chat, parts }
+          : { op, chat, parts, opening };
+      });
       break;
     case Op.HEADS:
     case Op.ENCODE:
@@ -472,20 +639,82 @@ export function decodeRequest(
       req = readAll(body, r => {
         const chat = r.str();
         const record = r.bytes();
-        const flag = r.u8();
-        if (flag === 0) {
-          return { op, chat, record };
-        }
-        if (flag === 1) {
-          return { op, chat, record, opening: r.bytes() };
-        }
-        throw new Short();
+        const opening = r.optionalBytes();
+        return opening === undefined
+          ? { op, chat, record }
+          : { op, chat, record, opening };
       });
+      break;
+    case Op.AUDIENCE:
+    case Op.SERVE:
+    case Op.ADDRESSED:
+      if (protocol < 3) {
+        return Code.UNKNOWN_OP;
+      }
+      req = readAll(body, r => readProtocol3Request(op, r));
       break;
     default:
       return Code.UNKNOWN_OP;
   }
   return req ?? Code.BAD_REQUEST;
+}
+
+function readProtocol3Request(
+  op: Op.AUDIENCE | Op.SERVE | Op.ADDRESSED,
+  r: Reader
+): Request {
+  if (op === Op.AUDIENCE) {
+    const count = r.u32();
+    const members = new Array<AudienceMember>();
+    for (let i = 0; i < count; i += 1) {
+      members.push(r.member());
+    }
+    return { op, members };
+  }
+  if (op === Op.ADDRESSED) {
+    return {
+      op,
+      chat: r.str(),
+      aci: r.take(16),
+      key: r.take(IDENTITY_KEY_BYTES),
+    };
+  }
+  const chat = r.str();
+  const ownAci = r.take(16);
+  const requesterAci = r.take(16);
+  const key = r.take(IDENTITY_KEY_BYTES);
+  const requestId = r.take(REQUEST_ID_BYTES);
+  const since = r.digests();
+  const mode = SERVE_MODES[r.u8()];
+  if (mode === undefined) {
+    throw new Short();
+  }
+  const wanted = r.digests();
+  const forExport = r.flag();
+  const strict = r.flag();
+  const live = r.digests();
+  const disown = r.digests();
+  const count = r.u32();
+  const held = new Array<ServeHeld>();
+  for (let i = 0; i < count; i += 1) {
+    held.push(r.held());
+  }
+  return {
+    op,
+    chat,
+    ownAci,
+    requesterAci,
+    key,
+    requestId,
+    since,
+    mode,
+    wanted,
+    forExport,
+    strict,
+    live,
+    disown,
+    held,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -511,7 +740,7 @@ export type ResultOf = {
   [Op.SALVAGE]: SalvageResult;
   [Op.COMMIT]: CommitResult;
   [Op.HASH]: Digest;
-  [Op.ACCEPT]: AcceptResult;
+  [Op.ACCEPT]: AcceptRecordResult;
   [Op.HEADS]: Array<Digest>;
   [Op.HAS]: boolean;
   [Op.GET]: RecordParts | undefined;
@@ -521,6 +750,9 @@ export type ResultOf = {
   [Op.ENCODE]: Bytes;
   [Op.CLOSE]: undefined;
   [Op.ACCEPT_RECORD]: AcceptRecordResult;
+  [Op.AUDIENCE]: AudienceResult;
+  [Op.SERVE]: ServeReply;
+  [Op.ADDRESSED]: Array<Digest>;
 };
 
 export type ReplyOptions = Readonly<{
@@ -548,6 +780,8 @@ function refusalBytes(result: { kind: string; digest?: Digest }): Bytes {
       return u8(Code.MALFORMED);
     case 'badOpening':
       return u8(Code.BAD_OPENING);
+    case 'noAudience':
+      return u8(Code.NO_AUDIENCE);
     default:
       throw new Error(`zrdt codec: no reply for ${result.kind}`);
   }
@@ -642,9 +876,41 @@ export function encodeReply<O extends Op>(
     }
     case Op.ENCODE:
       return concatBytes([ok, wBytes(result as Bytes)]);
+    case Op.AUDIENCE: {
+      const a = result as AudienceResult;
+      return a.kind === 'tooLarge'
+        ? u8(Code.TOO_LARGE)
+        : concatBytes([ok, wBytes(a.audience)]);
+    }
+    case Op.SERVE: {
+      const s = result as ServeReply;
+      return concatBytes([ok, s.headerBytes, s.entriesBytes]);
+    }
+    case Op.ADDRESSED:
+      return concatBytes([ok, wDigests(result as Array<Digest>)]);
     default:
       throw new Error('zrdt codec: unknown op');
   }
+}
+
+/** SERVE's OK body: header ‖ u32 count ‖ entries. */
+function readServeReply(r: Reader, bodyLength: number): ServeReply {
+  const headerBytes = r.take(SERVE_HEADER_BYTES);
+  const entriesBytes = r.take(bodyLength - SERVE_HEADER_BYTES);
+  const entries = decodeServeEntries(entriesBytes);
+  if (entries === undefined) {
+    throw new Short();
+  }
+  return {
+    header: {
+      requesterAci: headerBytes.slice(0, 16),
+      keyTag: headerBytes.slice(16, 32),
+      requestId: headerBytes.slice(32, 48),
+    },
+    headerBytes,
+    entries,
+    entriesBytes,
+  };
 }
 
 /** Why a reply could not be read. */
@@ -666,7 +932,8 @@ function readRefusal(
   | { kind: 'wrongChat' }
   | { kind: 'tooLarge' }
   | { kind: 'malformed' }
-  | { kind: 'badOpening' } {
+  | { kind: 'badOpening' }
+  | { kind: 'noAudience' } {
   switch (status) {
     case Code.COLLISION:
       return { kind: 'collision', digest: r.take(32) };
@@ -678,6 +945,8 @@ function readRefusal(
       return { kind: 'malformed' };
     case Code.BAD_OPENING:
       return { kind: 'badOpening' };
+    case Code.NO_AUDIENCE:
+      return { kind: 'noAudience' };
     default:
       throw new ReplyError(op, status);
   }
@@ -724,7 +993,7 @@ export function decodeReply<O extends Op>(
           } as R;
         }
         const refused = readRefusal(op, status, r);
-        if (refused.kind === 'badOpening') {
+        if (refused.kind === 'badOpening' || refused.kind === 'noAudience') {
           break;
         }
         return refused as R;
@@ -738,7 +1007,7 @@ export function decodeReply<O extends Op>(
           } as R;
         }
         const refused = readRefusal(op, status, r);
-        if (refused.kind === 'badOpening') {
+        if (refused.kind === 'badOpening' || refused.kind === 'noAudience') {
           break;
         }
         return refused as R;
@@ -770,10 +1039,7 @@ export function decodeReply<O extends Op>(
           return { kind: 'missing', digests: r.digests() } as R;
         }
         const refused = readRefusal(op, status, r);
-        if (
-          op === Op.ACCEPT &&
-          (refused.kind === 'malformed' || refused.kind === 'badOpening')
-        ) {
+        if (op === Op.ACCEPT && refused.kind === 'malformed') {
           break;
         }
         return refused as R;
@@ -818,6 +1084,26 @@ export function decodeReply<O extends Op>(
           break;
         }
         return r.bytes() as R;
+      case Op.AUDIENCE:
+        if (status === Code.TOO_LARGE) {
+          return { kind: 'tooLarge' } as R;
+        }
+        if (status !== Code.OK) {
+          break;
+        }
+        return { kind: 'ok', audience: r.bytes() } as R;
+      case Op.SERVE: {
+        if (status !== Code.OK) {
+          break;
+        }
+        const reply = readServeReply(r, body.length);
+        return reply as R;
+      }
+      case Op.ADDRESSED:
+        if (status !== Code.OK) {
+          break;
+        }
+        return r.digests() as R;
       default:
         break;
     }

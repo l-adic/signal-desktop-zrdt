@@ -5,7 +5,6 @@ import { assert } from 'chai';
 
 import type {
   GapState,
-  HeldRecord,
   Hex,
   ResendTarget,
 } from '../../zrdt/resendLogic.std.ts';
@@ -13,7 +12,6 @@ import {
   ResendScheduler,
   decideRelayAction,
   planPlacement,
-  planResendResponse,
   readResendOptions,
   relayProvenance,
 } from '../../zrdt/resendLogic.std.ts';
@@ -192,99 +190,16 @@ describe('zrdt resend scheduling', () => {
   });
 });
 
-describe('zrdt resend responder', () => {
-  const record = new Uint8Array([1, 2, 3]);
-  const held = new Map<Hex, HeldRecord>([
-    [
-      D1,
-      {
-        digest: D1,
-        record,
-        authorAci: ALICE,
-        message: { sentAt: 111, opening: 'b3Blbg==' },
-        inSendLog: true,
-      },
-    ],
-    [
-      D2,
-      {
-        digest: D2,
-        record,
-        authorAci: BOB,
-        message: { sentAt: 222, opening: 'b3Blbg==' },
-        inSendLog: false,
-      },
-    ],
-  ]);
-  const D3 = 'd3'.repeat(32);
-
-  it('own message in the sendLog: SavedProto; others: relay; rest: not found', () => {
-    const plan = planResendResponse({
-      digests: [D1, D2, D3],
-      held,
-      ourAci: ALICE,
-      requesterIsMember: true,
-      requesterWasMemberAtSend: () => true,
-    });
-    // The stored opening rides along, in case the sendLog entry is gone by
-    // the time the SavedProto job runs.
-    assert.deepEqual(plan.savedProto, [
-      { digest: D1, sentAt: 111, fallbackOpening: 'b3Blbg==' },
-    ]);
-    assert.deepEqual(plan.relay, [{ digest: D2, record, opening: 'b3Blbg==' }]);
-    assert.deepEqual(plan.notFound, [D3]);
-  });
-
-  it('SavedProto fallback: no opening for a requester who was not a member at send time', () => {
-    const plan = planResendResponse({
-      digests: [D1],
-      held,
-      ourAci: ALICE,
-      requesterIsMember: true,
-      requesterWasMemberAtSend: () => false,
-    });
-    assert.deepEqual(plan.savedProto, [{ digest: D1, sentAt: 111 }]);
-  });
-
-  it('own message no longer in the sendLog: relay it', () => {
-    const plan = planResendResponse({
-      digests: [D2],
-      held,
-      ourAci: BOB,
-      requesterIsMember: true,
-      requesterWasMemberAtSend: () => true,
-    });
-    assert.deepEqual(plan.savedProto, []);
-    assert.strictEqual(plan.relay.length, 1);
-  });
-
-  it('no opening for a requester who was not a member at send time', () => {
-    const plan = planResendResponse({
-      digests: [D2],
-      held,
-      ourAci: CAROL,
-      requesterIsMember: true,
-      requesterWasMemberAtSend: () => false,
-    });
-    assert.deepEqual(plan.relay, [{ digest: D2, record, opening: undefined }]);
-  });
-
-  it('ignores a requester who is not a member', () => {
-    const plan = planResendResponse({
-      digests: [D1, D2],
-      held,
-      ourAci: CAROL,
-      requesterIsMember: false,
-      requesterWasMemberAtSend: () => true,
-    });
-    assert.deepEqual(plan, { savedProto: [], relay: [], notFound: [] });
-  });
-});
-
 describe('zrdt relay acceptance', () => {
-  it('provenance: live if the responder is the author', () => {
-    assert.deepEqual(relayProvenance(ALICE, ALICE), { kind: 'live' });
-    assert.deepEqual(relayProvenance(BOB, ALICE), {
+  it("provenance: live only for the author's own copy", () => {
+    assert.deepEqual(relayProvenance(ALICE, ALICE, true), { kind: 'live' });
+    // JOIN_PLAN §4.4: the author's reply without the author-copy mark (it
+    // does not hold the record live, or disowned it) is a relay.
+    assert.deepEqual(relayProvenance(ALICE, ALICE, false), {
+      kind: 'relayed',
+      byAci: ALICE,
+    });
+    assert.deepEqual(relayProvenance(BOB, ALICE, true), {
       kind: 'relayed',
       byAci: BOB,
     });

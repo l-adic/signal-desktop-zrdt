@@ -46,7 +46,7 @@ import {
 import { drop } from '../util/drop.std.ts';
 import { strictAssert } from '../util/assert.std.ts';
 import { isAciString } from '../util/isAciString.std.ts';
-import { copyFromQuotedMessage } from './copyQuote.preload.ts';
+import { zrdtCopyQuote } from '../zrdt/receiveQuote.preload.ts';
 import { findStoryMessage } from '../util/findStoryMessage.preload.ts';
 import { getValidLinkPreviews } from '../util/getValidLinkPreviews.node.ts';
 import { getStoryExpirationStartTimestamp } from '../util/expirationTimer.std.ts';
@@ -441,7 +441,7 @@ export async function handleDataMessage(
 
     const [quote, storyQuote] = await Promise.all([
       initialMessage.quote
-        ? copyFromQuotedMessage(initialMessage.quote, conversation.id)
+        ? zrdtCopyQuote(initialMessage.quote, conversation.id)
         : undefined,
       findStoryMessage({
         conversation: conversation.attributes,

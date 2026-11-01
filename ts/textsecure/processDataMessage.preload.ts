@@ -243,6 +243,9 @@ function processQuote(
     type: isKnownProtoEnumMember(Proto.DataMessage.Quote.Type, quote.type)
       ? quote.type
       : Proto.DataMessage.Quote.Type.NORMAL,
+    ...(quote.zrdtRef != null && quote.zrdtRef.byteLength === 32
+      ? { zrdtRef: quote.zrdtRef }
+      : {}),
   };
 }
 

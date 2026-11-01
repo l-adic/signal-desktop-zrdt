@@ -163,6 +163,9 @@ export type ProcessedQuote = {
   attachments: ReadonlyArray<ProcessedQuoteAttachment>;
   bodyRanges?: ReadonlyArray<ProcessedBodyRange>;
   type: Proto.DataMessage.Quote.Type;
+  // zrdt: a stripped quote's target digest (JOIN_PLAN §8.3); resolved by
+  // ts/zrdt/receiveQuote.preload.ts and never stored
+  zrdtRef?: Uint8Array<ArrayBuffer>;
 };
 
 export type ProcessedAvatar = {

@@ -9,6 +9,10 @@
 // differential test (zrdt PLAN.md section 6, rung 7). It is written from
 // PLAN.md sections 3.3 to 3.5 only, not from the Lean code, so that a test
 // that compares the two finds mistakes in either. Keep it small and plain.
+//
+// Protocol 3 (zrdt docs/JOIN_PLAN.md sections 3.2, 5 and 10.2): an ACCEPT or
+// ACCEPT_RECORD with an opening records the opening's audience (field 201),
+// and refuses an opening without one; AUDIENCE, SERVE and ADDRESSED.
 
 import { createHash } from 'node:crypto';
 
@@ -17,15 +21,21 @@ import {
   COMMIT_BYTES,
   DIGEST_BYTES,
   GROUP_ID_BYTES,
+  IDENTITY_KEY_BYTES,
+  KEY_TAG_BYTES,
+  MAX_AUDIENCE,
   MAX_LINKS,
   NONCE_BYTES,
   PROTOCOL_VERSION,
   RECORD_COUNT_LIMIT,
+  REQUEST_ID_BYTES,
   ZrdtBackendError,
 } from '../ZrdtBackend.std.ts';
 import type {
   AcceptRecordResult,
   AcceptResult,
+  AudienceMember,
+  AudienceResult,
   BackendKind,
   Bytes,
   ChatKey,
@@ -38,10 +48,20 @@ import type {
   RecordStatus,
   Refused,
   SalvageResult,
+  ServeEntry,
+  ServeReply,
+  ServeRequest,
   Status,
   VersionInfo,
   ZrdtBackend,
 } from '../ZrdtBackend.std.ts';
+import {
+  audienceOfOpening,
+  isEphemeralOpening,
+  seatsUnderTag,
+} from '../audience.std.ts';
+import type { Seat } from '../audience.std.ts';
+import { encodeServeEntries } from './codec.std.ts';
 
 // ---------------------------------------------------------------------------
 // Bytes
@@ -413,6 +433,51 @@ function opens(record: StubRecord, opening: Bytes): boolean {
 }
 
 // ---------------------------------------------------------------------------
+// Audiences (JOIN_PLAN section 3.2)
+// ---------------------------------------------------------------------------
+
+const KEY_TAG_MAGIC = ascii('zrdtK1');
+
+/** The tag of a serialized identity key: SHA-256("zrdtK1" ‖ key)[0..16]. */
+export function stubKeyTag(identityKey: Bytes): Bytes {
+  checkSize('key', identityKey, IDENTITY_KEY_BYTES);
+  return sha256(KEY_TAG_MAGIC, identityKey).slice(0, KEY_TAG_BYTES);
+}
+
+/** AUDIENCE: field-201 bytes for these members, sorted by ACI. */
+export function buildAudience(
+  members: ReadonlyArray<AudienceMember>
+): AudienceResult {
+  if (members.length === 0) {
+    throw new ZrdtBackendError('badInput', 'an audience has a member');
+  }
+  if (members.length > MAX_AUDIENCE) {
+    return { kind: 'tooLarge' };
+  }
+  const entries = members.map(member => {
+    checkSize('aci', member.aci, ACI_BYTES);
+    const tag =
+      member.key === undefined
+        ? new Uint8Array(KEY_TAG_BYTES)
+        : stubKeyTag(member.key);
+    return concat([member.aci, tag]);
+  });
+  entries.sort(compareBytes);
+  for (let i = 1; i < entries.length; i += 1) {
+    const a = entries[i - 1];
+    const b = entries[i];
+    if (
+      a !== undefined &&
+      b !== undefined &&
+      equal(a.subarray(0, ACI_BYTES), b.subarray(0, ACI_BYTES))
+    ) {
+      throw new ZrdtBackendError('badInput', 'an ACI appears twice');
+    }
+  }
+  return { kind: 'ok', audience: concat(entries) };
+}
+
+// ---------------------------------------------------------------------------
 // The store
 // ---------------------------------------------------------------------------
 
@@ -428,6 +493,8 @@ export class StubStore {
   readonly hash: RecordHash;
   readonly #entries = new Map<string, Entry>();
   readonly #heads = new Set<string>();
+  /** The audience table: digests whose opening this store checked. */
+  readonly #audiences = new Map<string, ReadonlyArray<Seat>>();
 
   constructor(group: Bytes, hash: RecordHash = sha256) {
     checkSize('group', group, GROUP_ID_BYTES);
@@ -447,7 +514,30 @@ export class StubStore {
     for (const k of this.#heads) {
       copy.#heads.add(k);
     }
+    for (const [k, seats] of this.#audiences) {
+      copy.#audiences.set(k, seats);
+    }
     return copy;
+  }
+
+  /** Records the audience of a checked opening of a stored record. */
+  recordAudience(digest: Bytes, seats: ReadonlyArray<Seat>): void {
+    if (this.has(digest)) {
+      this.#audiences.set(key(digest), seats);
+    }
+  }
+
+  audienceOf(digest: Bytes): ReadonlyArray<Seat> | undefined {
+    return this.#audiences.get(key(digest));
+  }
+
+  /** The stored digests whose recorded audience seats `aci` under `tag`. */
+  addressed(aci: Bytes, tag: Bytes): Array<Digest> {
+    return this.digestsOf(
+      [...this.#audiences.entries()]
+        .filter(([, seats]) => seatsUnderTag(seats, aci, tag))
+        .map(([k]) => k)
+    );
   }
 
   has(digest: Bytes): boolean {
@@ -957,13 +1047,23 @@ export class StubBackend implements ZrdtBackend {
     return hashRecord(makeRecord(record), this.#hash);
   }
 
-  async accept(chat: ChatKey, record: RecordParts): Promise<AcceptResult> {
-    return this.#store(chat).accept(makeRecord(record));
+  /**
+   * ACCEPT. With an opening, the checks run in this order: the chat is open,
+   * the opening matches the commitment, it holds an audience, then ACCEPT's
+   * checks; an accepted record's audience is recorded.
+   */
+  async accept(
+    chat: ChatKey,
+    record: RecordParts,
+    opening?: Bytes
+  ): Promise<AcceptRecordResult> {
+    return acceptWithOpening(this.#store(chat), makeRecord(record), opening);
   }
 
   /**
    * ACCEPT_RECORD. The checks run in this order: the chat is open, the bytes
-   * decode, the opening matches the commitment, then ACCEPT's checks.
+   * decode, the opening matches the commitment, it holds an audience, then
+   * ACCEPT's checks.
    */
   async acceptRecord(
     chat: ChatKey,
@@ -975,10 +1075,7 @@ export class StubBackend implements ZrdtBackend {
     if (decoded === undefined) {
       return { kind: 'malformed' };
     }
-    if (opening !== undefined && !opens(decoded, opening)) {
-      return { kind: 'badOpening' };
-    }
-    return store.accept(decoded);
+    return acceptWithOpening(store, decoded, opening);
   }
 
   async heads(chat: ChatKey): Promise<Array<Digest>> {
@@ -1044,4 +1141,176 @@ export class StubBackend implements ZrdtBackend {
   async close(chat: ChatKey): Promise<void> {
     this.#stores.delete(chat);
   }
+
+  async audience(
+    members: ReadonlyArray<AudienceMember>
+  ): Promise<AudienceResult> {
+    return buildAudience(members);
+  }
+
+  async serve(request: ServeRequest): Promise<ServeReply> {
+    return serveStore(this.#store(request.chat), request);
+  }
+
+  async addressed(
+    chat: ChatKey,
+    aci: Bytes,
+    identityKey: Bytes
+  ): Promise<Array<Digest>> {
+    const store = this.#store(chat);
+    checkSize('aci', aci, ACI_BYTES);
+    return store.addressed(aci, stubKeyTag(identityKey));
+  }
+}
+
+function acceptWithOpening(
+  store: StubStore,
+  record: StubRecord,
+  opening: Bytes | undefined
+): AcceptRecordResult {
+  if (opening === undefined) {
+    return store.accept(record);
+  }
+  if (!opens(record, opening)) {
+    return { kind: 'badOpening' };
+  }
+  const seats = audienceOfOpening(opening);
+  if (seats === undefined) {
+    return { kind: 'noAudience' };
+  }
+  const result = store.accept(record);
+  if (result.kind === 'accepted') {
+    store.recordAudience(result.digest, seats);
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// SERVE (JOIN_PLAN section 5; Lean Zrdt.Serve.serve)
+// ---------------------------------------------------------------------------
+
+/**
+ * The reply to one SERVE request, for a closed store (no boundary of its own;
+ * Phase 1). Each stored record gives at most one entry, in digest order:
+ *
+ * - `addressed`: its audience (from a matching held opening, else the
+ *   recorded one) seats the requester, and it is wanted (per-digest) or not
+ *   reachable from `since` (catch-up). The opening goes along only if it
+ *   matches, its OWN audience seats the requester under the checked key, it
+ *   is not ephemeral in an export, and (strict mode) the entry is an author
+ *   copy.
+ * - `after`: it reaches an addressed-in-catch-up record (the walk back).
+ * - `boundary`: per-digest, any other wanted record; catch-up, a record
+ *   linked by an `after`/addressed record, or a head.
+ */
+function serveStore(store: StubStore, q: ServeRequest): ServeReply {
+  checkSize('own aci', q.ownAci, ACI_BYTES);
+  checkSize('requester aci', q.requesterAci, ACI_BYTES);
+  checkSize('request id', q.requestId, REQUEST_ID_BYTES);
+  const tag = stubKeyTag(q.key);
+  const seats = (aud: ReadonlyArray<Seat> | undefined): boolean =>
+    aud !== undefined && seatsUnderTag(aud, q.requesterAci, tag);
+  const live = new Set(q.live.map(key));
+  const disown = new Set(q.disown.map(key));
+  const held = new Map<string, Bytes | undefined>();
+  for (const item of q.held) {
+    held.set(key(item.digest), item.opening);
+  }
+  const perDigest = q.mode === 'perDigest';
+  const wanted = new Set(q.wanted.map(key));
+  const entries = store.entries();
+
+  const authorCopy = (k: string, r: StubRecord): boolean =>
+    equal(r.author, q.ownAci) && live.has(k) && !disown.has(k);
+  const audienceFor = (
+    k: string,
+    digest: Bytes,
+    r: StubRecord
+  ): ReadonlyArray<Seat> | undefined => {
+    const opening = held.get(k);
+    if (opening !== undefined && opens(r, opening)) {
+      return audienceOfOpening(opening);
+    }
+    return store.audienceOf(digest);
+  };
+  const serveOpening = (k: string, r: StubRecord, o: Bytes): boolean =>
+    opens(r, o) &&
+    seats(audienceOfOpening(o)) &&
+    !(q.forExport && isEphemeralOpening(o)) &&
+    (!q.strict || authorCopy(k, r));
+
+  const sinceReach = store.reach(q.since);
+  const entitled = new Set<string>();
+  const linkedBy = new Map<string, Array<string>>();
+  const linkedAny = new Set<string>();
+  for (const e of entries) {
+    const k = key(e.digest);
+    if (seats(audienceFor(k, e.digest, e.record))) {
+      entitled.add(k);
+    }
+    for (const link of e.record.links) {
+      const l = key(link);
+      linkedAny.add(l);
+      const list = linkedBy.get(l) ?? [];
+      list.push(k);
+      linkedBy.set(l, list);
+    }
+  }
+  // up: the walk back from the records the requester is seated in that
+  // `since` does not reach.
+  const up = new Set<string>();
+  const todo = [...entitled].filter(k => !sinceReach.has(k));
+  for (let k = todo.pop(); k !== undefined; k = todo.pop()) {
+    if (up.has(k)) {
+      continue;
+    }
+    up.add(k);
+    todo.push(...(linkedBy.get(k) ?? []));
+  }
+  const linkedByUp = new Set<string>();
+  for (const e of entries) {
+    if (up.has(key(e.digest))) {
+      for (const link of e.record.links) {
+        linkedByUp.add(key(link));
+      }
+    }
+  }
+
+  const out = new Array<ServeEntry>();
+  for (const e of entries) {
+    const k = key(e.digest);
+    if (perDigest && !wanted.has(k)) {
+      continue;
+    }
+    if (entitled.has(k) && (perDigest || !sinceReach.has(k))) {
+      const opening = held.get(k);
+      const record = new Uint8Array(e.encoded);
+      const ac = authorCopy(k, e.record);
+      out.push(
+        opening !== undefined && serveOpening(k, e.record, opening)
+          ? {
+              kind: 'addressed',
+              record,
+              opening: new Uint8Array(opening),
+              authorCopy: ac,
+            }
+          : { kind: 'addressed', record, authorCopy: ac }
+      );
+    } else if (up.has(k)) {
+      out.push({ kind: 'after', record: new Uint8Array(e.encoded) });
+    } else if (perDigest || linkedByUp.has(k) || !linkedAny.has(k)) {
+      out.push({ kind: 'boundary', digest: new Uint8Array(e.digest) });
+    }
+  }
+  const headerBytes = concat([q.requesterAci, tag, q.requestId]);
+  return {
+    header: {
+      requesterAci: new Uint8Array(q.requesterAci),
+      keyTag: tag,
+      requestId: new Uint8Array(q.requestId),
+    },
+    headerBytes,
+    entries: out,
+    entriesBytes: encodeServeEntries(out),
+  };
 }

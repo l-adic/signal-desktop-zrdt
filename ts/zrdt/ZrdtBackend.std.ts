@@ -25,6 +25,18 @@ export const GROUP_ID_BYTES = 32;
 export const COMMIT_BYTES = 32;
 export const NONCE_BYTES = 32;
 export const ACI_BYTES = 16;
+/** A serialized identity public key (libsignal `PublicKey.serialize()`). */
+export const IDENTITY_KEY_BYTES = 33;
+/** A key tag: 16 bytes of SHA-256("zrdtK1" ‖ identity key) (JOIN_PLAN §3.2). */
+export const KEY_TAG_BYTES = 16;
+/** A SERVE request id: 16 random bytes (JOIN_PLAN §10.1). */
+export const REQUEST_ID_BYTES = 16;
+/** An audience entry: aci(16) ‖ key tag(16). */
+export const AUDIENCE_ENTRY_BYTES = ACI_BYTES + KEY_TAG_BYTES;
+/** The audience cap (JOIN_PLAN §3.2, kejace's decision): 256 members. */
+export const MAX_AUDIENCE = 256;
+/** A SERVE reply header: requester aci ‖ key tag ‖ request id. */
+export const SERVE_HEADER_BYTES = ACI_BYTES + KEY_TAG_BYTES + REQUEST_ID_BYTES;
 
 /** A record links at most this many digests (PLAN.md section 3.4). */
 export const MAX_LINKS = 4096;
@@ -33,12 +45,13 @@ export const MAX_LINKS = 4096;
 export const RECORD_COUNT_LIMIT = 2 ** 24;
 
 /**
- * The frame protocol version this host speaks: 2 (zrdt build/t5-core: the
- * ACCEPT reply carries the record bytes, the COMMIT reply the opening, and
- * ACCEPT_RECORD exists). The daemon backend also reads protocol 1 replies
- * (zrdt e2b3160), by body length, and falls back for ACCEPT_RECORD.
+ * The frame protocol version this host speaks: 3 (zrdt docs/JOIN_PLAN.md
+ * section 10.2: ACCEPT takes an optional opening and records its audience,
+ * and AUDIENCE, SERVE and ADDRESSED exist). Every record message carries its
+ * author's audience (DataMessage field 201); an opening without one is
+ * refused (NO_AUDIENCE).
  */
-export const PROTOCOL_VERSION = 2;
+export const PROTOCOL_VERSION = 3;
 
 /**
  * The parts of a record. `group` is the group's 32-byte id, `commit` the
@@ -112,16 +125,97 @@ export type AcceptResult =
   | { kind: 'tooLarge' };
 
 /**
- * The reply to `acceptRecord()`: as `accept()`, plus
+ * The reply to `accept()` with an opening, and to `acceptRecord()`: as
+ * `AcceptResult`, plus
  *
- * - `malformed`: the bytes are not an encoded record (PLAN.md section 3.4);
+ * - `malformed` (`acceptRecord()` only): the bytes are not an encoded record
+ *   (PLAN.md section 3.4);
  * - `badOpening`: an opening was given and its commitment is not the
  *   record's `commit`. Nothing changed.
+ * - `noAudience`: an opening was given, it matches, but its committed bytes
+ *   do not hold exactly one well-formed field 201 (JOIN_PLAN §3.2). Nothing
+ *   changed.
  */
 export type AcceptRecordResult =
   | AcceptResult
   | { kind: 'malformed' }
-  | { kind: 'badOpening' };
+  | { kind: 'badOpening' }
+  | { kind: 'noAudience' };
+
+/**
+ * One member for AUDIENCE: its 16-byte ACI and the identity key the author
+ * holds for it (33 bytes), or none: the zero tag (a member Signal does not
+ * send this message to, or one the author has no key for).
+ */
+export type AudienceMember = Readonly<{ aci: Bytes; key?: Bytes }>;
+
+/** The reply to `audience()`: the field-201 bytes, or more than 256 members. */
+export type AudienceResult =
+  | { kind: 'ok'; audience: Bytes }
+  | { kind: 'tooLarge' };
+
+/** SERVE's mode: the whole view, or a repair of the wanted digests. */
+export type ServeMode = 'catchup' | 'perDigest';
+
+/** An opening the host holds for a stored record, for SERVE. */
+export type ServeHeld = Readonly<{ digest: Digest; opening?: Bytes }>;
+
+/**
+ * A SERVE request (JOIN_PLAN §5, §10.2). `requesterAci` is the
+ * Signal-authenticated sender of the request and `key` the identity key this
+ * device holds for it now; the reply is sealed to exactly that key.
+ * `live` and `disown` are this device's host state (A8); `held` the openings
+ * it holds.
+ */
+export type ServeRequest = Readonly<{
+  chat: ChatKey;
+  ownAci: Bytes;
+  requesterAci: Bytes;
+  key: Bytes;
+  requestId: Bytes;
+  since: ReadonlyArray<Digest>;
+  mode: ServeMode;
+  wanted: ReadonlyArray<Digest>;
+  forExport: boolean;
+  strict: boolean;
+  live: ReadonlyArray<Digest>;
+  disown: ReadonlyArray<Digest>;
+  held: ReadonlyArray<ServeHeld>;
+}>;
+
+/**
+ * One entry of a SERVE reply.
+ *
+ * - `addressed`: a record the requester is seated in, with its opening only
+ *   if the opening's own committed audience seats the requester under the
+ *   checked key; `authorCopy` only for the responder's own live, undisowned
+ *   record.
+ * - `after`: structure only (author and links).
+ * - `boundary`: the digest only.
+ */
+export type ServeEntry =
+  | { kind: 'addressed'; record: Bytes; opening?: Bytes; authorCopy: boolean }
+  | { kind: 'after'; record: Bytes }
+  | { kind: 'boundary'; digest: Digest };
+
+/** SERVE's reply header: who it is for, under which key, for which request. */
+export type ServeHeader = Readonly<{
+  requesterAci: Bytes;
+  keyTag: Bytes;
+  requestId: Bytes;
+}>;
+
+/**
+ * The reply to `serve()`. `headerBytes` and `entriesBytes` are the exact
+ * bytes zrdtd sent (`entriesBytes` = u32 count ‖ entries): the host seals
+ * `entriesBytes` and binds `headerBytes` as associated data.
+ */
+export type ServeReply = Readonly<{
+  header: ServeHeader;
+  headerBytes: Bytes;
+  entries: ReadonlyArray<ServeEntry>;
+  entriesBytes: Bytes;
+}>;
 
 /**
  * The reply to `commit()`. `opening` is `nonce ‖ DataMessage bytes with
@@ -264,12 +358,21 @@ export type ZrdtBackend = {
   /** HASH: the digest of a record. Needs no store. */
   hash(record: RecordParts): Promise<Digest>;
 
-  /** ACCEPT: add a record to the store under `chat`. */
-  accept(chat: ChatKey, record: RecordParts): Promise<AcceptResult>;
+  /**
+   * ACCEPT: add a record to the store under `chat`. With an opening, the
+   * opening must match the record (`badOpening`) and hold an audience
+   * (`noAudience`); the backend then records that audience.
+   */
+  accept(
+    chat: ChatKey,
+    record: RecordParts,
+    opening?: Bytes
+  ): Promise<AcceptRecordResult>;
 
   /**
    * ACCEPT_RECORD: add an encoded record (a relay or an import) to the store
-   * under `chat`. If `opening` is given, its commitment must be the record's.
+   * under `chat`. If `opening` is given, its commitment must be the record's
+   * and it must hold an audience, which the backend records.
    */
   acceptRecord(
     chat: ChatKey,
@@ -313,4 +416,20 @@ export type ZrdtBackend = {
 
   /** CLOSE: drop the store under `chat`, if any. */
   close(chat: ChatKey): Promise<void>;
+
+  /**
+   * AUDIENCE: the field-201 bytes for these members (sorted by ACI; the
+   * zero tag for a member without a key). Needs no store. The host never
+   * hashes a key itself (A4).
+   */
+  audience(members: ReadonlyArray<AudienceMember>): Promise<AudienceResult>;
+
+  /** SERVE: the reply to one request (JOIN_PLAN §5). */
+  serve(request: ServeRequest): Promise<ServeReply>;
+
+  /**
+   * ADDRESSED: the stored digests whose recorded audience seats `aci` under
+   * `key`, sorted. Tells the host which openings to load for SERVE.
+   */
+  addressed(chat: ChatKey, aci: Bytes, key: Bytes): Promise<Array<Digest>>;
 };

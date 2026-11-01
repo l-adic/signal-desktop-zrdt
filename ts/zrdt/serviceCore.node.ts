@@ -27,13 +27,16 @@ import type {
   ZrdtProvenanceRowType,
   ZrdtRecordRowType,
 } from '../types/Zrdt.std.ts';
-import { ZrdtBackendError } from './ZrdtBackend.std.ts';
+import { PROTOCOL_VERSION, ZrdtBackendError } from './ZrdtBackend.std.ts';
 import type {
   AcceptRecordResult,
+  AudienceMember,
   OpenResult,
   ProvenanceFact,
   RecordParts,
   SalvageResult,
+  ServeReply,
+  ServeRequest,
   Status,
   ZrdtBackend,
 } from './ZrdtBackend.std.ts';
@@ -84,7 +87,9 @@ export type ZrdtAcceptOutcome =
   | { status: 'wrongChat' }
   | { status: 'tooLarge' }
   | { status: 'malformed' }
-  | { status: 'badOpening' };
+  | { status: 'badOpening' }
+  // The opening holds no audience (DataMessage field 201): refused.
+  | { status: 'noAudience' };
 
 export type ZrdtOpenOutcome =
   | { status: 'ok' }
@@ -179,6 +184,16 @@ export type ZrdtServiceType = {
     conversationId: string,
     blob: Uint8Array<ArrayBuffer>
   ): Promise<ZrdtSalvageOutcome>;
+  audience(members: ReadonlyArray<AudienceMember>): Promise<Bytes | 'tooLarge'>;
+  serve(
+    conversationId: string,
+    request: Omit<ServeRequest, 'chat'>
+  ): Promise<ServeReply>;
+  addressed(
+    conversationId: string,
+    aci: Uint8Array<ArrayBuffer>,
+    key: Uint8Array<ArrayBuffer>
+  ): Promise<Array<Bytes>>;
 };
 
 // ---------------------------------------------------------------------------
@@ -369,6 +384,18 @@ export class ZrdtServiceCore implements ZrdtServiceType {
     });
     try {
       const { protocol, build } = await backend.version();
+      if (protocol !== PROTOCOL_VERSION) {
+        // Fail closed: the frames of another protocol do not match.
+        log.error(
+          `zrdt: backend speaks protocol ${protocol}, not ${PROTOCOL_VERSION}`
+        );
+        this.#setInfo({
+          kind: backend.kind,
+          version: `${build} (protocol ${protocol})`,
+          available: false,
+        });
+        return;
+      }
       this.#setInfo({
         kind: backend.kind,
         version: `${build} (protocol ${protocol})`,
@@ -780,12 +807,16 @@ export class ZrdtServiceCore implements ZrdtServiceType {
           'own DataMessage is malformed'
         );
       }
-      const result = await backend.accept(conversationId, {
-        group,
-        commit: committed.commit,
-        links: a.links.map(own),
-        author: own(a.authorAci),
-      });
+      const result = await backend.accept(
+        conversationId,
+        {
+          group,
+          commit: committed.commit,
+          links: a.links.map(own),
+          author: own(a.authorAci),
+        },
+        committed.opening
+      );
       if (result.kind !== 'accepted') {
         throw new ZrdtServiceError(
           'notAccepted',
@@ -825,7 +856,11 @@ export class ZrdtServiceCore implements ZrdtServiceType {
         links: a.links.map(own),
         author: own(a.authorAci),
       };
-      const result = await backend.accept(conversationId, parts);
+      const result = await backend.accept(
+        conversationId,
+        parts,
+        committed.opening
+      );
       if (result.kind === 'accepted') {
         await this.#stored(
           conversationId,
@@ -914,6 +949,50 @@ export class ZrdtServiceCore implements ZrdtServiceType {
       return { status: 'collision', digest: result.digest };
     }
     return { status: result.kind };
+  }
+
+  // --- audiences and SERVE (JOIN_PLAN sections 3.2, 5) --------------------------
+
+  /** AUDIENCE: the field-201 bytes, or 'tooLarge' over 256 members. */
+  async audience(
+    members: ReadonlyArray<AudienceMember>
+  ): Promise<Bytes | 'tooLarge'> {
+    await this.init();
+    const result = await this.#ready().audience(
+      members.map(m =>
+        m.key === undefined
+          ? { aci: own(m.aci) }
+          : { aci: own(m.aci), key: own(m.key) }
+      )
+    );
+    return result.kind === 'ok' ? result.audience : 'tooLarge';
+  }
+
+  /** SERVE on the conversation's store (it must be open). */
+  serve(
+    conversationId: string,
+    request: Omit<ServeRequest, 'chat'>
+  ): Promise<ServeReply> {
+    return this.#enter(conversationId, async backend => {
+      if (this.#state.get(conversationId)?.kind !== 'open') {
+        throw new ZrdtServiceError('rejected', `${conversationId} is not open`);
+      }
+      return backend.serve({ ...request, chat: conversationId });
+    });
+  }
+
+  /** ADDRESSED: stored digests whose recorded audience seats `aci` under `key`. */
+  addressed(
+    conversationId: string,
+    aci: Uint8Array<ArrayBuffer>,
+    key: Uint8Array<ArrayBuffer>
+  ): Promise<Array<Bytes>> {
+    return this.#enter(conversationId, async backend => {
+      if (this.#state.get(conversationId)?.kind !== 'open') {
+        return [];
+      }
+      return backend.addressed(conversationId, own(aci), own(key));
+    });
   }
 
   // --- provenance ---------------------------------------------------------------

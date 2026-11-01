@@ -69,6 +69,9 @@ const messageAttributesEraseBehavior: Record<
   unidentifiedDeliveries: 'preserve',
   // zrdt structure: the digest and links stay in zrdt_records anyway
   zrdtDigest: 'preserve',
+  // zrdt: the members and recipients at enqueue (membership metadata,
+  // JOIN_PLAN §3.2), read once at freeze
+  zrdtAudience: 'preserve',
   zrdtProvenance: 'preserve',
   zrdtStatus: 'preserve',
 

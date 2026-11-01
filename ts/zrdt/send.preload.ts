@@ -9,9 +9,12 @@
 //   1. If message.zrdt exists (a retry), send its frozen Content bytes. Never
 //      recompute links. If the store lacks the record (a crash before ACCEPT
 //      finished, or a lost row), re-accept it from the frozen bytes first.
-//   2. links = HEADS, nonce = 32 random bytes, disown = our disown set.
+//   2. links = HEADS, nonce = 32 random bytes, disown = our disown set, and
+//      the audience (JOIN_PLAN §3.2, §4.1): the enqueue snapshot's members
+//      still in membersV2, plus us; seated (a key tag) only the enqueue
+//      recipients we hold a key for. AUDIENCE gives the field-201 bytes.
 //   3. Build the Content with DataMessage.zrdt = ZrdtMeta{links, nonce,
-//      version, disown} and encode it.
+//      version, disown} and DataMessage.zrdtAudience, and encode it.
 //   4. Persist message.zrdt = {links, nonce, contentBytes, digest: ''} FIRST.
 //   5. COMMIT + ACCEPT (zrdtService.acceptOwn; it writes the store rows).
 //   6. Persist digest, zrdtOpening, zrdtDigest and zrdtProvenance (live).
@@ -36,8 +39,32 @@ import type {
   GroupMessageOptionsType,
   ZrdtMetaSendType,
 } from '../textsecure/SendMessage.preload.ts';
-import { ACI_BYTES, GROUP_ID_BYTES, NONCE_BYTES } from './ZrdtBackend.std.ts';
+import {
+  ACI_BYTES,
+  GROUP_ID_BYTES,
+  IDENTITY_KEY_BYTES,
+  NONCE_BYTES,
+} from './ZrdtBackend.std.ts';
+import type { AudienceMember } from './ZrdtBackend.std.ts';
 import { getZrdtOutOfScopeReason, isZrdtRecordMessage } from './scope.std.ts';
+import {
+  aciHex,
+  aciStringHex,
+  audienceAcis,
+  audienceOfDataMessage,
+} from './audience.std.ts';
+import { planAudience, snapshotFromSendState } from './audiencePlan.std.ts';
+import type { AudienceSnapshot } from './audiencePlan.std.ts';
+import { signalProtocolStore } from '../SignalProtocolStore.preload.ts';
+import { getKeysForServiceId } from '../textsecure/getKeysForServiceId.preload.ts';
+import {
+  getKeysForServiceId as doGetKeysForServiceId,
+  getKeysForServiceIdUnauth,
+} from '../textsecure/WebAPI.preload.ts';
+import { UnregisteredUserError } from '../textsecure/Errors.std.ts';
+import { getSendOptions } from '../util/getSendOptions.preload.ts';
+import type { AciString } from '../types/ServiceId.std.ts';
+import { isAciString } from '../util/isAciString.std.ts';
 import { zrdtService } from './service.preload.ts';
 import type { ConversationModel } from '../models/conversations.preload.ts';
 import type { MessageModel } from '../models/messages.preload.ts';
@@ -49,8 +76,8 @@ import { getMessageIdForLogging } from '../util/idForLogging.preload.ts';
 
 const defaultLog = createLogger('zrdt/send');
 
-/** ZrdtMeta.version this client writes. */
-export const ZRDT_META_VERSION = 1;
+/** ZrdtMeta.version this client writes (protocol 3, JOIN_PLAN §3.3). */
+export const ZRDT_META_VERSION = 3;
 
 // Outgoing messages scanned per conversation by reacceptUnstoredOutgoing.
 // TODO(zrdt): a dedicated indexed query (outgoing messages with $.zrdt) instead
@@ -80,6 +107,9 @@ export type ZrdtSendServiceType = Readonly<{
       links: Array<ArrayBytes>;
     }
   ) => Promise<{ digest: AnyBytes; record: AnyBytes; opening: AnyBytes }>;
+  audience: (
+    members: ReadonlyArray<AudienceMember>
+  ) => Promise<ArrayBytes | 'tooLarge'>;
 }>;
 
 export type ZrdtMessageUpdateType = Partial<
@@ -106,6 +136,11 @@ export type FreezeZrdtSendOptionsType = Readonly<{
   message: ZrdtFreezableMessageType;
   /** Builds this send's Content with DataMessage.zrdt set (Message.toProto). */
   buildContent: (zrdt: ZrdtMetaSendType) => Promise<Proto.Content.Params>;
+  /**
+   * The members for AUDIENCE (JOIN_PLAN §4.1), read at freeze. Throws on a
+   * transient key-fetch failure: no freeze, the job retries.
+   */
+  getAudienceMembers: () => Promise<ReadonlyArray<AudienceMember>>;
   service?: ZrdtSendServiceType;
   getRandomBytes?: (size: number) => ArrayBytes;
   log?: LoggerType;
@@ -209,6 +244,7 @@ export async function freezeZrdtSend(
     ourAci,
     message,
     buildContent,
+    getAudienceMembers,
     service = zrdtService,
     getRandomBytes = defaultGetRandomBytes,
     log = defaultLog,
@@ -250,12 +286,17 @@ export async function freezeZrdtSend(
   const nonce = getRandomBytes(NONCE_BYTES);
   strictAssert(nonce.byteLength === NONCE_BYTES, 'zrdt: bad nonce');
   const disown = (await service.disownSet(conversationId)).map(toArrayBytes);
+  const audience = await service.audience(await getAudienceMembers());
+  if (audience === 'tooLarge') {
+    throw new Error('zrdt: more than 256 audience members');
+  }
 
   const built = await buildContent({
     links,
     nonce,
     version: ZRDT_META_VERSION,
     disown,
+    audience,
   });
   // Freeze the canonical encoding: what decode → encode gives, because every
   // attempt (and the sendLog, and the sync transcript) re-encodes the decoded
@@ -267,6 +308,11 @@ export async function freezeZrdtSend(
     log.warn(`${logId}: Content changed on decode → encode; froze the second`);
   }
   strictAssert(dataMessage.zrdt, 'zrdt: built DataMessage has no zrdt');
+  strictAssert(
+    dataMessage.zrdtAudience != null &&
+      Bytes.areEqual(dataMessage.zrdtAudience, audience),
+    'zrdt: built DataMessage does not carry the audience'
+  );
   // Receivers apply the same predicate to the DataMessage they decrypt; a
   // mismatch here means they would ignore ZrdtMeta and later messages that
   // link this one would show gaps.
@@ -507,10 +553,142 @@ export async function reacceptZrdtOutgoingAtStartup(
   }
 }
 
+/** The ACIs (hex) listed in a frozen send's field 201. */
+function getFrozenAudienceAcis(contentBytes: ArrayBytes): Set<string> {
+  const { dataMessageBytes } = getFrozenDataMessage(contentBytes);
+  const seats = audienceOfDataMessage(dataMessageBytes);
+  strictAssert(seats, 'zrdt: frozen DataMessage has no audience');
+  return audienceAcis(seats);
+}
+
+function sendStateAcis(message: MessageModel): Array<AciString> {
+  const out = new Array<AciString>();
+  const ourAci = itemStorage.user.getCheckedAci();
+  for (const id of Object.keys(
+    message.get('sendStateByConversationId') ?? {}
+  )) {
+    const aci = window.ConversationController.get(id)?.getAci();
+    if (aci && aci !== ourAci) {
+      out.push(aci);
+    }
+  }
+  return out;
+}
+
+/**
+ * The identity key we hold for `aci` (33 bytes). Without one, fetch the
+ * prekey bundle first, as a send to that member would. Only a 404
+ * (unregistered) gives none (the zero tag); any other failure throws, so the
+ * attempt fails and the job retries (JOIN_PLAN §4.1).
+ */
+async function loadOrFetchIdentityKey(
+  aci: AciString,
+  log: LoggerType
+): Promise<ArrayBytes | undefined> {
+  const loaded = await signalProtocolStore.loadIdentityKey(aci);
+  if (loaded) {
+    strictAssert(
+      loaded.byteLength === IDENTITY_KEY_BYTES,
+      'zrdt: identity key is not 33 bytes'
+    );
+    return loaded;
+  }
+  try {
+    const member = window.ConversationController.get(aci);
+    const accessKey = member
+      ? ((await getSendOptions(member.attributes)).sendMetadata?.[aci]
+          ?.accessKey ?? null)
+      : null;
+    await getKeysForServiceId(
+      aci,
+      { getKeysForServiceId: doGetKeysForServiceId, getKeysForServiceIdUnauth },
+      null,
+      accessKey,
+      null
+    );
+  } catch (error) {
+    if (error instanceof UnregisteredUserError) {
+      log.warn(`zrdt/audience: ${aci} is unregistered (404); zero tag`);
+      return undefined;
+    }
+    throw error;
+  }
+  const fetched = await signalProtocolStore.loadIdentityKey(aci);
+  if (!fetched || fetched.byteLength !== IDENTITY_KEY_BYTES) {
+    throw new Error(`zrdt/audience: no identity key for ${aci}; will retry`);
+  }
+  return fetched;
+}
+
+/** The enqueue snapshot, or (a message without one) its send state. */
+function getAudienceSnapshot(message: MessageModel): AudienceSnapshot {
+  return (
+    message.get('zrdtAudience') ?? snapshotFromSendState(sendStateAcis(message))
+  );
+}
+
+/**
+ * Everyone a record can ever be sent to: the recipients at enqueue (a
+ * superset of its seats and of every attempt's recipients). The quote rule
+ * checks them all.
+ */
+export function getZrdtEnqueueRecipients(
+  message: MessageModel
+): ReadonlyArray<string> {
+  return getAudienceSnapshot(message).recipients;
+}
+
+/**
+ * The members for AUDIENCE at freeze (JOIN_PLAN §4.1), or 'tooLarge' when
+ * field 201 cannot hold them (the message then goes without zrdt).
+ */
+async function loadAudienceMembers(
+  conversation: ConversationModel,
+  message: MessageModel,
+  log: LoggerType
+): Promise<Array<AudienceMember> | 'tooLarge'> {
+  const ourAci = itemStorage.user.getCheckedAci();
+  const plan = planAudience({
+    ourAci,
+    snapshot: getAudienceSnapshot(message),
+    currentMembers: (conversation.get('membersV2') ?? []).map(m => m.aci),
+  });
+  if (plan.tooLarge) {
+    return 'tooLarge';
+  }
+  const ourKey = signalProtocolStore.getIdentityKeyPair(ourAci);
+  strictAssert(ourKey, 'zrdt: no identity key pair of our own');
+  const candidates = new Set(plan.seatCandidates.map(aciStringHex));
+  const members = new Array<AudienceMember>();
+  for (const aci of plan.members) {
+    const aciBytes = uuidToBytes(aci);
+    if (aciStringHex(aci) === aciStringHex(ourAci)) {
+      members.push({
+        aci: aciBytes,
+        key: new Uint8Array(ourKey.publicKey.serialize()),
+      });
+    } else if (candidates.has(aciStringHex(aci)) && isAciString(aci)) {
+      // oxlint-disable-next-line no-await-in-loop
+      const key = await loadOrFetchIdentityKey(aci, log);
+      members.push(key ? { aci: aciBytes, key } : { aci: aciBytes });
+    } else {
+      members.push({ aci: aciBytes });
+    }
+  }
+  const seated = members.filter(m => m.key !== undefined).length;
+  log.info(
+    `zrdt/audience: ${members.length} members, ${seated} seated ` +
+      `(${aciHex(uuidToBytes(ourAci)).slice(0, 8)} is the author)`
+  );
+  return members;
+}
+
 /**
  * The Content to send for an in-scope group message (isZrdtGroupSend), from
  * inside the conversation's queueJob: frozen once, the same bytes on every
- * attempt.
+ * attempt; and the ACIs (hex) of its audience, which bound the recipients of
+ * every attempt. Undefined if the group is over the audience cap (256): the
+ * message then is no record and goes the stock way.
  */
 export async function getZrdtGroupSendContent({
   conversation,
@@ -524,7 +702,10 @@ export async function getZrdtGroupSendContent({
   groupSendOptions: GroupMessageOptionsType;
   messaging: MessageSender;
   log: LoggerType;
-}>): Promise<Proto.Content.Params> {
+}>): Promise<
+  | { contentMessage: Proto.Content.Params; audienceAcis: Set<string> }
+  | undefined
+> {
   // Resumed send jobs can run before startup finished zrdtService.init();
   // init() is idempotent (T0), so wait for it: heads must come from the store
   // OPENed from SQL rows, never from an empty one.
@@ -535,10 +716,21 @@ export async function getZrdtGroupSendContent({
   if (!backend.available) {
     throw new Error(`zrdt unavailable (${backend.kind}); will retry`);
   }
+  if (message.get('zrdt') == null) {
+    const plan = planAudience({
+      ourAci: itemStorage.user.getCheckedAci(),
+      snapshot: getAudienceSnapshot(message),
+      currentMembers: (conversation.get('membersV2') ?? []).map(m => m.aci),
+    });
+    if (plan.tooLarge) {
+      log.warn('zrdt: more than 256 audience members; sending without zrdt');
+      return undefined;
+    }
+  }
   const groupId = getGroupIdBytes(conversation);
   await zrdtService.ensureConversation(conversation.id, groupId);
   await reacceptOutgoingForConversation(conversation, log);
-  return freezeZrdtSend({
+  const contentMessage = await freezeZrdtSend({
     conversationId: conversation.id,
     groupId,
     ourAci: getOurAciBytes(),
@@ -554,6 +746,19 @@ export async function getZrdtGroupSendContent({
       messaging.getContentMessage(
         messaging.getAttrsFromGroupOptions({ ...groupSendOptions, zrdt })
       ),
+    getAudienceMembers: async () => {
+      const members = await loadAudienceMembers(conversation, message, log);
+      if (members === 'tooLarge') {
+        throw new Error('zrdt: more than 256 audience members');
+      }
+      return members;
+    },
     log,
   });
+  const frozen = message.get('zrdt');
+  strictAssert(frozen, 'zrdt: no frozen send after freeze');
+  return {
+    contentMessage,
+    audienceAcis: getFrozenAudienceAcis(Bytes.fromBase64(frozen.contentBytes)),
+  };
 }

@@ -108,6 +108,8 @@ function getGroupConversation(
 type PendingRelay = Readonly<{
   opening: Uint8Array<ArrayBuffer> | undefined;
   responderAci: AciString;
+  // The SERVE entry was marked author copy.
+  authorCopy: boolean;
   // Whether we had asked for it (decided when it arrived).
   wasRequested: boolean;
 }>;
@@ -237,7 +239,9 @@ export async function zrdtReceiveLive({
     });
 
     if (outcome.status !== 'accepted' && outcome.status !== 'missing') {
-      // COLLISION, WRONG_CHAT, TOO_LARGE, MALFORMED: drop the record, log.
+      // COLLISION, WRONG_CHAT, TOO_LARGE, MALFORMED, NO_AUDIENCE (no field
+      // 201: every record must carry its audience, JOIN_PLAN §3.2): drop the
+      // record, log.
       // TODO(zrdt): COLLISION should show the message with its digest
       // (APP.md §5 step 4); it never fires with SHA-256.
       log.warn(`${logId}: zrdt record refused: ${outcome.status}`);
@@ -567,21 +571,25 @@ async function resolveGapRow(
   await window.MessageCache.saveMessage(row.attributes);
 }
 
-// --- relays (ZrdtResend) --------------------------------------------------------------
+// --- relays (SERVE entries) -----------------------------------------------------------
 
-// APP.md §5 step 7. Called by resend.preload.ts for a ZrdtResend from a
-// current member. ACCEPT_RECORD checks the opening against the record's
-// commit; a bad opening falls back to structure only.
+// APP.md §5 step 7, JOIN_PLAN §4.4. Called by resend.preload.ts for each
+// addressed or `after` entry of a sealed SERVE reply that passed the §4.4
+// checks. ACCEPT_RECORD checks the opening against the record's commit and
+// records its audience; a bad opening, or one without an audience, falls
+// back to structure only. `authorCopy`: the entry was marked author copy.
 export async function acceptRelayedRecord({
   groupId,
   responderAci,
   record,
   opening,
+  authorCopy,
 }: Readonly<{
   groupId: Uint8Array<ArrayBuffer>;
   responderAci: AciString;
   record: Uint8Array<ArrayBuffer>;
   opening: Uint8Array<ArrayBuffer> | undefined;
+  authorCopy: boolean;
 }>): Promise<void> {
   initZrdtReceive();
   const conversation = getGroupConversation(groupId);
@@ -602,8 +610,8 @@ export async function acceptRelayedRecord({
     opening,
     provenance,
   });
-  if (outcome.status === 'badOpening') {
-    log.warn('relay: opening does not match the record; structure only');
+  if (outcome.status === 'badOpening' || outcome.status === 'noAudience') {
+    log.warn(`relay: opening refused (${outcome.status}); structure only`);
     usedOpening = undefined;
     outcome = await zrdtService.acceptRecord(conversationId, {
       record,
@@ -617,6 +625,7 @@ export async function acceptRelayedRecord({
       pendingRelays.set(`${conversationId}:${digest}`, {
         opening: usedOpening,
         responderAci,
+        authorCopy,
         wasRequested:
           zrdtResendScheduler.isOutstanding(conversationId, digest) ||
           gaps.length > 0,
@@ -650,6 +659,7 @@ export async function acceptRelayedRecord({
         record: outcome.record,
         responderAci,
         opening: usedOpening,
+        authorCopy,
       })
     )
   );
@@ -695,6 +705,7 @@ async function afterDrainedRelay(
       record: held.record,
       responderAci: relay.responderAci,
       opening,
+      authorCopy: relay.authorCopy,
       wasRequested: relay.wasRequested,
     });
   } catch (error) {
@@ -708,6 +719,7 @@ async function onRelayAccepted({
   record,
   responderAci,
   opening,
+  authorCopy,
   wasRequested: knownRequested,
 }: Readonly<{
   conversationId: string;
@@ -715,6 +727,7 @@ async function onRelayAccepted({
   record: Uint8Array<ArrayBuffer>;
   responderAci: AciString;
   opening: Uint8Array<ArrayBuffer> | undefined;
+  authorCopy: boolean;
   wasRequested?: boolean;
 }>): Promise<void> {
   const conversation = window.ConversationController.get(conversationId);
@@ -728,9 +741,9 @@ async function onRelayAccepted({
     log.warn(`relay: accepted ${digest.slice(0, 8)} but cannot read author`);
     return;
   }
-  const provenance = relayProvenance(responderAci, authorAci);
+  const provenance = relayProvenance(responderAci, authorAci, authorCopy);
   if (provenance.kind === 'live') {
-    // The author relayed its own record: upgrade (idempotent accept).
+    // The author's own copy (SERVE marked it so): upgrade (idempotent accept).
     await zrdtService.acceptRecord(conversationId, {
       record,
       provenance,

@@ -45,6 +45,15 @@ const GROUP_ID = new Uint8Array(32).fill(7);
 const OUR_ACI = new Uint8Array(16).fill(1);
 const OTHER_ACI = new Uint8Array(16).fill(2);
 const MASTER_KEY = new Uint8Array(32).fill(9);
+// Serialized identity keys (33 bytes); the stub only hashes them.
+const OUR_KEY = new Uint8Array(33).fill(0x05);
+const OTHER_KEY = new Uint8Array(33).fill(0x06);
+const AUDIENCE_MEMBERS = [
+  { aci: OUR_ACI, key: OUR_KEY },
+  { aci: OTHER_ACI, key: OTHER_KEY },
+];
+// A fixed field-201 value for the toProto tests.
+const AUDIENCE_BYTES = new Uint8Array(32).fill(0x0a);
 
 function fill(byte: number, size = 32): Bytes {
   return new Uint8Array(size).fill(byte);
@@ -88,6 +97,14 @@ class FakeService implements ZrdtSendServiceType {
     return this.backend.has(conversationId, digest);
   };
 
+  audience = async (
+    members: Parameters<ZrdtSendServiceType['audience']>[0]
+  ): Promise<Bytes | 'tooLarge'> => {
+    this.calls.push('audience');
+    const result = await this.backend.audience(members);
+    return result.kind === 'ok' ? result.audience : 'tooLarge';
+  };
+
   acceptOwn = async (
     conversationId: string,
     a: Parameters<ZrdtSendServiceType['acceptOwn']>[1]
@@ -110,15 +127,20 @@ class FakeService implements ZrdtSendServiceType {
       links: a.links,
       author: a.authorAci,
     };
-    const result = await this.backend.accept(conversationId, parts);
-    if (result.kind !== 'accepted') {
-      throw new Error(`acceptOwn: ${result.kind}`);
-    }
     const committed = removeTopLevelFields(
       a.dataMessageBytes,
       new Set([15, 200])
     );
     assert.isDefined(committed, 'dataMessageBytes must parse');
+    // As the service does: ACCEPT with the opening (its audience is recorded).
+    const result = await this.backend.accept(
+      conversationId,
+      parts,
+      Bytes.concatenate([a.nonce, committed ?? new Uint8Array(0)])
+    );
+    if (result.kind !== 'accepted') {
+      throw new Error(`acceptOwn: ${result.kind}`);
+    }
     return {
       digest: result.digest,
       record: encodeRecord(makeRecord(parts)),
@@ -213,6 +235,7 @@ describe('zrdt/send: freeze once', () => {
       ourAci: OUR_ACI,
       message,
       buildContent: makeBuildContent(body, built),
+      getAudienceMembers: async () => AUDIENCE_MEMBERS,
       service,
       getRandomBytes,
       log,
@@ -230,14 +253,20 @@ describe('zrdt/send: freeze once', () => {
       nonce: fill(4),
       version: ZRDT_META_VERSION,
       disown,
+      audience: AUDIENCE_BYTES,
     });
     const decoded = Proto.Content.decode(Proto.Content.encode(content));
     const zrdt = decoded.content?.dataMessage?.zrdt;
     assert.isOk(zrdt);
     assert.deepEqual(zrdt?.links, links);
     assert.deepEqual(zrdt?.nonce, fill(4));
-    assert.strictEqual(zrdt?.version, 1);
+    assert.strictEqual(zrdt?.version, 3);
     assert.deepEqual(zrdt?.disown, disown);
+    // The audience is DataMessage field 201.
+    assert.deepEqual(
+      decoded.content?.dataMessage?.zrdtAudience,
+      AUDIENCE_BYTES
+    );
 
     // An empty ZrdtMeta (first message: no heads) is still on the wire.
     const first = await makeBuildContent(
@@ -248,6 +277,7 @@ describe('zrdt/send: freeze once', () => {
       nonce: fill(4),
       version: ZRDT_META_VERSION,
       disown: [],
+      audience: AUDIENCE_BYTES,
     });
     const firstDecoded = Proto.Content.decode(Proto.Content.encode(first));
     assert.isOk(firstDecoded.content?.dataMessage?.zrdt);
@@ -270,6 +300,7 @@ describe('zrdt/send: freeze once', () => {
     assert.deepEqual(service.calls, [
       'heads',
       'disownSet',
+      'audience',
       'save:frozen',
       'acceptOwn',
       'save:accepted',
@@ -318,6 +349,26 @@ describe('zrdt/send: freeze once', () => {
     assert.strictEqual(openedMessage.body, 'hello');
 
     assert.isTrue(await service.backend.has(CHAT, Bytes.fromHex(digest)));
+
+    // JOIN_PLAN §3.2: the opening commits the audience (field 201), and the
+    // backend recorded it: both members are seated under their keys.
+    const expected = await service.backend.audience(AUDIENCE_MEMBERS);
+    assert.strictEqual(expected.kind, 'ok');
+    assert.deepEqual(
+      openedMessage.zrdtAudience,
+      expected.kind === 'ok' ? expected.audience : undefined
+    );
+    for (const { aci, key } of AUDIENCE_MEMBERS) {
+      // oxlint-disable-next-line no-await-in-loop
+      assert.deepEqual(await service.backend.addressed(CHAT, aci, key), [
+        Bytes.fromHex(digest),
+      ]);
+    }
+    assert.deepEqual(
+      await service.backend.addressed(CHAT, OTHER_ACI, OUR_KEY),
+      [],
+      'a member under another key is not seated'
+    );
   });
 
   it('retry: sends the same bytes, never recomputes links', async () => {
@@ -555,6 +606,7 @@ describe('zrdt/send: freeze once', () => {
         nonce: fill(2),
         version: ZRDT_META_VERSION,
         disown: [],
+        audience: AUDIENCE_BYTES,
       },
     });
     const once = Proto.Content.encode(content);
@@ -584,6 +636,7 @@ describe('zrdt/send: freeze once', () => {
           ourAci: new Uint8Array(ourAci),
           message: makeMessage([]),
           buildContent: makeBuildContent('x', []),
+          getAudienceMembers: async () => AUDIENCE_MEMBERS,
           service,
           log,
         });
@@ -689,6 +742,7 @@ describe('zrdt/send: getAttrsFromGroupOptions', () => {
       nonce: fill(2),
       version: ZRDT_META_VERSION,
       disown: [fill(3)],
+      audience: AUDIENCE_BYTES,
     };
     const attrs = messageSender.getAttrsFromGroupOptions({
       timestamp: 1,

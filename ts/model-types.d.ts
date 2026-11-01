@@ -39,6 +39,7 @@ import type { StorySendMode } from './types/Stories.std.ts';
 import type { MIMEType } from './types/MIME.std.ts';
 import type { DurationInSeconds } from './util/durations/index.std.ts';
 import type {
+  ZrdtAudienceSnapshotType,
   ZrdtGapAttributesType,
   ZrdtProvenanceAttributesType,
   ZrdtSendAttributesType,
@@ -347,6 +348,8 @@ export type MessageAttributesType = {
   zrdtOpening?: string;
   // hex digest of this message's record; indexed (messages_zrdtDigest)
   zrdtDigest?: string;
+  // zrdt: the audience snapshot at enqueue (JOIN_PLAN §3.2)
+  zrdtAudience?: ZrdtAudienceSnapshotType;
   zrdtProvenance?: ZrdtProvenanceAttributesType;
   zrdtStatus?: ZrdtStatusAttributesType;
   // Only on type 'zrdt-gap'
@@ -550,6 +553,9 @@ export type ConversationAttributesType = {
   expireTimer?: DurationInSeconds;
   expireTimerVersion: number;
   membersV2?: Array<GroupV2MemberType>;
+  // zrdt strict mode (JOIN_PLAN §5): SERVE releases content only in author
+  // copies. Per group, off by default.
+  zrdtStrict?: boolean;
   pendingMembersV2?: Array<GroupV2PendingMemberType>;
   pendingAdminApprovalV2?: Array<GroupV2PendingAdminApprovalType>;
   bannedMembersV2?: Array<GroupV2BannedMemberType>;

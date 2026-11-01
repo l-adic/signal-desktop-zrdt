@@ -49,10 +49,21 @@ const BOB = 'b0b0b0b0-b0b0-b0b0-b0b0-b0b0b0b0b0b0';
 const CAROL = 'c0c0c0c0-c0c0-c0c0-c0c0-c0c0c0c0c0c0';
 const CHAT = 'conversation-camping';
 
-/** DataMessage { body = text } */
+// Field 201 (JOIN_PLAN §3.2): one entry, Alice with a non-zero key tag.
+const AUDIENCE = new Uint8Array([...filled(16, 0xa1), ...filled(16, 0x11)]);
+
+/** DataMessage { body = text, zrdtAudience = AUDIENCE } */
 function dataMessage(text: string): B {
   const body = new TextEncoder().encode(text);
-  return new Uint8Array([0x0a, body.length, ...body]);
+  return new Uint8Array([
+    0x0a,
+    body.length,
+    ...body,
+    0xca,
+    0x0c,
+    AUDIENCE.length,
+    ...AUDIENCE,
+  ]);
 }
 
 let nonceCounter = 0;

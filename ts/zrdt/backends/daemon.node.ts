@@ -21,12 +21,8 @@
 // core/Zrdt/Proto.lean, and pinned by vectors/vectors.json (rung 7 test:
 // ts/test-node/zrdt/vectors_test.node.ts).
 //
-// Replies of the protocol 1 layout (zrdt e2b3160) have no record bytes in
-// ACCEPT and no opening in COMMIT, and that zrdtd has no ACCEPT_RECORD. For
-// those the host builds the canonical record encoding and the opening itself
-// (the same bytes the stub produces), and runs ACCEPT_RECORD as COMMIT on the
-// opening plus ACCEPT. TODO(zrdt T0): drop the fallbacks once every zrdtd in
-// use speaks the lead's changes (build/t5-core).
+// The host speaks protocol 3 only (zrdt docs/JOIN_PLAN.md section 10.2;
+// greenfield, no older zrdtd is in use): the protocol 1 fallbacks are gone.
 
 import { spawn } from 'node:child_process';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
@@ -35,7 +31,8 @@ import { createLogger } from '../../logging/log.std.ts';
 import { ZrdtBackendError } from '../ZrdtBackend.std.ts';
 import type {
   AcceptRecordResult,
-  AcceptResult,
+  AudienceMember,
+  AudienceResult,
   BackendKind,
   Bytes,
   ChatKey,
@@ -47,6 +44,8 @@ import type {
   RecordParts,
   RecordStatus,
   SalvageResult,
+  ServeReply,
+  ServeRequest,
   VersionInfo,
   ZrdtBackend,
 } from '../ZrdtBackend.std.ts';
@@ -54,17 +53,10 @@ import {
   Code,
   Op,
   ReplyError,
-  concatBytes,
   decodeReply,
   encodeRequestBody,
 } from './codec.std.ts';
 import type { Request, ResultOf } from './codec.std.ts';
-import {
-  decodeRecord,
-  encodeRecord,
-  makeRecord,
-  removeTopLevelFields,
-} from './stub.node.ts';
 
 export { Op } from './codec.std.ts';
 
@@ -384,8 +376,6 @@ export class DaemonBackend implements ZrdtBackend {
   // The frame ops (codec.std.ts).
   // -------------------------------------------------------------------------
 
-  #acceptRecordOp: boolean | undefined;
-
   /** Sends a typed request and reads the typed reply. */
   async #request<O extends Op>(req: Request & { op: O }): Promise<ResultOf[O]> {
     const frame = await this.call(req.op, encodeRequestBody(req));
@@ -454,35 +444,25 @@ export class DaemonBackend implements ZrdtBackend {
     nonce: Bytes,
     dataMessage: Bytes
   ): Promise<CommitResult> {
-    const result = await this.#request({
+    return this.#request({
       op: Op.COMMIT,
       group,
       author,
       nonce,
       dataMessage,
     });
-    if (result.kind === 'ok' && result.opening.length === 0) {
-      // Protocol 1: no opening in the reply.
-      const committed = removeTopLevelFields(dataMessage, new Set([15, 200]));
-      if (committed === undefined) {
-        return { kind: 'malformed' };
-      }
-      return { ...result, opening: concatBytes([nonce, committed]) };
-    }
-    return result;
   }
 
   async hash(record: RecordParts): Promise<Digest> {
     return this.#request({ op: Op.HASH, parts: record });
   }
 
-  async accept(chat: ChatKey, record: RecordParts): Promise<AcceptResult> {
-    const result = await this.#request({ op: Op.ACCEPT, chat, parts: record });
-    if (result.kind === 'accepted' && result.record.length === 0) {
-      // Protocol 1: no record bytes in the reply.
-      return { ...result, record: encodeRecord(makeRecord(record)) };
-    }
-    return result;
+  async accept(
+    chat: ChatKey,
+    record: RecordParts,
+    opening?: Bytes
+  ): Promise<AcceptRecordResult> {
+    return this.#request({ op: Op.ACCEPT, chat, parts: record, opening });
   }
 
   async acceptRecord(
@@ -490,61 +470,7 @@ export class DaemonBackend implements ZrdtBackend {
     record: Bytes,
     opening?: Bytes
   ): Promise<AcceptRecordResult> {
-    if (this.#acceptRecordOp !== false) {
-      try {
-        const result = await this.#request({
-          op: Op.ACCEPT_RECORD,
-          chat,
-          record,
-          opening,
-        });
-        this.#acceptRecordOp = true;
-        return result;
-      } catch (error) {
-        if (
-          !(error instanceof ZrdtBackendError) ||
-          error.code !== 'protocol' ||
-          this.#acceptRecordOp === true
-        ) {
-          throw error;
-        }
-        log.warn('zrdtd has no ACCEPT_RECORD; using COMMIT and ACCEPT');
-        this.#acceptRecordOp = false;
-      }
-    }
-    // Protocol 1: decode here, check the opening with COMMIT, then ACCEPT.
-    const parts = decodeRecord(record);
-    if (parts === undefined) {
-      return { kind: 'malformed' };
-    }
-    if (opening !== undefined) {
-      if (opening.length < 32) {
-        return { kind: 'badOpening' };
-      }
-      // Lean's openingMatches: the committed bytes hold no field 15 or 200.
-      const committed = opening.subarray(32);
-      const stripped = removeTopLevelFields(committed, new Set([15, 200]));
-      if (
-        stripped === undefined ||
-        Buffer.compare(Buffer.from(stripped), Buffer.from(committed)) !== 0
-      ) {
-        return { kind: 'badOpening' };
-      }
-      const check = await this.commit(
-        parts.group,
-        parts.author,
-        opening.subarray(0, 32),
-        opening.subarray(32)
-      );
-      if (
-        check.kind !== 'ok' ||
-        Buffer.compare(Buffer.from(check.commit), Buffer.from(parts.commit)) !==
-          0
-      ) {
-        return { kind: 'badOpening' };
-      }
-    }
-    return this.accept(chat, parts);
+    return this.#request({ op: Op.ACCEPT_RECORD, chat, record, opening });
   }
 
   async heads(chat: ChatKey): Promise<Array<Digest>> {
@@ -583,5 +509,23 @@ export class DaemonBackend implements ZrdtBackend {
 
   async close(chat: ChatKey): Promise<void> {
     await this.#request({ op: Op.CLOSE, chat });
+  }
+
+  async audience(
+    members: ReadonlyArray<AudienceMember>
+  ): Promise<AudienceResult> {
+    return this.#request({ op: Op.AUDIENCE, members });
+  }
+
+  async serve(request: ServeRequest): Promise<ServeReply> {
+    return this.#request({ ...request, op: Op.SERVE });
+  }
+
+  async addressed(
+    chat: ChatKey,
+    aci: Bytes,
+    key: Bytes
+  ): Promise<Array<Digest>> {
+    return this.#request({ op: Op.ADDRESSED, chat, aci, key });
   }
 }

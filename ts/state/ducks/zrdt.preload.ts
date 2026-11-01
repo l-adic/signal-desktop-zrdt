@@ -19,7 +19,7 @@ import type { ThunkAction, ThunkDispatch } from 'redux-thunk';
 import { createLogger } from '../../logging/log.std.ts';
 import * as Errors from '../../types/errors.std.ts';
 import * as Bytes from '../../Bytes.std.ts';
-import { bytesToUuid } from '../../util/uuidToBytes.std.ts';
+import { bytesToUuid, uuidToBytes } from '../../util/uuidToBytes.std.ts';
 import { DataReader } from '../../sql/Client.preload.ts';
 import { SignalService as Proto } from '../../protobuf/index.std.ts';
 import type { BoundActionCreatorsMapObject } from '../../hooks/useBoundActions.std.ts';
@@ -39,7 +39,14 @@ import {
   zrdtEvents,
   zrdtService,
 } from '../../zrdt/service.preload.ts';
-import { requestMissing } from '../../zrdt/resend.preload.ts';
+import {
+  loadHeldOpenings,
+  loadServeHostState,
+  requestMissing,
+} from '../../zrdt/resend.preload.ts';
+import { isEphemeralOpening } from '../../zrdt/audience.std.ts';
+import { signalProtocolStore } from '../../SignalProtocolStore.preload.ts';
+import { itemStorage } from '../../textsecure/Storage.preload.ts';
 import { drop } from '../../util/drop.std.ts';
 import type { ZrdtRejectReason } from '../../zrdt/ui/labels.std.ts';
 import { rejectedText } from '../../zrdt/ui/labels.std.ts';
@@ -204,33 +211,53 @@ function isExcludedContent(decoded: Proto.DataMessage): boolean {
   return (decoded.expireTimer ?? 0) > 0 || decoded.isViewOnce === true;
 }
 
-/** Openings of the conversation's messages, by hex digest, for an export. */
+/**
+ * Openings of the conversation's messages, by hex digest, for an export:
+ * exactly the openings in SERVE's reply to our own account, under our own
+ * identity key, with the export flag (JOIN_PLAN §4.5): SERVE refuses
+ * disappearing and view-once content (`serve_export`). Deleted-for-everyone
+ * rows hold no opening.
+ */
 async function getExportContent(
   conversationId: string
 ): Promise<Map<string, Uint8Array<ArrayBuffer>>> {
-  const rows = await DataReader.getZrdtRecords(conversationId);
-  const ids = await DataReader.getMessageIdsByZrdtDigest(
-    conversationId,
-    rows.map(row => zrdtHex(row.digest))
-  );
+  const ourAci = itemStorage.user.getCheckedAci();
+  const ourKeys = signalProtocolStore.getIdentityKeyPair(ourAci);
+  if (!ourKeys) {
+    throw new Error('no identity key pair of our own');
+  }
+  const [held, hostState] = await Promise.all([
+    loadHeldOpenings(conversationId, undefined),
+    loadServeHostState(conversationId),
+  ]);
+  const reply = await zrdtService.serve(conversationId, {
+    ownAci: uuidToBytes(ourAci),
+    requesterAci: uuidToBytes(ourAci),
+    key: new Uint8Array(ourKeys.publicKey.serialize()),
+    requestId: globalThis.crypto.getRandomValues(new Uint8Array(16)),
+    since: [],
+    mode: 'catchup',
+    wanted: [],
+    forExport: true,
+    strict: false,
+    live: hostState.live,
+    disown: hostState.disown,
+    held,
+  });
+  const digestOfOpening = new Map<string, string>();
+  for (const item of held) {
+    if (item.opening) {
+      digestOfOpening.set(Bytes.toBase64(item.opening), zrdtHex(item.digest));
+    }
+  }
   const content = new Map<string, Uint8Array<ArrayBuffer>>();
-  for (const { digest, messageId } of ids) {
-    // oxlint-disable-next-line no-await-in-loop
-    const message = await DataReader.getMessageById(messageId);
-    const opening = message?.zrdtOpening;
-    if (
-      opening == null ||
-      message == null ||
-      message.deletedForEveryone === true ||
-      (message.expireTimer ?? 0) > 0 ||
-      message.isViewOnce === true
-    ) {
+  for (const entry of reply.entries) {
+    if (entry.kind !== 'addressed' || entry.opening === undefined) {
       continue;
     }
-    const bytes = Bytes.fromBase64(opening);
-    const decoded = decodeOpening(bytes);
-    if (decoded != null && !isExcludedContent(decoded)) {
-      content.set(digest, bytes);
+    const digest = digestOfOpening.get(Bytes.toBase64(entry.opening));
+    if (digest !== undefined) {
+      content.set(digest, entry.opening);
     }
   }
   return content;
@@ -266,7 +293,14 @@ async function verifyImportedContent(
       const decoded = decodeOpening(opening);
       // oxlint-disable-next-line no-await-in-loop
       const held = await zrdtService.get(conversationId, zrdtFromHex(hex));
-      if (decoded == null || isExcludedContent(decoded) || held == null) {
+      // Import refuses ephemeral content (JOIN_PLAN §4.5): by the committed
+      // bytes, as SERVE's export flag does, and by the decoded message.
+      if (
+        decoded == null ||
+        isEphemeralOpening(opening) ||
+        isExcludedContent(decoded) ||
+        held == null
+      ) {
         refused += 1;
         continue;
       }

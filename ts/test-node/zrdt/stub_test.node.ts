@@ -885,7 +885,7 @@ describe('zrdt stub', () => {
       const stub = newStub();
       assert.strictEqual(stub.kind, 'stub');
       assert.isTrue(stub.isAvailable());
-      assert.deepEqual(await stub.version(), { protocol: 2, build: 'stub' });
+      assert.deepEqual(await stub.version(), { protocol: 3, build: 'stub' });
     });
 
     it('is refused when ZRDT_REQUIRE_LEAN=1', () => {
@@ -914,14 +914,19 @@ describe('zrdt stub', () => {
       const stub = newStub();
       await stub.create(CHAT, GROUP);
       const nonce = filled(32, 0x4e);
-      // body "hi" (field 1), groupV2 (field 15, dropped), zrdt (200, dropped)
-      const dataMessage = fromHex('0a0268697a020000c20c00');
+      // body "hi" (field 1), groupV2 (field 15, dropped), zrdt (200,
+      // dropped), zrdtAudience (201, kept: one entry, Alice, tag 0x11...)
+      const audience = 'ca0c20' + 'a1'.repeat(16) + '11'.repeat(16);
+      const dataMessage = fromHex(`0a0268697a020000c20c00${audience}`);
       const committed = await stub.commit(GROUP, ALICE, nonce, dataMessage);
       assert.strictEqual(committed.kind, 'ok');
       if (committed.kind !== 'ok') {
         return;
       }
-      assert.strictEqual(hex(committed.opening), hex(nonce) + '0a026869');
+      assert.strictEqual(
+        hex(committed.opening),
+        `${hex(nonce)}0a026869${audience}`
+      );
       const parts = {
         group: GROUP,
         commit: committed.commit,

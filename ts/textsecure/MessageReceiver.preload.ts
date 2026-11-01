@@ -2723,10 +2723,11 @@ export default class MessageReceiver
       );
       return;
     }
-    // zrdt control messages (Content 200-202): resend by digest
+    // zrdt control messages (Content 202-204): SERVE requests, sealed
+    // replies, not-found (JOIN_PLAN §10.1)
     if (
-      content.content?.zrdtResendRequest ||
-      content.content?.zrdtResend ||
+      content.content?.zrdtServeRequest ||
+      content.content?.zrdtServed ||
       content.content?.zrdtNotFound
     ) {
       try {

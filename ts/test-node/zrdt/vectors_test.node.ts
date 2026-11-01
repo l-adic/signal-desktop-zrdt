@@ -23,7 +23,10 @@ import { join } from 'node:path';
 
 import { assert } from 'chai';
 
-import { ZrdtBackendError } from '../../zrdt/ZrdtBackend.std.ts';
+import {
+  PROTOCOL_VERSION,
+  ZrdtBackendError,
+} from '../../zrdt/ZrdtBackend.std.ts';
 import type {
   Bytes,
   Digest,
@@ -171,7 +174,7 @@ async function runTyped(
     case Op.HASH:
       return backend.hash(req.parts);
     case Op.ACCEPT:
-      return backend.accept(req.chat, req.parts);
+      return backend.accept(req.chat, req.parts, req.opening);
     case Op.HEADS:
       return backend.heads(req.chat);
     case Op.HAS:
@@ -191,6 +194,12 @@ async function runTyped(
       return undefined;
     case Op.ACCEPT_RECORD:
       return backend.acceptRecord(req.chat, req.record, req.opening);
+    case Op.AUDIENCE:
+      return backend.audience(req.members);
+    case Op.SERVE:
+      return backend.serve(req);
+    case Op.ADDRESSED:
+      return backend.addressed(req.chat, req.aci, req.key);
     default:
       throw new Error('unknown op');
   }
@@ -200,7 +209,7 @@ async function runTyped(
 async function serve(
   backend: ZrdtBackend,
   payload: Bytes,
-  options: ReplyOptions & { withAcceptRecord: boolean }
+  options: ReplyOptions & { withAcceptRecord: boolean; protocol?: number }
 ): Promise<Bytes> {
   const req = decodeRequest(payload, options);
   if (typeof req === 'number') {
@@ -290,7 +299,20 @@ describe('zrdt rung 7: stub vs Lean (vectors.json, zrdtd)', function (this: Moch
   const options = {
     ...replyOptions(vectors),
     withAcceptRecord: hasAcceptRecord(vectors),
+    protocol: vectors.protocol,
   };
+  // The sessions pin frames of one protocol. Vectors of an older protocol
+  // (the zrdt submodule before the join core lands) cannot run on a
+  // protocol-3 stub, and that checkout's zrdtd speaks the older protocol too.
+  const sameProtocol = vectors.protocol === PROTOCOL_VERSION;
+  const describeSessions = sameProtocol ? describe : () => undefined;
+  if (!sameProtocol) {
+    // eslint-disable-next-line no-console
+    console.log(
+      `      vectors.json is protocol ${vectors.protocol}, the host ` +
+        `${PROTOCOL_VERSION}: sessions skipped until the vectors are regenerated`
+    );
+  }
 
   describe('static encodings on the stub', () => {
     it('sha256', () => {
@@ -379,7 +401,7 @@ describe('zrdt rung 7: stub vs Lean (vectors.json, zrdtd)', function (this: Moch
     });
   });
 
-  describe('sessions on the stub', () => {
+  describeSessions('sessions on the stub', () => {
     for (const session of vectors.sessions) {
       it(`session ${session.name}`, async () => {
         const stub = new StubBackend({ env: {} });
@@ -392,7 +414,7 @@ describe('zrdt rung 7: stub vs Lean (vectors.json, zrdtd)', function (this: Moch
     }
   });
 
-  const haveDaemon = existsSync(ZRDTD);
+  const haveDaemon = existsSync(ZRDTD) && sameProtocol;
   const describeDaemon = haveDaemon ? describe : () => undefined;
 
   describeDaemon(`sessions on zrdtd (${ZRDTD})`, () => {

@@ -72,6 +72,17 @@ export type ZrdtSendAttributesType = Readonly<{
   contentBytes: string; // base64, the frozen Content bytes sent on every attempt
 }>;
 
+// `message.zrdtAudience`: the snapshot taken at enqueue, in the same
+// synchronous block that sets the recipients (zrdt docs/JOIN_PLAN.md §3.2,
+// §4.1): the raw `membersV2` ACIs and Desktop's own recipient set
+// (`getRecipients`: not blocked, not unregistered). At freeze the audience is
+// built from it: members ∩ membersV2 then, plus the author; seated only the
+// enqueue recipients the author holds a key for. Outgoing group messages only.
+export type ZrdtAudienceSnapshotType = Readonly<{
+  members: ReadonlyArray<AciString>;
+  recipients: ReadonlyArray<string>;
+}>;
+
 // State machine of a `zrdt-gap` row (APP.md §7):
 // 'waiting'           spinner; ZRDT_RESEND_DELAY_MS not elapsed yet
 // 'requested'         a ZrdtResendRequest went out
