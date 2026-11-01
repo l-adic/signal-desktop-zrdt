@@ -15,7 +15,7 @@
 //
 // Then open the panel URL it prints. Ctrl-C (or POST /actions/quit) closes
 // every desktop and the server. Artifacts (villain log, screenshots, desktop
-// logs) go to artifacts/demo/ (ZRDT_DEMO_OUT to change).
+// logs) go to demo/artifacts/demo/ (ZRDT_DEMO_OUT to change).
 //
 // Environment: see demo/harness.ts (SIGNAL_MOCK_TESTS_BACKGROUND,
 // ZRDT_DAEMON, ZRDT_RESEND_DELAY_MS); ZRDT_PANEL_PORT for the panel port.
@@ -28,10 +28,13 @@ import { getTimelineMessageWithText } from '../ts/test-mock/helpers.node.ts';
 import { formatEntry } from './evil.ts';
 import { startPanel } from './panel.ts';
 import type { PanelAction } from './panel.ts';
-import { doctorAppend, doctorRemove } from './doctor.ts';
+import { doctorAppend, doctorRemove, doctoredPath } from './doctor.ts';
 import {
   REPO,
   configureEnv,
+  conversationId,
+  dumpPath,
+  hook,
   linkDesktop,
   linked,
   openGroup,
@@ -85,47 +88,9 @@ function memberParam(demo: Demo, value: string | undefined): Member {
   return demo.byName[name as MemberName];
 }
 
-// The newest *.zrdt file in the usual places, for an empty "file" field.
-// TODO(zrdt T4): use the export lane's real default path once it lands.
-async function latestExport(demo: Demo): Promise<string> {
-  const dirs = [
-    path.join(os.homedir(), 'Downloads'),
-    path.join(os.homedir(), 'Desktop'),
-    demo.artifacts,
-    os.tmpdir(),
-  ];
-  let best: { file: string; mtime: number } | undefined;
-  for (const dir of dirs) {
-    let names: Array<string> = [];
-    try {
-      // oxlint-disable-next-line no-await-in-loop
-      names = await fs.readdir(dir);
-    } catch {
-      continue;
-    }
-    for (const n of names.filter(x => x.endsWith('.zrdt'))) {
-      const file = path.join(dir, n);
-      // oxlint-disable-next-line no-await-in-loop
-      const { mtimeMs } = await fs.stat(file);
-      if (!best || mtimeMs > best.mtime) {
-        best = { file, mtime: mtimeMs };
-      }
-    }
-  }
-  if (!best) {
-    throw new Error(`no .zrdt export found in ${dirs.join(', ')}`);
-  }
-  return best.file;
-}
-
-async function fileParam(
-  demo: Demo,
-  value: string | undefined
-): Promise<string> {
-  const v = value?.trim();
-  if (!v) {
-    return latestExport(demo);
-  }
+/** A path from the panel; "~/" means the home directory. */
+function fileParam(value: string): string {
+  const v = value.trim();
   return v.startsWith('~/') ? path.join(os.homedir(), v.slice(2)) : v;
 }
 
@@ -141,24 +106,66 @@ function actions(demo: Demo, quit: () => void): Record<string, PanelAction> {
         return "Dave's desktop is linked and shows Camping";
       },
     },
+    export: {
+      label:
+        "Export a member's store (rehearsal; the demo clicks Settings → Internal)",
+      fields: ['member'],
+      run: async p => {
+        const m = memberParam(demo, p.member);
+        const r = await hook<unknown>(
+          m,
+          'exportStore',
+          await conversationId(demo, m)
+        );
+        if (r.missing) {
+          throw new Error('no window.SignalCI.zrdt.exportStore hook yet');
+        }
+        return `${m.name}: ${JSON.stringify(r.value)} (${await dumpPath(demo, m)})`;
+      },
+    },
+    import: {
+      label: "Import into a member's chat (rehearsal)",
+      fields: ['member'],
+      run: async p => {
+        const m = memberParam(demo, p.member);
+        const r = await hook<unknown>(
+          m,
+          'importStore',
+          await conversationId(demo, m)
+        );
+        if (r.missing) {
+          throw new Error('no window.SignalCI.zrdt.importStore hook yet');
+        }
+        return `${m.name}: ${JSON.stringify(r.value)}`;
+      },
+    },
     'doctor-remove': {
-      label: 'Beat 4: remove a linked record from an export',
+      label:
+        "Beat 4: remove a linked record from Carol's export (in place; " +
+        'the original is kept as .orig)',
       fields: ['file', 'digest'],
-      run: async p =>
-        doctorRemove(
-          await fileParam(demo, p.file),
-          undefined,
-          p.digest?.trim() || undefined
-        ),
+      run: async p => {
+        const file = p.file?.trim()
+          ? fileParam(p.file)
+          : await dumpPath(demo, byName.carol);
+        await fs.copyFile(file, `${file}.orig`);
+        return doctorRemove(file, file, p.digest?.trim() || undefined);
+      },
     },
     'doctor-append': {
-      label: "Beat 5: append two fakes by Bob to Bob's export",
+      label:
+        "Beat 5: append two fakes by Bob to Bob's export, written where " +
+        "Dave's desktop imports from",
       fields: ['file'],
-      run: async p =>
-        doctorAppend(
-          await fileParam(demo, p.file),
-          byName.bob.boot.phone.device.aci
-        ),
+      run: async p => {
+        const file = p.file?.trim()
+          ? fileParam(p.file)
+          : await dumpPath(demo, byName.bob);
+        const out = byName.dave.app
+          ? await dumpPath(demo, byName.dave)
+          : doctoredPath(file);
+        return doctorAppend(file, byName.bob.boot.phone.device.aci, out);
+      },
     },
     send: {
       label: 'Send as member (rehearsal)',
@@ -213,7 +220,7 @@ async function main(): Promise<void> {
   const opts = parseArgs(process.argv.slice(2));
   say(configureEnv());
   const artifacts = path.resolve(
-    process.env.ZRDT_DEMO_OUT ?? path.join(REPO, 'artifacts', 'demo')
+    process.env.ZRDT_DEMO_OUT ?? path.join(REPO, 'demo', 'artifacts', 'demo')
   );
 
   let quit: () => void = () => undefined;

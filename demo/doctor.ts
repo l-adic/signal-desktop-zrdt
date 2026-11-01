@@ -25,11 +25,12 @@
 // links(32 each) ‖ author(16). Digest = SHA-256 of the record bytes.
 // (docs/PLAN.md §3.4.)
 //
-// The export file: a raw blob, or a container that holds one (the export
-// format of RESTORE_PLAN.md §5 adds a content section). The blob is found by
-// its magic; see `locateBlob`.
-// TODO(zrdt T4): pin this to the export lane's file format once it lands;
-// `remove` leaves the removed record's content entry in place.
+// The export file: lane T3 writes the raw store blob
+// (<profile>/zrdt-export-<conversation id>.bin). A container that holds a
+// blob (RESTORE_PLAN.md §5 adds a content section later) also works: the blob
+// is found by its magic; see `locateBlob`.
+// TODO(zrdt T4): when exports gain a content section, `remove` should drop the
+// removed record's content entry too.
 
 import { spawn } from 'node:child_process';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';

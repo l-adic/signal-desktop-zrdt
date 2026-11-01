@@ -252,6 +252,17 @@ export async function restartDesktop(
 
 export async function openGroup(m: Member, group: Group): Promise<void> {
   const p = page(m);
+  // Signal's "New ways to connect" card takes screen space; dismiss it.
+  const dismiss = p.locator('#LeftPane').getByRole('button', {
+    name: 'Dismiss',
+  });
+  try {
+    if ((await dismiss.count()) > 0) {
+      await dismiss.first().click({ timeout: 2_000 });
+    }
+  } catch {
+    // cosmetic only
+  }
   await p
     .locator('#LeftPane')
     .locator(`[data-testid="${group.id}"]`)
@@ -381,6 +392,68 @@ export async function screenshots(
   await fs.writeFile(file, PNG.sync.write(all));
   say(`screenshot ${path.relative(REPO, file)}`);
   return file;
+}
+
+// --- zrdt test hooks (lane T3, ts/zrdt/ci.preload.ts) ----------------------------
+
+export type HookResult<T> =
+  | Readonly<{ missing: true }>
+  | Readonly<{ missing: false; value: T }>;
+
+/**
+ * Calls `window.SignalCI.zrdt[name](...args)` in `m`'s window; `missing` when
+ * the fork has no such hook (yet).
+ */
+export async function hook<T>(
+  m: Member,
+  name: string,
+  ...args: ReadonlyArray<unknown>
+): Promise<HookResult<T>> {
+  return page(m).evaluate(
+    async ({ n, a }) => {
+      type Hooks = Record<string, (...x: ReadonlyArray<unknown>) => unknown>;
+      const ci = (globalThis as unknown as { SignalCI?: { zrdt?: Hooks } })
+        .SignalCI;
+      const fn = ci?.zrdt?.[n];
+      if (typeof fn !== 'function') {
+        return { missing: true as const };
+      }
+      return { missing: false as const, value: (await fn(...a)) as T };
+    },
+    { n: name, a: args }
+  );
+}
+
+/** `m`'s conversation id for the group (each desktop has its own). */
+export async function conversationId(demo: Demo, m: Member): Promise<string> {
+  const id = await page(m).evaluate(
+    `window.ConversationController.get(${JSON.stringify(demo.group.id)})?.id`
+  );
+  if (typeof id !== 'string') {
+    throw new Error(`${m.display} has no conversation for the group`);
+  }
+  return id;
+}
+
+/**
+ * Where `m`'s desktop exports the group's store and imports it from:
+ * `<userData>/zrdt-export-<conversation id>.bin` (lane T3's getZrdtDumpPath).
+ */
+export async function dumpPath(demo: Demo, m: Member): Promise<string> {
+  const conv = await conversationId(demo, m);
+  let userData: unknown;
+  try {
+    userData = await page(m).evaluate(
+      "window.SignalContext.getPath('userData')"
+    );
+  } catch {
+    userData = undefined;
+  }
+  const dir = typeof userData === 'string' ? userData : m.storagePath;
+  if (!dir) {
+    throw new Error(`no profile directory for ${m.display}`);
+  }
+  return path.join(dir, `zrdt-export-${conv}.bin`);
 }
 
 // Kills Electron processes still using one of our profiles.
