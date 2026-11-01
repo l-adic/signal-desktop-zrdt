@@ -1949,6 +1949,37 @@ WHERE
 </details>
 
 <details>
+<summary>Index: messages → messages_zrdtDigest</summary>
+
+```sql
+CREATE INDEX messages_zrdtDigest ON messages (
+  conversationId,
+  json_extract(
+    json,
+    '$.zrdtDigest'
+  )
+)
+WHERE
+  json_extract(
+    json,
+    '$.zrdtDigest'
+  ) IS NOT NULL
+```
+
+</details>
+
+<details>
+<summary>Index: messages → messages_zrdtGap</summary>
+
+```sql
+CREATE INDEX messages_zrdtGap ON messages (conversationId)
+WHERE
+  type IS 'zrdt-gap'
+```
+
+</details>
+
+<details>
 <summary>Index: messages → sqlite_autoindex_messages_1</summary>
 
 ```text
@@ -3080,6 +3111,93 @@ CREATE INDEX unprocessed_byReceivedAtCounter ON unprocessed (receivedAtCounter)
 
 ```sql
 CREATE INDEX unprocessed_byReceivedAtDate ON unprocessed (receivedAtDate)
+```
+
+</details>
+
+---
+
+</details>
+
+<details>
+<summary>Table: zrdt_pending</summary>
+
+```sql
+CREATE TABLE zrdt_pending (
+  conversationId TEXT NOT NULL,
+  digest BLOB NOT NULL,
+  record BLOB NOT NULL,
+  messageId TEXT,
+  PRIMARY KEY (
+    conversationId,
+    digest
+  )
+) STRICT
+```
+
+<details>
+<summary>Index: zrdt_pending → sqlite_autoindex_zrdt_pending_1</summary>
+
+```text
+(404: SQL Not Found)
+```
+
+</details>
+
+---
+
+</details>
+
+<details>
+<summary>Table: zrdt_provenance</summary>
+
+```sql
+CREATE TABLE zrdt_provenance (
+  conversationId TEXT NOT NULL,
+  digest BLOB NOT NULL,
+  kind TEXT NOT NULL,
+  byAci TEXT,
+  disownedBy TEXT,
+  PRIMARY KEY (
+    conversationId,
+    digest
+  )
+) STRICT
+```
+
+<details>
+<summary>Index: zrdt_provenance → sqlite_autoindex_zrdt_provenance_1</summary>
+
+```text
+(404: SQL Not Found)
+```
+
+</details>
+
+---
+
+</details>
+
+<details>
+<summary>Table: zrdt_records</summary>
+
+```sql
+CREATE TABLE zrdt_records (
+  conversationId TEXT NOT NULL,
+  digest BLOB NOT NULL,
+  record BLOB NOT NULL,
+  PRIMARY KEY (
+    conversationId,
+    digest
+  )
+) STRICT
+```
+
+<details>
+<summary>Index: zrdt_records → sqlite_autoindex_zrdt_records_1</summary>
+
+```text
+(404: SQL Not Found)
 ```
 
 </details>

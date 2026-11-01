@@ -1351,6 +1351,7 @@ export function isNormalBubble(message: MessageWithUIFieldsType): boolean {
     !isChangeNumberNotification(message) &&
     !isJoinedSignalNotification(message) &&
     !isDeliveryIssue(message) &&
+    !isZrdtGap(message) &&
     !isMessageRequestResponse(message)
   );
 }
@@ -2078,6 +2079,13 @@ function getPropsForPhoneNumberDiscovery(
 
 export function isDeliveryIssue(message: MessageWithUIFieldsType): boolean {
   return message.type === 'delivery-issue';
+}
+
+// zrdt gap (APP.md §6, §7). Rendering (getPropsForBubble + TimelineItem) is
+// owned by the UI lane; see ts/types/Zrdt.std.ts for the payload.
+
+export function isZrdtGap(message: MessageWithUIFieldsType): boolean {
+  return message.type === 'zrdt-gap';
 }
 
 function getPropsForDeliveryIssue(

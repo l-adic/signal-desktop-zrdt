@@ -79,6 +79,7 @@ import {
   isGroupV2Change,
   isKeyChange,
   isNormalBubble,
+  isZrdtGap,
   isPollTerminate,
   isPhoneNumberDiscovery,
   isProfileChange,
@@ -2625,6 +2626,11 @@ export class BackupExportStream {
 
     if (isUniversalTimerNotification(message)) {
       // Transient, drop it
+      return { kind: NonBubbleResultKind.Drop };
+    }
+
+    if (isZrdtGap(message)) {
+      // zrdt: local-only placeholder, never in a Signal backup
       return { kind: NonBubbleResultKind.Drop };
     }
 

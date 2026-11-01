@@ -299,6 +299,22 @@ import {
   getUnremindedUnreadMessageTimeRanges,
   getUnreadReminderSummaryData,
 } from './server/unreadReminders.std.ts';
+import {
+  deleteZrdtForConversation,
+  deleteZrdtPending,
+  deleteZrdtRecords,
+  getMessageIdsByZrdtDigest,
+  getZrdtConversationIds,
+  getZrdtGapMessageIds,
+  getZrdtPending,
+  getZrdtProvenance,
+  getZrdtRecords,
+  insertZrdtPending,
+  insertZrdtRecord,
+  insertZrdtRecords,
+  markZrdtDisowned,
+  upsertZrdtProvenance,
+} from './server/zrdt.std.ts';
 import { INITIAL_EXPIRE_TIMER_VERSION } from '../util/expirationTimer.std.ts';
 import type { GifType } from '../components/fun/panels/FunPanelGifs.dom.tsx';
 import type { NotificationProfileType } from '../types/NotificationProfile.std.ts';
@@ -530,6 +546,13 @@ export const DataReader: ServerReadableInterface = {
   getAllMegaphones,
   getAllMegaphoneIds,
   hasMegaphone,
+
+  getZrdtRecords,
+  getZrdtConversationIds,
+  getZrdtPending,
+  getZrdtProvenance,
+  getMessageIdsByZrdtDigest,
+  getZrdtGapMessageIds,
 
   getAllKTAcis,
   getKTAccountData,
@@ -826,6 +849,15 @@ export const DataWriter: ServerWritableInterface = {
   appendPinnedMessage,
   deletePinnedMessageByMessageId,
   deleteAllExpiredPinnedMessagesBefore,
+
+  insertZrdtRecord,
+  insertZrdtRecords,
+  deleteZrdtRecords,
+  insertZrdtPending,
+  deleteZrdtPending,
+  upsertZrdtProvenance,
+  markZrdtDisowned,
+  deleteZrdtForConversation,
 
   removeAll,
   removeAllConfiguration,
@@ -2097,9 +2129,12 @@ function updateConversations(
 }
 
 function _removeConversation(db: WritableDB, id: string): void {
-  db.prepare('DELETE FROM conversations WHERE id = $id;').run({
-    id,
-  });
+  db.transaction(() => {
+    db.prepare('DELETE FROM conversations WHERE id = $id;').run({
+      id,
+    });
+    deleteZrdtForConversation(db, id);
+  })();
 }
 
 function _removeAllConversations(db: WritableDB): void {
@@ -8780,6 +8815,9 @@ function removeAll(db: WritableDB): void {
       DELETE FROM syncTasks;
       DELETE FROM unprocessed;
       DELETE FROM uninstalled_sticker_packs;
+      DELETE FROM zrdt_pending;
+      DELETE FROM zrdt_provenance;
+      DELETE FROM zrdt_records;
 
       INSERT INTO messages_fts(messages_fts) VALUES('optimize');
 

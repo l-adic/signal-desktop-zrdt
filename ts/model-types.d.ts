@@ -38,6 +38,12 @@ import type { StickerType } from './types/Stickers.preload.ts';
 import type { StorySendMode } from './types/Stories.std.ts';
 import type { MIMEType } from './types/MIME.std.ts';
 import type { DurationInSeconds } from './util/durations/index.std.ts';
+import type {
+  ZrdtGapAttributesType,
+  ZrdtProvenanceAttributesType,
+  ZrdtSendAttributesType,
+  ZrdtStatusAttributesType,
+} from './types/Zrdt.std.ts';
 import type { AnyPaymentEvent } from './types/Payment.std.ts';
 import type { PollMessageAttribute } from './types/Polls.dom.ts';
 
@@ -182,7 +188,9 @@ type MessageType =
   | 'contact-removed-notification'
   | 'title-transition-notification'
   | 'verified-change'
-  | 'message-request-response-event';
+  | 'message-request-response-event'
+  // zrdt: a placeholder for records our store is missing (APP.md §6, §7)
+  | 'zrdt-gap';
 
 // Note: when adding a property that is likely to be set across many messages,
 //   consider adding a database column as well and updating `MESSAGE_COLUMNS`
@@ -330,6 +338,19 @@ export type MessageAttributesType = {
   // Should only be present for messages deleted for everyone
   deletedForEveryoneSendStatus?: Record<string, boolean>;
   deletedForEveryoneFailed?: boolean;
+
+  // zrdt (APP.md §4, §6; ts/types/Zrdt.std.ts). `zrdt` and `zrdtOpening` hold
+  // plaintext and are 'erase' in messageAttributesEraseBehavior.
+  // The frozen send, outgoing messages only.
+  zrdt?: ZrdtSendAttributesType;
+  // base64(nonce ‖ DataMessage bytes without fields 15 and 200)
+  zrdtOpening?: string;
+  // hex digest of this message's record; indexed (messages_zrdtDigest)
+  zrdtDigest?: string;
+  zrdtProvenance?: ZrdtProvenanceAttributesType;
+  zrdtStatus?: ZrdtStatusAttributesType;
+  // Only on type 'zrdt-gap'
+  zrdtGap?: ZrdtGapAttributesType;
 };
 
 export type ReadonlyMessageAttributesType = ReadonlyDeep<MessageAttributesType>;
