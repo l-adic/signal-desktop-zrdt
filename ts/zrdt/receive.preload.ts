@@ -605,13 +605,28 @@ export async function acceptRelayedRecord({
     log.warn(`relay: record refused: ${outcome.status}`);
     return;
   }
-  await onRelayAccepted({
-    conversationId,
-    digest: outcome.digest,
-    record: outcome.record,
-    responderAci,
-    opening: usedOpening,
-  });
+  // The store is up to date now; the timeline work runs outside the
+  // MessageReceiver queue (like onMessageReceived, it must not wait on the
+  // conversation queue).
+  drop(
+    safely('onRelayAccepted', () =>
+      onRelayAccepted({
+        conversationId,
+        digest: outcome.digest,
+        record: outcome.record,
+        responderAci,
+        opening: usedOpening,
+      })
+    )
+  );
+}
+
+async function safely(what: string, fn: () => Promise<void>): Promise<void> {
+  try {
+    await fn();
+  } catch (error) {
+    log.error(`${what} failed`, Errors.toLogFormat(error));
+  }
 }
 
 // A relayed record that was pending got drained by the service (without the
