@@ -182,7 +182,10 @@ export async function setUp({
     updates2Path: path.join(REPO, 'ts', 'test-mock', 'updates-data'),
   });
   server.verbose = verbose;
-  await server.listen(0);
+  // Loopback only: the desktops connect to https://localhost:PORT, and on all
+  // interfaces macOS's firewall would ask about node and the venue's network
+  // could reach the mock server.
+  await server.listen(0, '127.0.0.1');
   say(`EvilServer listening on port ${server.address().port}`);
 
   const member = (name: MemberName, display: string): Member => ({

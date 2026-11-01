@@ -10,7 +10,8 @@ Everything here runs from the repository root with Node 24 and `tsx`. Build
 ## Quick start
 
 ```sh
-git clone --recurse-submodules <this repo> && cd signal-desktop-zrdt
+git clone --recurse-submodules -b zrdt https://github.com/l-adic/signal-desktop-zrdt.git
+cd signal-desktop-zrdt
 make install    # zrdtd (Lean), node_modules, Electron, generated files
 make run        # the live demo
 ```
@@ -24,8 +25,12 @@ mock server, sends the warm-up messages to group "Camping", and opens the
 villain's control panel in the browser (default http://127.0.0.1:7357/);
 then follow [DEMO.md](DEMO.md). Ctrl-C closes everything. Other targets:
 `make smoke` (the go/no-go test, exit 0 only if every check passes),
-`make stop`, `make proofs` (the Lean proofs in `zrdt/`), `make comparator`,
-`make kit` (the MacBook demo kit), `make help`.
+`make stop`, `make proofs` (the Lean proofs in `zrdt/`: heavy, the Mathlib
+cache and a build of about 5 minutes on 32 cores, about 9 GB of disk; best
+on Linux; not needed for `make run`), `make comparator` (Linux only,
+memory-heavy: see `zrdt/README.md`, "Running Comparator"), `make kit` (the
+MacBook demo kit), `make help`. `make run` leaves nothing in `$TMPDIR`: the
+desktop profiles are removed after Ctrl-C or `make stop` too.
 
 | File         | What it does                                                                                                                                                       |
 | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
