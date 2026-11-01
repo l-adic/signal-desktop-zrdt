@@ -41,8 +41,15 @@ export const SmartZrdtConversationBanners = memo(
       (state: StateType) => state.zrdt.byConversation[conversationId]
     );
     const conversationSelector = useSelector(getConversationSelector);
-    const { keepWhatVerifies, dismissSalvageReport, dismissOwnNameAlarm } =
-      useZrdtActions();
+    const {
+      keepWhatVerifies,
+      dismissSalvageReport,
+      dismissOwnNameAlarm,
+      restartBackend,
+    } = useZrdtActions();
+    const onRestart = useCallback(() => {
+      void restartBackend();
+    }, [restartBackend]);
     const { changeLocation } = useNavActions();
 
     const onKeepWhatVerifies = useCallback(() => {
@@ -120,7 +127,12 @@ export const SmartZrdtConversationBanners = memo(
     }
     return (
       <div className="ZrdtBanners" data-testid="zrdt-banners">
-        {unavailable && <ZrdtUnavailableBanner detail={unavailableDetail} />}
+        {unavailable && (
+          <ZrdtUnavailableBanner
+            detail={unavailableDetail}
+            onRetry={onRestart}
+          />
+        )}
         {rejected != null && (
           <ZrdtRejectedBanner
             reason={rejected.reason}

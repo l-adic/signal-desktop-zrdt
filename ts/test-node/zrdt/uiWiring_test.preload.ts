@@ -181,7 +181,8 @@ describe('zrdt UI wiring', () => {
       );
       const upgraded = {
         ...base,
-        zrdtProvenance: { kind: 'live' as const, arrivedIndirectly: true },
+        zrdtProvenance: { kind: 'live' as const },
+        zrdtStatus: { kind: 'confirmedByAuthor' as const, wasRelayed: true },
       };
       assert.strictEqual(
         label(upgraded, { [D1]: { kind: 'confirmedByAuthor' } }),
@@ -293,6 +294,22 @@ describe('zrdt UI wiring', () => {
       assert.deepEqual(store.getState().zrdt.compare?.outcome, {
         kind: 'invalid-code',
         error: 'not-a-compare-code',
+      });
+    });
+
+    it('T2 "still-missing" turns an asking compare into "Asked; no answer."', async () => {
+      const store = setup([D1], [D1]);
+      await runZrdtThunk(actions.openCompare('camping'), store);
+      await runZrdtThunk(actions.comparePasted(codeFor(BOB, [D2])), store);
+      runZrdtThunk(actions.onResendStillMissing('other-chat', [D2]), store);
+      assert.strictEqual(
+        store.getState().zrdt.compare?.outcome?.kind,
+        'you-are-behind'
+      );
+      runZrdtThunk(actions.onResendStillMissing('camping', [D2]), store);
+      assert.deepEqual(store.getState().zrdt.compare?.outcome, {
+        kind: 'withheld',
+        missing: [D2],
       });
     });
 

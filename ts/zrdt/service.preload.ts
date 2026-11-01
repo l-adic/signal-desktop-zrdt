@@ -158,3 +158,28 @@ export const zrdtService: ZrdtServiceType = {
   importBlob: async () => notYet(),
   salvageBlob: async () => notYet(),
 };
+
+// T0's extras (same names as lane T0's module).
+
+/** The OPEN outcome of a conversation rejected at start, if any. */
+export function rejectionOf(
+  _conversationId: string
+): ZrdtOpenOutcome | undefined {
+  return undefined;
+}
+
+/** Start a new backend after zrdtd exited, and re-OPEN every chat. */
+export async function restartZrdt(): Promise<void> {
+  notYet();
+}
+
+/** "Keep what verifies" from the conversation's own rows. */
+export async function salvageStored(_conversationId: string): Promise<
+  | {
+      dropped: Array<Uint8Array<ArrayBuffer>>;
+      missing: Array<Uint8Array<ArrayBuffer>>;
+    }
+  | ZrdtOpenOutcome
+> {
+  notYet();
+}

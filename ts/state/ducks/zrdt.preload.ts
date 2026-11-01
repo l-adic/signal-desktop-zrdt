@@ -31,7 +31,13 @@ import type {
   ZrdtOpenOutcome,
   ZrdtStatus,
 } from '../../zrdt/service.preload.ts';
-import { zrdtEvents, zrdtService } from '../../zrdt/service.preload.ts';
+import {
+  rejectionOf,
+  restartZrdt,
+  salvageStored,
+  zrdtEvents,
+  zrdtService,
+} from '../../zrdt/service.preload.ts';
 import { requestMissing } from '../../zrdt/resend.preload.ts';
 import { drop } from '../../util/drop.std.ts';
 import type { ZrdtRejectReason } from '../../zrdt/ui/labels.std.ts';
@@ -277,6 +283,31 @@ function getGroupChatId(
   return Bytes.toHex(Bytes.fromBase64(conversation.groupId));
 }
 
+/**
+ * A conversation whose rows did not OPEN at start: the service emitted
+ * 'rejected' possibly before the UI listened, so ask it (T0's rejectionOf).
+ */
+function checkStartupRejection(conversationId: string): ZrdtThunk {
+  return (dispatch, getState) => {
+    const current = getState().zrdt.byConversation[conversationId];
+    if (current?.rejected?.source === 'import') {
+      return;
+    }
+    let outcome: ZrdtOpenOutcome | undefined;
+    try {
+      outcome = rejectionOf(conversationId);
+    } catch (error) {
+      log.warn('rejectionOf failed', Errors.toLogFormat(error));
+      return;
+    }
+    if (outcome != null) {
+      dispatch(markRejected(conversationId, outcome, 'startup'));
+    } else if (current?.rejected?.source === 'startup') {
+      dispatch(patchConversation(conversationId, {}, ['rejected']));
+    }
+  };
+}
+
 /** Re-reads CLASSIFY, the disown set and the unconfirmed section. */
 function refreshConversation(conversationId: string): ZrdtThunk<Promise<void>> {
   return async dispatch => {
@@ -314,6 +345,7 @@ function refreshConversation(conversationId: string): ZrdtThunk<Promise<void>> {
           unconfirmed,
         })
       );
+      dispatch(checkStartupRejection(conversationId));
     } catch (error) {
       log.warn(
         `refreshConversation(${conversationId}) failed`,
@@ -397,13 +429,7 @@ function keepWhatVerifies(conversationId: string): ZrdtThunk<Promise<void>> {
   return async dispatch => {
     const blob = failedImportBlobs.get(conversationId);
     if (blob == null) {
-      // TODO(zrdt T0): startup rejection (OPEN of the SQL rows failed) needs a
-      // service op that salvages the stored rows; the contract has none yet.
-      dispatch(
-        setInternalResult(
-          'Keep what verifies: no failed import to salvage (startup salvage is not wired yet)'
-        )
-      );
+      await dispatch(keepWhatVerifiesStored(conversationId));
       return;
     }
     dispatch(patchConversation(conversationId, { busy: true }));
@@ -434,6 +460,52 @@ function keepWhatVerifies(conversationId: string): ZrdtThunk<Promise<void>> {
       log.error('keepWhatVerifies failed', Errors.toLogFormat(error));
       dispatch(patchConversation(conversationId, {}, ['busy']));
       dispatch(setInternalResult(`Salvage failed: ${errorText(error)}`));
+    }
+  };
+}
+
+/** "Keep what verifies" after a startup rejection: SALVAGE the own rows. */
+function keepWhatVerifiesStored(
+  conversationId: string
+): ZrdtThunk<Promise<void>> {
+  return async dispatch => {
+    dispatch(patchConversation(conversationId, { busy: true }));
+    try {
+      const before = (await DataReader.getZrdtRecords(conversationId)).length;
+      const result = await salvageStored(conversationId);
+      if ('status' in result) {
+        dispatch(markRejected(conversationId, result, 'startup'));
+        dispatch(patchConversation(conversationId, {}, ['busy']));
+        return;
+      }
+      const dropped = result.dropped.map(zrdtHex);
+      const kept = Math.max(0, before - dropped.length);
+      dispatch(
+        patchConversation(conversationId, { salvage: { kept, dropped } }, [
+          'rejected',
+          'busy',
+        ])
+      );
+      dispatch(
+        setInternalResult(`Salvage: kept ${kept}, dropped ${dropped.length}`)
+      );
+      await dispatch(refreshConversation(conversationId));
+    } catch (error) {
+      log.error('keepWhatVerifiesStored failed', Errors.toLogFormat(error));
+      dispatch(patchConversation(conversationId, {}, ['busy']));
+      dispatch(setInternalResult(`Salvage failed: ${errorText(error)}`));
+    }
+  };
+}
+
+/** The unavailable banner's "Restart" (T0's restartZrdt). */
+function restartBackend(): ZrdtThunk<Promise<void>> {
+  return async dispatch => {
+    try {
+      await restartZrdt();
+    } catch (error) {
+      log.error('restartZrdt failed', Errors.toLogFormat(error));
+      dispatch(setInternalResult(`Restart failed: ${errorText(error)}`));
     }
   };
 }
@@ -720,6 +792,35 @@ function askCompare(): ZrdtThunk<Promise<void>> {
   };
 }
 
+/** T2 gave up on some digests: an open compare that asked for them says so. */
+function onResendStillMissing(
+  conversationId: string,
+  digests: ReadonlyArray<string>
+): ZrdtThunk {
+  return (dispatch, getState) => {
+    const compare = getState().zrdt.compare;
+    const outcome = compare?.outcome;
+    if (
+      compare?.conversationId !== conversationId ||
+      outcome?.kind !== 'you-are-behind'
+    ) {
+      return;
+    }
+    const given = new Set(digests.map(d => d.toLowerCase()));
+    if (!outcome.missing.some(d => given.has(d))) {
+      return;
+    }
+    clearCompareTimer();
+    dispatch({
+      type: SET_COMPARE,
+      payload: {
+        ...compare,
+        outcome: { kind: 'withheld', missing: [...outcome.missing] },
+      },
+    });
+  };
+}
+
 /** Called on every 'accepted' event: an open compare re-checks its outcome. */
 function onAccepted(conversationId: string): ZrdtThunk<Promise<void>> {
   return async (dispatch, getState) => {
@@ -743,6 +844,7 @@ export const actions = {
   dismissOwnNameAlarm,
   markRejected,
   keepWhatVerifies,
+  restartBackend,
   dismissSalvageReport,
   exportConversation,
   importConversation,
@@ -752,6 +854,7 @@ export const actions = {
   comparePasted,
   askCompare,
   onAccepted,
+  onResendStillMissing,
 };
 
 export const useZrdtActions = (): BoundActionCreatorsMapObject<
@@ -871,6 +974,21 @@ export function initZrdtRedux(store: Store<RootStateType>): void {
       scheduleRefresh(conversationId);
     }
   });
+  // T2's resend scheduler: (conversationId, hexDigests, 'requested' |
+  // 'still-missing'). "still-missing" is the compare screen's "Asked; no
+  // answer." without waiting for our own timeout.
+  zrdtEvents.on(
+    'resendState',
+    (conversationId: unknown, digests: unknown, state: unknown) => {
+      if (
+        typeof conversationId === 'string' &&
+        Array.isArray(digests) &&
+        state === 'still-missing'
+      ) {
+        dispatch(onResendStillMissing(conversationId, digests.map(String)));
+      }
+    }
+  );
   zrdtEvents.on(
     'rejected',
     (conversationId: unknown, outcome?: ZrdtOpenOutcome) => {

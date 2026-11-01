@@ -1152,7 +1152,8 @@ export function getZrdtMessageProps(
       status,
       provenance,
       authorAci,
-      arrivedIndirectly: attr?.arrivedIndirectly === true,
+      // zrdtStatus.wasRelayed is the label's `arrivedIndirectly`.
+      arrivedIndirectly: stored?.wasRelayed === true,
       nameOf,
     });
   } else if (provenance.kind === 'relayed') {
