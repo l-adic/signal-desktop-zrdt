@@ -249,10 +249,14 @@
   color: #ffffff;
 }
 
+// Top centre: the title-bar strip is empty in Signal, so the badge never
+// covers the composer's send button (bottom right) or the nav (left).
 .ZrdtBackendBadge__floating {
   position: fixed;
-  inset-block-end: 6px;
-  inset-inline-end: 8px;
+  inset-block-start: 4px;
+  inset-inline: 0;
+  width: fit-content;
+  margin-inline: auto;
   z-index: 10000;
   pointer-events: none;
   opacity: 0.9;
