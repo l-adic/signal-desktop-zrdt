@@ -501,7 +501,7 @@ export class StubStore {
  * wakes the records waiting for it). Records go in only through
  * `store.accept`. Returns the records that were not accepted.
  */
-export function acceptAll(
+function acceptAll(
   store: StubStore,
   records: ReadonlyArray<StubRecord>
 ): Array<StubRecord> {
@@ -556,7 +556,7 @@ const BLOB_MAGIC = ascii('zrdtS2');
 const BLOB_HEADER_BYTES = BLOB_MAGIC.length + GROUP_ID_BYTES + 4;
 
 /** `"zrdtS2" ‖ group(32) ‖ u32 count ‖ (u32 len ‖ record)*`, sorted by digest. */
-export function encodeBlob(store: StubStore): Bytes {
+function encodeBlob(store: StubStore): Bytes {
   const entries = store.entries();
   const parts: Array<Bytes> = [BLOB_MAGIC, store.group, u32(entries.length)];
   for (const { encoded } of entries) {
@@ -736,7 +736,7 @@ function hasConcurrent(
  * count: a record is live if any fact for it says so, and its disown list
  * is the union of the disown lists of its live facts.
  */
-export function classifyStore(
+function classifyStore(
   store: StubStore,
   facts: ReadonlyArray<ProvenanceFact>
 ): Array<RecordStatus> {
