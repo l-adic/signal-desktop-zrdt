@@ -24,6 +24,7 @@ import type { IPCResponse as ChallengeResponseType } from './challenge.dom.ts';
 import type { MessageAttributesType } from './model-types.d.ts';
 import type { SocketStatuses } from './textsecure/SocketManager.preload.ts';
 import type { RestoreResponseType } from './textsecure/WebAPI.preload.ts';
+import type { ZrdtCIHooks } from './zrdt/ci.preload.ts';
 import { runStorageServiceSyncJob } from './services/storage.preload.ts';
 import { storageJobQueue } from './util/JobQueue.std.ts';
 import { drop } from './util/drop.std.ts';
@@ -70,6 +71,8 @@ export type CIType = {
   fetchManifestForPrimary: () => void;
   pauseStorageService: () => Promise<void>;
   resumeStorageService: () => void;
+  // zrdt test hooks, set by installZrdtCIHooks (ts/zrdt/ci.preload.ts)
+  zrdt?: ZrdtCIHooks;
 };
 
 export type GetCIOptionsType = Readonly<{

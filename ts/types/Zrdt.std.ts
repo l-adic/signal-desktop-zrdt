@@ -117,7 +117,9 @@ export type ZrdtStatusAttributesType = Readonly<{
   kind: ZrdtStatusKind;
   heldByAci?: AciString; // with 'heldBy'
   // True if the message arrived relayed before its author confirmed it; the UI
-  // then shows "confirmed by <author>" instead of a plain message.
+  // then shows "confirmed by <author>" instead of a plain message. This is
+  // chooseProvenanceLabel's `arrivedIndirectly` (ts/zrdt/ui/labels.std.ts);
+  // the receive path keeps it across CLASSIFY refreshes and live upgrades.
   wasRelayed?: boolean;
 }>;
 

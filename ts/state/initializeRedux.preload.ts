@@ -5,6 +5,8 @@ import { bindActionCreators } from 'redux';
 import { actionCreators } from './actions.preload.ts';
 import { createStore } from './createStore.preload.ts';
 import { getInitialState } from './getInitialState.preload.ts';
+import { initZrdtRedux } from './ducks/zrdt.preload.ts';
+import { installZrdtCIHooks } from '../zrdt/ci.preload.ts';
 
 import type { BadgesStateType } from './ducks/badges.preload.ts';
 import type { CallHistoryDetails } from '../types/CallDisposition.std.ts';
@@ -116,5 +118,10 @@ export function initializeRedux(data: ReduxInitData): void {
     updates: bindActionCreators(actionCreators.updates, store.dispatch),
     user: bindActionCreators(actionCreators.user, store.dispatch),
     username: bindActionCreators(actionCreators.username, store.dispatch),
+    zrdt: bindActionCreators(actionCreators.zrdt, store.dispatch),
   };
+
+  // zrdt: mirror the service's events into the zrdt slice; CI test hooks.
+  initZrdtRedux(store);
+  installZrdtCIHooks();
 }

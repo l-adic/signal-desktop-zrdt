@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 
 import type { ReactElement } from 'react';
-import { useCallback, useEffect, useId, useState } from 'react';
+import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import type { ZrdtDigestHex } from './words.std.ts';
 import {
   ASK_AGAIN,
@@ -15,7 +15,7 @@ import {
   withheldText,
   youAreBehindText,
 } from './labels.std.ts';
-import { copyToClipboard } from './clipboard.std.ts';
+import { copyToClipboard } from './clipboard.dom.ts';
 
 /**
  * What the parent tells the modal after it parsed the pasted code, asked the
@@ -137,6 +137,12 @@ export function ZrdtCompareModal(props: ZrdtCompareModalProps): ReactElement {
   const pasteId = useId();
   const [pasted, setPasted] = useState('');
   const [copied, setCopied] = useState(false);
+  const pasteRef = useRef<HTMLTextAreaElement | null>(null);
+
+  // The paste box has focus on open, so Cmd+V works at once (beats 1, 3).
+  useEffect(() => {
+    pasteRef.current?.focus();
+  }, []);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -205,6 +211,7 @@ export function ZrdtCompareModal(props: ZrdtCompareModalProps): ReactElement {
           </label>
           <textarea
             id={pasteId}
+            ref={pasteRef}
             className="ZrdtCompare__code"
             value={pasted}
             rows={3}

@@ -105,6 +105,9 @@ const getTimelineItem = (
     defaultConversationColor,
     hasMediaBackups,
     getStoryReplyAttachment,
+    zrdtStatuses: message.zrdtDigest
+      ? state.zrdt.byConversation[message.conversationId]?.statuses
+      : undefined,
   });
 };
 

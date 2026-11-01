@@ -5,7 +5,7 @@ import type { ReactElement } from 'react';
 import { useCallback, useState } from 'react';
 import type { ZrdtDigestHex } from './words.std.ts';
 import { DEFAULT_WORD_COUNT, digestToWords, formatTag } from './words.std.ts';
-import { copyToClipboard } from './clipboard.std.ts';
+import { copyToClipboard } from './clipboard.dom.ts';
 
 export type ZrdtCodeDetailProps = Readonly<{
   digest: ZrdtDigestHex;

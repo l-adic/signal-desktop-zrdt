@@ -18,6 +18,7 @@ import { CallingNotification } from './CallingNotification.dom.tsx';
 import { ChatSessionRefreshedNotification } from './ChatSessionRefreshedNotification.dom.tsx';
 import type { PropsDataType as DeliveryIssueProps } from './DeliveryIssueNotification.dom.tsx';
 import { DeliveryIssueNotification } from './DeliveryIssueNotification.dom.tsx';
+import type { ZrdtGapStateType } from '../../types/Zrdt.std.ts';
 import type { PropsData as ChangeNumberNotificationProps } from './ChangeNumberNotification.dom.tsx';
 import { ChangeNumberNotification } from './ChangeNumberNotification.dom.tsx';
 import type { PropsData as JoinedSignalNotificationProps } from './JoinedSignalNotification.dom.tsx';
@@ -91,6 +92,19 @@ type CollapseSetType = {
 type DeliveryIssueType = {
   type: 'deliveryIssue';
   data: DeliveryIssueProps;
+};
+// zrdt: a `zrdt-gap` row (APP.md §6, §7), rendered by `renderZrdtGap`.
+export type ZrdtGapItemDataType = Readonly<{
+  conversationId: string;
+  state: ZrdtGapStateType;
+  missingDigests: ReadonlyArray<string>;
+  replierName: string;
+  referencedByAci?: string;
+  authorName?: string;
+}>;
+type ZrdtGapType = {
+  type: 'zrdtGap';
+  data: ZrdtGapItemDataType;
 };
 type MessageType = {
   type: 'message';
@@ -184,6 +198,7 @@ export type TimelineItemType = (
   | CollapseSetType
   | ConversationMergeNotificationType
   | DeliveryIssueType
+  | ZrdtGapType
   | GroupNotificationType
   | GroupV1MigrationType
   | GroupV2ChangeType
@@ -243,6 +258,7 @@ type PropsLocalType = {
   renderContact: SmartContactRendererType<JSX.Element>;
   renderUniversalTimerNotification: () => JSX.Element;
   renderItem: (props: RenderItemProps) => JSX.Element;
+  renderZrdtGap?: (data: ZrdtGapItemDataType) => JSX.Element;
   i18n: LocalizerType;
   targetedMessage: TargetedMessageType | null;
   theme: ThemeType;
@@ -291,6 +307,7 @@ export const TimelineItem = memo(function TimelineItem({
   returnToActiveCall,
   renderContact,
   renderItem,
+  renderZrdtGap,
   scrollToPinnedMessage,
   scrollToPollMessage,
   targetMessage,
@@ -315,6 +332,11 @@ export const TimelineItem = memo(function TimelineItem({
   }
 
   let itemContents: ReactNode;
+  if (item.type === 'message' && item.data.zrdtHidden) {
+    // zrdt: imported and not yet confirmed by any member; shown only in the
+    // collapsed "not yet confirmed" section (APP.md §7).
+    return <div className="TimelineItem--zrdt-hidden" />;
+  }
   if (item.type === 'message') {
     itemContents = (
       <TimelineMessage
@@ -378,6 +400,8 @@ export const TimelineItem = memo(function TimelineItem({
       notification = (
         <ChatSessionRefreshedNotification {...reducedProps} i18n={i18n} />
       );
+    } else if (item.type === 'zrdtGap') {
+      notification = renderZrdtGap ? renderZrdtGap(item.data) : null;
     } else if (item.type === 'deliveryIssue') {
       notification = (
         <DeliveryIssueNotification

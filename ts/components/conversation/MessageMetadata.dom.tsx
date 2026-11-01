@@ -21,6 +21,9 @@ import { SizeObserver } from '../../hooks/useSizeObserver.dom.tsx';
 import { AxoSymbol } from '../../axo/AxoSymbol.dom.tsx';
 import { tw } from '../../axo/tw.dom.tsx';
 import { AxoConfirmDialog } from '../../axo/AxoConfirmDialog.dom.tsx';
+import type { ZrdtLabel } from '../../zrdt/ui/labels.std.ts';
+import { ZrdtMessageCode } from '../../zrdt/ui/ZrdtMessageCode.dom.tsx';
+import { ZrdtProvenanceLabel } from '../../zrdt/ui/ZrdtProvenanceLabel.dom.tsx';
 
 type PropsType = {
   canRetryDeleteForEveryone: boolean;
@@ -47,6 +50,9 @@ type PropsType = {
   status?: MessageStatusType;
   textPending?: boolean;
   timestamp: number;
+  // zrdt (APP.md §7): the 4-char code and the provenance label.
+  zrdtDigest?: string;
+  zrdtLabel?: ZrdtLabel | null;
 };
 
 enum ConfirmationType {
@@ -101,6 +107,8 @@ export const MessageMetadata = forwardRef<HTMLDivElement, Readonly<PropsType>>(
       status,
       textPending,
       timestamp,
+      zrdtDigest,
+      zrdtLabel,
     },
     ref
   ) {
@@ -280,6 +288,8 @@ export const MessageMetadata = forwardRef<HTMLDivElement, Readonly<PropsType>>(
             {i18n('icu:MessageMetadata__edited')}
           </button>
         )}
+        {zrdtLabel != null && <ZrdtProvenanceLabel label={zrdtLabel} />}
+        {zrdtDigest != null && <ZrdtMessageCode digest={zrdtDigest} />}
         {timestampNode}
         {isSMS ? (
           <div className="module-message__metadata__sms">

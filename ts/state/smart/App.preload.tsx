@@ -25,6 +25,7 @@ import { SmartInstallScreen } from './InstallScreen.preload.tsx';
 import { getApp } from '../selectors/app.std.ts';
 import { SmartFunProvider } from './FunProvider.preload.tsx';
 import { SmartStandaloneRegistration } from './StandaloneRegistration.preload.tsx';
+import { SmartZrdtRoot } from './ZrdtRoot.preload.tsx';
 
 function renderInbox(): JSX.Element {
   return <SmartInbox />;
@@ -39,7 +40,13 @@ function renderCallManager(): JSX.Element {
 }
 
 function renderGlobalModalContainer(): JSX.Element {
-  return <SmartGlobalModalContainer />;
+  return (
+    <>
+      <SmartGlobalModalContainer />
+      {/* zrdt: backend badge and compare modal */}
+      <SmartZrdtRoot />
+    </>
+  );
 }
 
 function renderInstallScreen(): JSX.Element {

@@ -186,6 +186,14 @@ import type { TargetedMessageSource } from '../ducks/conversationsEnums.std.ts';
 import { formatEmbeddedContactForUI } from '../../util/sharedContact.std.ts';
 import type { ResolveSharedContactType } from './sharedContact.dom.ts';
 import { getResolveSharedContactSelector } from './sharedContact.dom.ts';
+import type { ZrdtGapItemDataType } from '../../components/conversation/TimelineItem.dom.tsx';
+import type { ZrdtStatus } from '../../zrdt/service.preload.ts';
+import type {
+  ZrdtClassifyStatus,
+  ZrdtLabel,
+  ZrdtProvenance,
+} from '../../zrdt/ui/labels.std.ts';
+import { chooseProvenanceLabel } from '../../zrdt/ui/labels.std.ts';
 
 const { groupBy, isEmpty, isNumber, isObject, map } = lodash;
 
@@ -230,6 +238,9 @@ export type GetPropsForBubbleOptions = Readonly<{
   getStoryReplyAttachment: (
     storyMessageId: string
   ) => AttachmentType | undefined;
+  // zrdt: CLASSIFY statuses of the message's conversation (hex digest ->
+  // status), from the zrdt slice. Falls back to message.zrdtStatus.
+  zrdtStatuses?: ReadonlyDeep<Record<string, ZrdtStatus>>;
 }>;
 
 export function hasErrors(
@@ -830,6 +841,7 @@ export type GetPropsForMessageOptions = Pick<
   | 'defaultConversationColor'
   | 'hasMediaBackups'
   | 'getStoryReplyAttachment'
+  | 'zrdtStatuses'
 >;
 
 function getTextAttachment(
@@ -1084,8 +1096,78 @@ const getPropsForMessage = (
     textDirection: getTextDirection(message.body),
     timestamp: getMessageSentTimestamp(message, { includeEdits: false, log }),
     receivedAtMS: message.received_at_ms,
+    ...getZrdtMessageProps(message, options),
   };
 };
+
+// zrdt (APP.md §7): the metadata tag, the provenance label and whether the
+// message sits in the "not yet confirmed" section instead of the timeline.
+export function getZrdtMessageProps(
+  message: Pick<
+    MessageWithUIFieldsType,
+    'type' | 'sourceServiceId' | 'zrdtDigest' | 'zrdtStatus' | 'zrdtProvenance'
+  >,
+  {
+    conversationSelector,
+    ourAci,
+    zrdtStatuses,
+  }: Pick<
+    GetPropsForBubbleOptions,
+    'conversationSelector' | 'ourAci' | 'zrdtStatuses'
+  >
+): {
+  zrdtDigest?: string;
+  zrdtLabel?: ZrdtLabel | null;
+  zrdtHidden?: boolean;
+} {
+  const digest = message.zrdtDigest;
+  if (digest == null) {
+    return {};
+  }
+  const nameOf = (aci: string): string => {
+    const contact = conversationSelector(aci);
+    return contact.firstName || contact.title;
+  };
+  const stored = message.zrdtStatus;
+  let status: ZrdtClassifyStatus | undefined = zrdtStatuses?.[digest];
+  if (status == null && stored != null) {
+    status =
+      stored.kind === 'heldBy'
+        ? { kind: 'heldBy', aci: stored.heldByAci ?? '' }
+        : { kind: stored.kind };
+  }
+  const attr = message.zrdtProvenance;
+  let provenance: ZrdtProvenance;
+  if (attr?.kind === 'relayed') {
+    provenance = { kind: 'relayed', byAci: attr.byAci ?? '' };
+  } else if (attr?.kind === 'imported') {
+    provenance = { kind: 'imported' };
+  } else {
+    provenance = { kind: 'live' };
+  }
+  const authorAci = getSourceServiceId(message, ourAci) ?? '';
+  let zrdtLabel: ZrdtLabel | null;
+  if (status != null) {
+    zrdtLabel = chooseProvenanceLabel({
+      status,
+      provenance,
+      authorAci,
+      // zrdtStatus.wasRelayed is the label's `arrivedIndirectly`.
+      arrivedIndirectly: stored?.wasRelayed === true,
+      nameOf,
+    });
+  } else if (provenance.kind === 'relayed') {
+    zrdtLabel = { kind: 'relayed', name: nameOf(provenance.byAci) };
+  } else {
+    zrdtLabel = null;
+  }
+  return {
+    zrdtDigest: digest,
+    zrdtLabel,
+    zrdtHidden:
+      provenance.kind === 'imported' && status?.kind === 'unconfirmed',
+  };
+}
 
 // This is getPropsForMessage but wrapped in reselect's createSelector so that
 // we can derive all of the selector dependencies that getPropsForMessage
@@ -1275,6 +1357,13 @@ export function getPropsForBubble(
     return {
       type: 'chatSessionRefreshed',
       data: null,
+      timestamp,
+    };
+  }
+  if (isZrdtGap(message)) {
+    return {
+      type: 'zrdtGap',
+      data: getPropsForZrdtGap(message, options),
       timestamp,
     };
   }
@@ -2081,11 +2170,32 @@ export function isDeliveryIssue(message: MessageWithUIFieldsType): boolean {
   return message.type === 'delivery-issue';
 }
 
-// zrdt gap (APP.md §6, §7). Rendering (getPropsForBubble + TimelineItem) is
-// owned by the UI lane; see ts/types/Zrdt.std.ts for the payload.
+// zrdt gap (APP.md §6, §7); see ts/types/Zrdt.std.ts for the payload.
 
 export function isZrdtGap(message: MessageWithUIFieldsType): boolean {
   return message.type === 'zrdt-gap';
+}
+
+function getPropsForZrdtGap(
+  message: MessageWithUIFieldsType,
+  { conversationSelector }: GetPropsForBubbleOptions
+): ZrdtGapItemDataType {
+  const gap = message.zrdtGap;
+  const nameOf = (aci: string | undefined): string | undefined => {
+    if (aci == null) {
+      return undefined;
+    }
+    const contact = conversationSelector(aci);
+    return contact.firstName || contact.title;
+  };
+  return {
+    conversationId: message.conversationId,
+    state: gap?.state ?? 'waiting',
+    missingDigests: gap?.missingDigests ?? [],
+    replierName: nameOf(gap?.referencedByAci) ?? 'A member',
+    referencedByAci: gap?.referencedByAci,
+    authorName: nameOf(gap?.contentUnavailableAuthorAci),
+  };
 }
 
 function getPropsForDeliveryIssue(

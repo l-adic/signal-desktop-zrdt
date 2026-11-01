@@ -29,6 +29,7 @@ import type { ConversationType } from '../ducks/conversations.preload.ts';
 import { useConversationsActions } from '../ducks/conversations.preload.ts';
 import { useSearchActions } from '../ducks/search.preload.ts';
 import { useStoriesActions } from '../ducks/stories.preload.ts';
+import { useZrdtActions } from '../ducks/zrdt.preload.ts';
 import { getPreferredBadgeSelector } from '../selectors/badges.preload.ts';
 import {
   getActiveCallState,
@@ -279,6 +280,12 @@ export const SmartConversationHeader = memo(function SmartConversationHeader({
     void pushPanelForConversation({ type: PanelType.AllMedia });
   }, [pushPanelForConversation]);
 
+  // zrdt: the compare screen (APP.md §7), groups only.
+  const { openCompare } = useZrdtActions();
+  const onZrdtCompare = useCallback(() => {
+    void openCompare(conversation.id);
+  }, [openCompare, conversation.id]);
+
   const onViewUserStories = useCallback(() => {
     viewUserStories({
       conversationId: conversation.id,
@@ -330,6 +337,7 @@ export const SmartConversationHeader = memo(function SmartConversationHeader({
       onShowMembers={onShowMembers}
       onViewConversationDetails={onViewConversationDetails}
       onViewAllMedia={onViewAllMedia}
+      onZrdtCompare={conversation.type === 'group' ? onZrdtCompare : undefined}
       onViewUserStories={onViewUserStories}
       outgoingCallButtonStyle={outgoingCallButtonStyle}
       theme={theme}
