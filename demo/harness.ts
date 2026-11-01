@@ -83,10 +83,20 @@ export function configureEnv(): string {
     process.env.SIGNAL_MOCK_TESTS_BACKGROUND ??= '1';
   }
   const daemon = process.env.ZRDT_DAEMON ?? defaultDaemonPath();
+  // The demo must run on the verified Lean core: never fall back to the TS stub silently.
+  // Set ZRDT_REQUIRE_LEAN=0 explicitly to run the harness on the stub.
+  process.env.ZRDT_REQUIRE_LEAN ??= '1';
   if (existsSync(daemon)) {
     process.env.ZRDT_DAEMON = daemon;
+  } else if (process.env.ZRDT_REQUIRE_LEAN === '1') {
+    throw new Error(
+      `no zrdtd at ${daemon}: build it with \`cd zrdt/core && lake build\`, ` +
+        'or set ZRDT_REQUIRE_LEAN=0 to run on the stub'
+    );
   } else {
-    say(`no zrdtd at ${daemon}: the fork falls back to its backend default`);
+    say(
+      `no zrdtd at ${daemon}: running on the TypeScript stub (ZRDT_REQUIRE_LEAN=0)`
+    );
   }
   process.env.ZRDT_RESEND_DELAY_MS ??= '4000';
   return (
