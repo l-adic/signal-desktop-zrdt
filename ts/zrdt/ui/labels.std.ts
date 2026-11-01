@@ -84,8 +84,8 @@ export type ChooseLabelInput = Readonly<{
   /**
    * True when this record first arrived relayed or imported, even if its
    * provenance has since been upgraded to live. Then "confirmed by <author>"
-   * is shown instead of no label. (H1: keep zrdt_provenance.byAci, or a
-   * flag, on upgrade so this survives.)
+   * is shown instead of no label. Host side: the message attribute
+   * `zrdtProvenance.arrivedIndirectly` (ts/types/Zrdt.std.ts).
    */
   arrivedIndirectly: boolean;
   nameOf: (aci: string) => string;

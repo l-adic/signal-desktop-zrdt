@@ -37,6 +37,7 @@ import { actions as toast } from './ducks/toast.preload.ts';
 import { actions as updates } from './ducks/updates.preload.ts';
 import { actions as user } from './ducks/user.preload.ts';
 import { actions as username } from './ducks/username.preload.ts';
+import { actions as zrdt } from './ducks/zrdt.preload.ts';
 import type { ReduxActions } from './types.std.ts';
 
 export const actionCreators: ReduxActions = {
@@ -76,4 +77,5 @@ export const actionCreators: ReduxActions = {
   updates,
   user,
   username,
+  zrdt,
 };

@@ -414,6 +414,8 @@ type PropsFunctionType = {
   saveAccountKeysPDF: () => Promise<void>;
   forceKeyTransparencyCheck: () => Promise<void>;
   keyTransparencySelfHealth: StorageAccessType['keyTransparencySelfHealth'];
+  // zrdt: export / import / salvage section of Settings → Internal
+  renderZrdtInternal?: () => JSX.Element;
 
   // Localization
   i18n: LocalizerType;
@@ -677,6 +679,7 @@ export function Preferences({
   saveAccountKeysPDF,
   forceKeyTransparencyCheck,
   keyTransparencySelfHealth,
+  renderZrdtInternal,
   weArePrimaryDevice,
 }: PropsType): JSX.Element {
   const languageId = useId();
@@ -2708,6 +2711,7 @@ export function Preferences({
             setSfuUrl={setSfuUrl}
             forceKeyTransparencyCheck={forceKeyTransparencyCheck}
             keyTransparencySelfHealth={keyTransparencySelfHealth}
+            renderZrdtInternal={renderZrdtInternal}
           />
         }
         contentsRef={settingsPaneRef}

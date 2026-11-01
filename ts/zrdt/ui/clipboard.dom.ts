@@ -4,7 +4,7 @@
 /** Default copy action for zrdt components when the parent passes no onCopy. */
 export async function copyToClipboard(text: string): Promise<void> {
   try {
-    await navigator.clipboard.writeText(text);
+    await window.navigator.clipboard.writeText(text);
   } catch (error) {
     // The renderer may lack clipboard permission; the code stays selectable.
     // oxlint-disable-next-line no-console

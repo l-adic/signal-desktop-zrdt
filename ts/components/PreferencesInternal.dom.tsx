@@ -74,6 +74,7 @@ export function PreferencesInternal({
   setSfuUrl,
   forceKeyTransparencyCheck,
   keyTransparencySelfHealth,
+  renderZrdtInternal,
 }: {
   i18n: LocalizerType;
   validateBackup: () => Promise<BackupValidationResultType>;
@@ -121,6 +122,7 @@ export function PreferencesInternal({
   setSfuUrl: (value: string | undefined) => void;
   forceKeyTransparencyCheck: () => Promise<void>;
   keyTransparencySelfHealth: StorageAccessType['keyTransparencySelfHealth'];
+  renderZrdtInternal?: () => JSX.Element;
 }): JSX.Element {
   const [messageCountBySchemaVersion, setMessageCountBySchemaVersion] =
     useState<MessageCountBySchemaVersionType>();
@@ -385,6 +387,7 @@ export function PreferencesInternal({
 
   return (
     <div className="Preferences--internal">
+      {renderZrdtInternal?.()}
       <SettingsRow title={i18n('icu:Preferences__button--backups')}>
         <FlowingSettingsControl>
           <div className="Preferences__two-thirds-flow">

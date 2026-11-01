@@ -33,6 +33,7 @@ import { Avatar, AvatarSize } from '../Avatar.dom.tsx';
 import { AvatarSpacer } from '../AvatarSpacer.dom.tsx';
 import { MessageBodyReadMore } from './MessageBodyReadMore.dom.tsx';
 import { MessageMetadata } from './MessageMetadata.dom.tsx';
+import type { ZrdtLabel } from '../../zrdt/ui/labels.std.ts';
 import { MessageTextMetadataSpacer } from './MessageTextMetadataSpacer.dom.tsx';
 import { ImageGrid } from './ImageGrid.dom.tsx';
 import { GIF } from './GIF.dom.tsx';
@@ -211,6 +212,11 @@ function ReactionEmoji(props: { emoji: Emoji.Variant }) {
 
 export type PropsData = {
   id: string;
+  // zrdt (APP.md §7): hex digest for the metadata tag; provenance label.
+  zrdtDigest?: string;
+  zrdtLabel?: ZrdtLabel | null;
+  // Imported and unconfirmed: rendered only in the collapsed section.
+  zrdtHidden?: boolean;
   renderingContext: RenderingContextType;
   contactNameColor?: ContactNameColorType;
   contactLabel?: MemberLabelType;
@@ -1049,12 +1055,16 @@ export class Message extends PureComponent<Props, State> {
       text,
       textAttachment,
       timestamp,
+      zrdtDigest,
+      zrdtLabel,
     } = this.props;
 
     const isStickerLike = isSticker || this.#canRenderStickerLikeEmoji();
 
     return (
       <MessageMetadata
+        zrdtDigest={zrdtDigest}
+        zrdtLabel={zrdtLabel}
         canRetryDeleteForEveryone={canRetryDeleteForEveryone}
         deletedForEveryone={deletedForEveryone}
         direction={direction}

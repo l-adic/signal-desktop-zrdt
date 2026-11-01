@@ -100,6 +100,11 @@ export type ZrdtGapAttributesType = Readonly<{
 export type ZrdtProvenanceAttributesType = Readonly<{
   kind: ZrdtProvenanceKind;
   byAci?: AciString;
+  // True if the message first arrived relayed or imported, even after an
+  // upgrade to 'live'. The UI then shows "confirmed by <author>" instead of a
+  // plain message (chooseProvenanceLabel's `arrivedIndirectly`). The receive
+  // path sets it when it upgrades a relayed/imported message to live.
+  arrivedIndirectly?: boolean;
 }>;
 
 // `message.zrdtStatus`: the CLASSIFY result, stored when records are accepted;
@@ -114,9 +119,8 @@ export type ZrdtStatusKind =
 export type ZrdtStatusAttributesType = Readonly<{
   kind: ZrdtStatusKind;
   heldByAci?: AciString; // with 'heldBy'
-  // True if the message arrived relayed before its author confirmed it; the UI
-  // then shows "confirmed by <author>" instead of a plain message.
-  wasRelayed?: boolean;
+  // (The "arrived relayed first" flag lives in zrdtProvenance.arrivedIndirectly;
+  // it is a provenance fact, not a CLASSIFY result.)
 }>;
 
 // --- Timeline placement (APP.md §6, AMENDMENTS A7) ------------------------------

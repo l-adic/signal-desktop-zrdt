@@ -487,3 +487,25 @@
   word-break: break-all;
   user-select: text;
 }
+
+// ---------------------------------------------------------------------------
+// Signal-side wiring (ts/state/smart/Zrdt*.preload.tsx)
+
+// Banner slot under the conversation header.
+.ZrdtBanners {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-block: 4px;
+  padding-inline: 12px;
+}
+
+// Timeline wrapper of a zrdt-gap row.
+.ZrdtGapRow__container {
+  padding-inline: 16px;
+}
+
+// An imported, unconfirmed message: shown only in the collapsed section.
+.TimelineItem--zrdt-hidden {
+  display: none;
+}

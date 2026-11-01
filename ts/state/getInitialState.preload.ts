@@ -41,6 +41,7 @@ import { getEmptyState as toastEmptyState } from './ducks/toast.preload.ts';
 import { getEmptyState as updatesEmptyState } from './ducks/updates.preload.ts';
 import { getEmptyState as userEmptyState } from './ducks/user.preload.ts';
 import { getEmptyState as usernameEmptyState } from './ducks/username.preload.ts';
+import { getEmptyState as zrdtEmptyState } from './ducks/zrdt.preload.ts';
 
 import OS from '../util/os/osMain.node.ts';
 import { makeLookup } from '../util/makeLookup.std.ts';
@@ -184,6 +185,7 @@ function getEmptyState(): StateType {
     updates: updatesEmptyState(),
     user: userEmptyState(),
     username: usernameEmptyState(),
+    zrdt: zrdtEmptyState(),
   };
 }
 

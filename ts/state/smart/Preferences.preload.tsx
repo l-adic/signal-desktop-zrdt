@@ -81,6 +81,7 @@ import { SmartProfileEditor } from './ProfileEditor.preload.tsx';
 import { useNavActions } from '../ducks/nav.std.ts';
 import { NavTab } from '../../types/Nav.std.ts';
 import { renderToastManagerWithoutMegaphone } from './ToastManager.preload.tsx';
+import { renderZrdtInternal } from './ZrdtInternal.preload.tsx';
 import { useToastActions } from '../ducks/toast.preload.ts';
 import { DataReader, DataWriter } from '../../sql/Client.preload.ts';
 import { deleteAllMyStories } from '../../util/deleteAllMyStories.preload.ts';
@@ -1257,6 +1258,7 @@ export function SmartPreferences(): JSX.Element | null {
         forceKeyTransparencyCheck={forceKeyTransparencyCheck}
         saveAccountKeysPDF={saveAccountKeysPDF}
         keyTransparencySelfHealth={items.keyTransparencySelfHealth}
+        renderZrdtInternal={renderZrdtInternal}
         weArePrimaryDevice={weArePrimaryDevice}
       />
     </AppProvider>

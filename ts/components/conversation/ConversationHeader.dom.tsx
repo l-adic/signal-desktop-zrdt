@@ -190,6 +190,8 @@ export type PropsActionsType = {
   onViewAllMedia: () => void;
   onViewConversationDetails: () => void;
   onViewUserStories: () => void;
+  // zrdt: opens the compare screen; undefined hides the button.
+  onZrdtCompare?: () => void;
 
   acknowledgeGroupMemberNameCollisions: AcknowledgeGroupMemberNameCollisions;
   reviewConversationNameCollision: ReviewConversationNameCollission;
@@ -238,6 +240,7 @@ export const ConversationHeader = memo(function ConversationHeader({
   onShowMembers,
   onViewAllMedia,
   onViewConversationDetails,
+  onZrdtCompare,
   onViewUserStories,
   outgoingCallButtonStyle,
   theme,
@@ -397,6 +400,15 @@ export const ConversationHeader = memo(function ConversationHeader({
                   label={isMuted ? i18n('icu:unmute') : i18n('icu:mute')}
                 />
               ) : null}
+              {onZrdtCompare != null && !isSelectMode && (
+                <AxoIconButton.Root
+                  symbol="shield-check"
+                  size="md"
+                  onClick={onZrdtCompare}
+                  label="Compare this chat"
+                  variant="implied-secondary"
+                />
+              )}
               <AxoIconButton.Root
                 symbol="search"
                 size="md"
