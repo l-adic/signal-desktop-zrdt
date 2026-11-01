@@ -41,6 +41,7 @@ const SEND_LOG_WINDOW_MS = 24 * 60 * 60 * 1000;
 
 // zrdtEvents: (conversationId, hexDigests, 'requested' | 'still-missing').
 // The compare screen uses it for "Asked; no answer." (no gap row there).
+/** @knipignore used by the UI lane (T3) */
 export const ZRDT_RESEND_STATE_EVENT = 'resendState';
 
 export const zrdtResendScheduler = new ResendScheduler(
@@ -70,6 +71,7 @@ export const zrdtResendScheduler = new ResendScheduler(
 // The UI's "Ask again" / "Ask for it" (gap row, compare screen). Asks now,
 // 1:1 to `firstAskAci` if given (then the group after the timeout), else the
 // group. Not deduped.
+/** @knipignore shared contract; the UI lane (T3) calls it */
 export async function requestMissing(
   conversationId: string,
   digests: Array<ZrdtBytes>,

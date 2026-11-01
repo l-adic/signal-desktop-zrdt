@@ -64,6 +64,7 @@ export type ZrdtBytes = Uint8Array<ArrayBufferLike>;
 
 // The UI listens for this (conversationId, hexDigest): "Someone linked a
 // message in your name that you did not send."
+/** @knipignore used by the UI lane (T3) */
 export const ZRDT_OWN_NAME_ALARM_EVENT = 'ownNameAlarm';
 
 // --- small helpers ----------------------------------------------------------------
@@ -427,7 +428,7 @@ async function loadGapRows(
   return rows.filter(isNotNil);
 }
 
-export async function findGapsFor(
+async function findGapsFor(
   conversationId: string,
   digest: string
 ): Promise<Array<MessageModel>> {
@@ -796,7 +797,7 @@ async function upgradeShownMessage(
 
 // Step 12: never refuse a record in our name; alarm and disown it. The send
 // path puts the whole disown set (zrdtService.disownSet) on every message.
-export async function raiseOwnNameAlarm(
+async function raiseOwnNameAlarm(
   conversationId: string,
   digest: Uint8Array<ArrayBuffer>
 ): Promise<void> {
@@ -907,7 +908,7 @@ const STATUS_REFRESH_DELAY_MS = 500;
 
 // Debounced: the message being received is saved by a batcher, so wait a
 // little before reading message rows by digest.
-export function scheduleStatusRefresh(conversationId: string): void {
+function scheduleStatusRefresh(conversationId: string): void {
   const existing = refreshTimers.get(conversationId);
   if (existing) {
     clearTimeout(existing);
@@ -923,7 +924,7 @@ export function scheduleStatusRefresh(conversationId: string): void {
 
 // Stores the CLASSIFY result on every message with a digest (the UI renders
 // stored values, APP.md §7).
-export async function refreshStatuses(conversationId: string): Promise<void> {
+async function refreshStatuses(conversationId: string): Promise<void> {
   try {
     const statuses = await zrdtService.classify(conversationId);
     const rows = await DataReader.getMessageIdsByZrdtDigest(conversationId, [
