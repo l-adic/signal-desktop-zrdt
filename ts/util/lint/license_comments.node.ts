@@ -169,13 +169,6 @@ function indent(text: string) {
     .join('\n');
 }
 
-// zrdt fork files may carry 'Copyright <year> zrdt contributors'.
-const ZRDT_FILES = ['ts/zrdt/**', 'demo/**', 'ts/test-*/zrdt/**'];
-
-function isZrdtFile(file: string): boolean {
-  return micromatch.isMatch(path.relative(rootPath, file), ZRDT_FILES);
-}
-
 async function main() {
   const currentYear = new Date().getFullYear();
   const failures: Array<Failure> = [];
@@ -195,13 +188,18 @@ async function main() {
 
     const warnings = [];
 
+    // zrdt fork: files under ts/zrdt, demo/ and ts/test-*/zrdt may carry the
+    // zrdt contributors' copyright line instead.
+    const isZrdtFile =
+      /^(ts\/zrdt|demo|ts\/test-[^/]+\/zrdt)\//.test(
+        path.relative(rootPath, file).split(path.sep).join('/')
+      ) &&
+      firstLine != null &&
+      /Copyright \d{4} zrdt contributors/.test(firstLine);
+
     if (
       firstLine == null ||
-      !(
-        /Copyright \d{4} Signal Messenger, LLC/.test(firstLine) ||
-        (isZrdtFile(file) &&
-          /Copyright \d{4} zrdt contributors/.test(firstLine))
-      )
+      (!isZrdtFile && !/Copyright \d{4} Signal Messenger, LLC/.test(firstLine))
     ) {
       const commit = await getCommitFileWasAdded(file);
       warnings.push(

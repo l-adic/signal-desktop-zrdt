@@ -6,12 +6,13 @@ import { ESLintUtils } from '@typescript-eslint/utils';
 const COMMENT_LINE_1_EXACT = /^ Copyright \d{4} Signal Messenger, LLC$/;
 const COMMENT_LINE_2_EXACT = /^ SPDX-License-Identifier: AGPL-3.0-only$/;
 
-// zrdt fork files (ts/zrdt, demo/, ts/test-*/zrdt) may instead carry
-// 'Copyright <year> zrdt contributors'.
-const ZRDT_COMMENT_LINE_1_EXACT = /^ Copyright \d{4} zrdt contributors$/;
-const ZRDT_PATH = /(^|[\/])(ts[\/]zrdt|demo|ts[\/]test-[^\/]+[\/]zrdt)[\/]/;
-
 const COMMENT_LINE_1_LOOSE = /Copyright (\d{4}) Signal Messenger, LLC/;
+
+// zrdt fork: new files under ts/zrdt, demo/ and ts/test-*/zrdt may carry the
+// zrdt contributors' copyright line instead.
+const ZRDT_COMMENT_LINE_1_EXACT = /^ Copyright \d{4} zrdt contributors$/;
+const ZRDT_PATH =
+  /(^|[\\/])(ts[\\/]zrdt|demo|ts[\\/]test-[^\\/]+[\\/]zrdt)[\\/]/;
 const COMMENT_LINE_2_LOOSE = /SPDX-License-Identifier: AGPL-3.0-only/;
 
 export const enforceLicenseComments = ESLintUtils.RuleCreator.withoutDocs({
@@ -33,10 +34,18 @@ export const enforceLicenseComments = ESLintUtils.RuleCreator.withoutDocs({
         if (
           comment1?.type === 'Line' &&
           comment2?.type === 'Line' &&
-          (COMMENT_LINE_1_EXACT.test(comment1.value) ||
-            (ZRDT_PATH.test(context.filename) &&
-              ZRDT_COMMENT_LINE_1_EXACT.test(comment1.value))) &&
+          COMMENT_LINE_1_EXACT.test(comment1.value) &&
           COMMENT_LINE_2_EXACT.test(comment2.value)
+        ) {
+          return;
+        }
+
+        if (
+          comment1?.type === 'Line' &&
+          comment2?.type === 'Line' &&
+          ZRDT_COMMENT_LINE_1_EXACT.test(comment1.value) &&
+          COMMENT_LINE_2_EXACT.test(comment2.value) &&
+          ZRDT_PATH.test(context.filename)
         ) {
           return;
         }
