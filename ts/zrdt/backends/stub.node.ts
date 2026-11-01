@@ -394,7 +394,7 @@ export function commitWithOpening(
  * 15 or 200, whose commitment under the record's group and author is the
  * record's commit.
  */
-export function opens(record: StubRecord, opening: Bytes): boolean {
+function opens(record: StubRecord, opening: Bytes): boolean {
   if (opening.length < NONCE_BYTES) {
     return false;
   }

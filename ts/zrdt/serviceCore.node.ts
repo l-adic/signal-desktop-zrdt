@@ -243,7 +243,7 @@ export function toHex(bytes: Uint8Array<ArrayBuffer>): string {
 }
 
 /** 16 bytes -> "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx". */
-export function aciBytesToString(bytes: Uint8Array<ArrayBuffer>): string {
+function aciBytesToString(bytes: Uint8Array<ArrayBuffer>): string {
   const h = toHex(bytes);
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
 }
@@ -307,7 +307,7 @@ function provenanceRow(
   };
 }
 
-export class ZrdtServiceError extends Error {
+class ZrdtServiceError extends Error {
   readonly code: 'rejected' | 'unavailable' | 'noGroup' | 'notAccepted';
 
   constructor(code: ZrdtServiceError['code'], message: string) {
@@ -1198,7 +1198,7 @@ export class ZrdtServiceCore implements ZrdtServiceType {
 }
 
 /** Orders rows so that each record comes after the records it links. */
-export function orderParentsFirst(
+function orderParentsFirst(
   rows: ReadonlyArray<ZrdtRecordRowType>
 ): Array<ZrdtRecordRowType> {
   const byHex = new Map(rows.map(row => [toHex(row.digest), row]));

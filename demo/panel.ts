@@ -450,14 +450,18 @@ async function refresh() {
       $('#actions').appendChild(div);
     }
   }
-  $('#rules').innerHTML = '';
+  $('#rules').replaceChildren();
   for (const r of state.rules) {
     const li = document.createElement('li');
     li.textContent = r.id + (r.fired ? ' (fired)' : '');
     if (r.fired) li.className = 'fired';
     $('#rules').appendChild(li);
   }
-  if (state.rules.length === 0) $('#rules').innerHTML = '<li>none: everything passes</li>';
+  if (state.rules.length === 0) {
+    const none = document.createElement('li');
+    none.textContent = 'none: everything passes';
+    $('#rules').appendChild(none);
+  }
   const held = Object.entries(state.held).map(([k, n]) => k + ': ' + n);
   $('#held').textContent = held.length ? 'held: ' + held.join(', ') : '';
   const log = await (await fetch('/log?n=200')).text();

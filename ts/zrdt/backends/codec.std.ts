@@ -91,35 +91,33 @@ export function concatBytes(
   return out;
 }
 
-export function u8(value: number): Bytes {
+function u8(value: number): Bytes {
   return Uint8Array.of(value);
 }
 
-export function u32(value: number): Bytes {
+function u32(value: number): Bytes {
   const out = new Uint8Array(4);
   new DataView(out.buffer).setUint32(0, value, false);
   return out;
 }
 
 /** `bytes`: a u32 length, then the bytes. */
-export function wBytes(bytes: Uint8Array<ArrayBuffer>): Bytes {
+function wBytes(bytes: Uint8Array<ArrayBuffer>): Bytes {
   return concatBytes([u32(bytes.length), bytes]);
 }
 
 /** `str`: UTF-8 text as `bytes`. */
-export function wStr(text: string): Bytes {
+function wStr(text: string): Bytes {
   return wBytes(new TextEncoder().encode(text));
 }
 
 /** `digests`: a u32 count, then the digests. */
-export function wDigests(
-  digests: ReadonlyArray<Uint8Array<ArrayBuffer>>
-): Bytes {
+function wDigests(digests: ReadonlyArray<Uint8Array<ArrayBuffer>>): Bytes {
   return concatBytes([u32(digests.length), ...digests]);
 }
 
 /** `parts`: group ‖ commit ‖ links (`digests`) ‖ author. */
-export function wParts(parts: RecordParts): Bytes {
+function wParts(parts: RecordParts): Bytes {
   return concatBytes([
     parts.group,
     parts.commit,
@@ -178,7 +176,7 @@ function wStatus(status: Status): Bytes {
 class Short extends Error {}
 
 /** Reads fields from a body; throws `Short` when a field is cut short. */
-export class Reader {
+class Reader {
   #offset = 0;
   readonly #bytes: Bytes;
 
@@ -302,7 +300,7 @@ export class Reader {
 }
 
 /** Runs `read` on `bytes`; undefined if a field is cut short or bytes are left. */
-export function readAll<T>(
+function readAll<T>(
   bytes: Uint8Array<ArrayBuffer>,
   read: (r: Reader) => T
 ): T | undefined {
@@ -501,7 +499,7 @@ export type HostError =
   | Code.NO_CHAT
   | Code.CHAT_OPEN;
 
-export function isHostError(code: number): code is HostError {
+function isHostError(code: number): code is HostError {
   return code >= 0x80;
 }
 
