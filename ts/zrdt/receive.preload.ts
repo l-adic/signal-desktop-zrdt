@@ -113,6 +113,14 @@ type PendingRelay = Readonly<{
 }>;
 const pendingRelays = new Map<string, PendingRelay>();
 
+// Disown lists of live messages whose record is pending: applied when the
+// service drains it (TODO(zrdt): in memory only; the author's next message
+// carries the full set again anyway).
+const pendingDisowns = new Map<
+  string,
+  { authorAci: AciString; disown: Array<Uint8Array<ArrayBuffer>> }
+>();
+
 async function getPendingDigests(conversationId: string): Promise<Set<string>> {
   const rows = await DataReader.getZrdtPending(conversationId);
   return new Set(rows.map(row => toHex(row.digest)));
@@ -122,6 +130,15 @@ async function getPendingDigests(conversationId: string): Promise<Set<string>> {
 // records it drains after another accept.
 function onAcceptedEvent(conversationId: string, digest: string): void {
   const key = `${conversationId}:${digest}`;
+  const disown = pendingDisowns.get(key);
+  if (disown) {
+    pendingDisowns.delete(key);
+    drop(
+      safely('recordDisown', () =>
+        recordDisown(conversationId, disown.authorAci, disown.disown)
+      )
+    );
+  }
   const relay = pendingRelays.get(key);
   if (relay) {
     pendingRelays.delete(key);
@@ -246,8 +263,12 @@ export async function zrdtReceiveLive({
       log.info(
         `${logId}: zrdt pending ${digest?.slice(0, 8)}; missing: ${missing.length}`
       );
-      // TODO(zrdt): the disown list of a pending live message is applied
-      // only by the author's next message (every message carries the set).
+      if (digest && meta.disown.length > 0) {
+        pendingDisowns.set(`${conversationId}:${digest}`, {
+          authorAci,
+          disown: meta.disown,
+        });
+      }
       if (missing.length > 0) {
         // Ask the member whose message referenced them, after the delay; a
         // sync transcript of ours goes to the group.
