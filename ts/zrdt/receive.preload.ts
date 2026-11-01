@@ -144,10 +144,11 @@ function getPending(conversationId: string): Map<string, PendingEntry> {
   return map;
 }
 
+// Returns the key the entry is stored under.
 async function addPending(
   entry: PendingEntry,
   outcome: ZrdtAcceptOutcome
-): Promise<void> {
+): Promise<string> {
   const digest = optionalBytes(outcome, 'digest');
   const record = optionalBytes(outcome, 'record');
   const keyed = { ...entry, key: digest ? toHex(digest) : entry.key };
@@ -161,6 +162,7 @@ async function addPending(
       messageId: entry.messageId ?? null,
     });
   }
+  return keyed.key;
 }
 
 // Retry every pending record until no more go in (APP.md §5 step 2).
@@ -376,9 +378,13 @@ export async function zrdtReceiveLive({
       log.info(
         `${logId}: zrdt missing ${missing.map(d => d.slice(0, 8)).join(',')}`
       );
-      const key = `nonce:${toHex(meta.nonce)}`;
-      await addPending(
-        { key, conversationId, input, provenance: { kind: 'live' } },
+      const key = await addPending(
+        {
+          key: `nonce:${toHex(meta.nonce)}`,
+          conversationId,
+          input,
+          provenance: { kind: 'live' },
+        },
         outcome
       );
       // Ask the member whose message referenced them, after the delay; a
@@ -508,8 +514,9 @@ export async function zrdtOnDuplicate(
       zrdtDigest: info.digest,
       zrdtOpening: existing.get('zrdtOpening') ?? info.opening,
       zrdtProvenance: { kind: 'live' },
-      zrdtStatus:
-        wasRelayed && status ? { ...status, wasRelayed: true } : status,
+      zrdtStatus: wasRelayed
+        ? { ...(status ?? { kind: 'unconfirmed' }), wasRelayed: true }
+        : status,
     });
     await window.MessageCache.saveMessage(existing.attributes);
     log.info(`live copy upgrades ${info.digest.slice(0, 8)}`);
@@ -818,7 +825,10 @@ async function upgradeShownMessage(
       const status = message.get('zrdtStatus');
       message.set({
         zrdtProvenance: { kind: 'live' },
-        zrdtStatus: status ? { ...status, wasRelayed: true } : status,
+        zrdtStatus: {
+          ...(status ?? { kind: 'unconfirmed' }),
+          wasRelayed: true,
+        },
       });
       // oxlint-disable-next-line no-await-in-loop
       await window.MessageCache.saveMessage(message.attributes);
