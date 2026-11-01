@@ -37,7 +37,11 @@ import type {
   Status,
   ZrdtBackend,
 } from './ZrdtBackend.std.ts';
-import { decodeRecord, encodeRecord } from './backends/stub.node.ts';
+import {
+  decodeRecord,
+  encodeRecord,
+  makeRecord,
+} from './backends/stub.node.ts';
 
 const log = createLogger('zrdt/service');
 
@@ -595,7 +599,7 @@ export class ZrdtServiceCore implements ZrdtServiceType {
         return undefined;
       }
       return {
-        record: encodeRecord(parts),
+        record: encodeRecord(makeRecord(parts)),
         authorAci: parts.author,
         links: [...parts.links],
         commit: parts.commit,
@@ -824,7 +828,7 @@ export class ZrdtServiceCore implements ZrdtServiceType {
         };
       }
       if (result.kind === 'missing') {
-        const record = encodeRecord(parts);
+        const record = encodeRecord(makeRecord(parts));
         const digest = await this.#pending(
           conversationId,
           record,
@@ -1022,7 +1026,7 @@ export class ZrdtServiceCore implements ZrdtServiceType {
         rows.push({
           conversationId,
           digest: own(digest),
-          record: encodeRecord(parts),
+          record: encodeRecord(makeRecord(parts)),
         });
       }
     }

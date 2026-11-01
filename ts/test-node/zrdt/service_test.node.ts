@@ -17,7 +17,7 @@ import type {
 } from '../../types/Zrdt.std.ts';
 import type { ZrdtBackend } from '../../zrdt/ZrdtBackend.std.ts';
 import { DaemonBackend } from '../../zrdt/backends/daemon.node.ts';
-import { StubBackend } from '../../zrdt/backends/stub.node.ts';
+import { StubBackend, decodeRecord } from '../../zrdt/backends/stub.node.ts';
 import {
   createZrdtBackend,
   intendedBackendKind,
@@ -428,6 +428,28 @@ describe('zrdt service', function (this: Mocha.Suite) {
         assert.deepEqual(statuses.get(toHex(aliceMessage.digest)), {
           kind: 'confirmedByAuthor',
         });
+      });
+
+      it('buffers a record whose links come unsorted and repeated', async () => {
+        const storage = new MemoryStorage();
+        const service = fresh(storage);
+        await service.ensureConversation(CHAT, GROUP);
+        const x1 = filled(32, 0x01);
+        const x2 = filled(32, 0xfe);
+        const gap = await incoming(service, BOB, 'b', [x2, x1, x2]);
+        assert.strictEqual(gap.status, 'missing');
+        if (gap.status !== 'missing') {
+          return;
+        }
+        assert.deepEqual(gap.digests.map(toHex), [toHex(x1), toHex(x2)]);
+        assert.isDefined(gap.digest);
+        const row = storage.pending[0];
+        assert.isDefined(row);
+        assert.isDefined(decodeRecord(row?.record ?? new Uint8Array()));
+        assert.strictEqual(
+          toHex(row?.record ?? new Uint8Array()),
+          toHex(gap.record ?? new Uint8Array(1))
+        );
       });
 
       it('rejects doctored rows at start, and salvages them', async () => {
