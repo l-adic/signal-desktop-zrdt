@@ -75,6 +75,54 @@ export type CIType = {
   zrdt?: ZrdtCIHooks;
 };
 
+// zrdt: start.preload.ts copies window.SignalCI into the page with
+// contextBridge while the preload runs, before initializeRedux calls
+// installZrdtCIHooks (ts/zrdt/ci.preload.ts). A property added afterwards
+// never reaches the page, so `zrdt` is part of the object from the start, as
+// forwarders to the implementation that installZrdtCIHooks sets later.
+let zrdtCIHooks: ZrdtCIHooks | undefined;
+
+export function setZrdtCIHooks(hooks: ZrdtCIHooks): void {
+  zrdtCIHooks = hooks;
+}
+
+const ZRDT_CI_HOOK_NAMES = Object.keys({
+  backendInfo: true,
+  getConversationState: true,
+  refresh: true,
+  getMessages: true,
+  getMessagesBySentAt: true,
+  getGapRows: true,
+  heads: true,
+  getCompareCode: true,
+  comparePaste: true,
+  askCompare: true,
+  getCompareState: true,
+  closeCompare: true,
+  exportStore: true,
+  importStore: true,
+  keepWhatVerifies: true,
+  getInternalResult: true,
+} satisfies Record<keyof ZrdtCIHooks, true>) as Array<keyof ZrdtCIHooks>;
+
+type AnyHookType = (...args: ReadonlyArray<unknown>) => unknown;
+
+function forwardZrdtCIHook(name: keyof ZrdtCIHooks): AnyHookType {
+  return (...args) => {
+    const hooks = zrdtCIHooks;
+    if (hooks == null) {
+      throw new Error(`SignalCI.zrdt.${name}: not installed yet`);
+    }
+    return (hooks[name] as AnyHookType)(...args);
+  };
+}
+
+function makeZrdtCIForwarders(): ZrdtCIHooks {
+  return Object.fromEntries(
+    ZRDT_CI_HOOK_NAMES.map(name => [name, forwardZrdtCIHook(name)])
+  ) as ZrdtCIHooks;
+}
+
 export type GetCIOptionsType = Readonly<{
   deviceName: string;
   forceUnprocessed: boolean;
@@ -374,5 +422,6 @@ export function getCI({
     fetchManifestForPrimary,
     pauseStorageService,
     resumeStorageService,
+    zrdt: makeZrdtCIForwarders(),
   };
 }

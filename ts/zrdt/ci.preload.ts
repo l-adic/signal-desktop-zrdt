@@ -6,6 +6,7 @@
 // JSON (hex strings, no bytes) so playwright's evaluate() can carry it.
 
 import { DataReader } from '../sql/Client.preload.ts';
+import { setZrdtCIHooks } from '../CI.preload.ts';
 import type { ZrdtOpenOutcome, ZrdtStatus } from './service.preload.ts';
 import { zrdtService } from './service.preload.ts';
 import { getZrdtMessageProps } from '../state/selectors/message.preload.ts';
@@ -100,8 +101,7 @@ function toCIMessage(message: MessageAttributesType): ZrdtCIMessageType {
 }
 
 export function installZrdtCIHooks(): void {
-  const ci = window.SignalCI;
-  if (ci == null) {
+  if (window.SignalCI == null) {
     return;
   }
   // Thunks run directly so their promises come back typed.
@@ -191,5 +191,5 @@ export function installZrdtCIHooks(): void {
     },
     getInternalResult: () => zrdtState().internalResult,
   };
-  ci.zrdt = hooks;
+  setZrdtCIHooks(hooks);
 }
