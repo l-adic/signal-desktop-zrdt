@@ -18,6 +18,7 @@ import type { AnyPaymentEvent } from '../types/Payment.std.ts';
 import type { RawBodyRange } from '../types/BodyRange.std.ts';
 import type { StoryMessageRecipientsType } from '../types/Stories.std.ts';
 import type { Emoji } from '../axo/emoji.std.ts';
+import type { ZrdtReceiveInfo } from '../zrdt/receiveInfo.std.ts';
 import type { EmbeddedContactType } from '../types/EmbeddedContact.std.ts';
 import type {
   DurationSecs,
@@ -285,6 +286,8 @@ export type ProcessedDataMessage = {
   giftBadge?: ProcessedGiftBadge;
   unpinMessage?: ProcessedUnpinMessage;
   canReplyToStory?: boolean;
+  // zrdt: result of MessageReceiver's zrdt step (ts/zrdt/receive.preload.ts)
+  zrdtReceive?: ZrdtReceiveInfo;
 };
 
 export type ProcessedUnidentifiedDeliveryStatus = Readonly<{
