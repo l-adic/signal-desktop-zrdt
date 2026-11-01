@@ -44,7 +44,7 @@ native modules need 13.0). It was tested on macOS 27.0.1 (Mac mini M4).
 | Command               | What it does                                                                                       |
 | --------------------- | -------------------------------------------------------------------------------------------------- |
 | `run-demo.sh`         | The live demo: Alice, Bob and Carol linked, warm-ups sent, the villain panel opened in the browser |
-| `run-demo.sh --smoke` | The automatic test of beats 1 to 3 (about 50 s); prints GO or NO-GO                                |
+| `run-demo.sh --smoke` | The automatic test of beats 1 to 5 (about 60 s); prints GO or NO-GO                                |
 | `run-demo.sh --stop`  | Closes a demo that is still running, then kills leftover desktops                                  |
 | `--link-dave`         | Links Dave at once (for rehearsals)                                                                |
 | `--no-open`           | Does not open the panel                                                                            |
@@ -68,9 +68,7 @@ rehearsals).
 **The day before, or at least an hour before:**
 
 1. [ ] Unpack the kit, then run `~/zrdt-demo-kit/run-demo.sh --smoke`. You
-       should see `GO` or, with the current build, `NO-GO` with exactly one failed
-       check: `beat2 recovered copy was "relayed by Bob" first`. That fail is
-       known and is fixed by the author fast-path delay lane. Any other failure:
+       should see `GO: all 41 checks passed` after about 60 s. Any failure:
        stop and read _If something fails_.
 2. [ ] Click away every macOS prompt this first run raises: firewall
        ("accept incoming connections" for node or Electron): **Allow**;
@@ -161,10 +159,6 @@ Carol. Normally Carol would never find out. But Bob's reply points at the
 message he answered, so Carol's app sees the hole, asks Bob for a copy, and
 Alice's app confirms it is hers. Carol never had to trust the server."
 
-With the current build, "relayed by Bob" may flash past and only "confirmed
-by Alice" stay. Then say: "Bob's app sent the copy, and Alice's app confirmed
-it."
-
 ### Beat 3: a withheld message (45 s)
 
 | Do                                                       | The audience sees                                                                                                                         |
@@ -188,12 +182,12 @@ without blaming anyone. Switch the villain off, ask again, and it arrives."
 
 ### Beat 4: a doctored backup (40 s)
 
-| Do                                                                                                                                                                 | The audience sees                                                                                                                                                                                                                           |
-| ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Carol: Settings (the gear at the bottom of the left rail) → **Internal** (the last item) → the section "zrdt (demo)" at the top, Chat "Camping" → **Export store** | "Exported N records … to …" under the section                                                                                                                                                                                               |
-| Panel: **Beat 4: remove a linked record from Carol's export…**                                                                                                     | Panel status: "removed ·b5f3 … linked by ·0cea" (Bob's "me", which Carol's "I have the stove" builds on)                                                                                                                                    |
-| Carol: **Import file**                                                                                                                                             | Carol is back in the chat, under a red banner: "This copy of the chat does not verify: message ·b5f3 is missing", with **Keep what verifies** and **Import a copy**                                                                         |
-| Carol: **Keep what verifies** (in the banner)                                                                                                                      | A blue banner: "Kept 4 messages that verify. Dropped 1 message: ·0cea." The dropped message is the one that built on the missing message. Carol's chat does not change, because she already holds every message that was kept. Click **OK** |
+| Do                                                                                                                                                                                                                                  | The audience sees                                                                                                                                                                                                                                                          |
+| ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Carol: Settings (the gear at the bottom of the left rail) → **Internal** (the last item) → the section "zrdt (demo)" at the top, Chat "Camping" → **Export store**                                                                  | "Exported N records … to …" under the section                                                                                                                                                                                                                              |
+| Wait for the terminal line `auto-doctor, beat 4 (Carol's export): removed ·xxxx …` (1 to 2 s). Do **not** click the panel's Beat 4 doctor button: run-demo.sh already doctors the export, and a second pass removes another message | Nothing on screen. The terminal names the removed message: with the script's messages it is Bob's `I'll bring spares`, linked by Alice's `meet at 9 at the trailhead`                                                                                                      |
+| Carol: **Import file**                                                                                                                                                                                                              | Carol is back in the chat, under a red banner: "This copy of the chat does not verify: message ·xxxx is missing" (the one the terminal named), with **Keep what verifies** and **Import a copy**                                                                           |
+| Carol: **Keep what verifies** (in the banner)                                                                                                                                                                                       | A blue banner: "Kept 7 messages that verify. Dropped 1 message: ·yyyy." The dropped message (`meet at 9 at the trailhead`) is the one that built on the missing message. Carol's chat does not change, because she already holds every message that was kept. Click **OK** |
 
 Say: "Backups are another weak spot. Someone deletes one message from the
 middle of Carol's backup file. Her app refuses the file, names exactly which
@@ -208,24 +202,25 @@ new laptop.
 
 ### Beat 5: restore from anyone (60 s)
 
-| Do                                                                                                                                | The audience sees                                                                                                                                                                                                   |
-| --------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Bob: Settings → **Internal** → **Export store**, then back to the chat (the speech-bubble icon at the top of the left rail)       | A result line                                                                                                                                                                                                       |
-| Panel: **Beat 5: append two fakes by Bob to Bob's export…**                                                                       | Panel status: "appended ·990a ·f52e by … passes OPEN"                                                                                                                                                               |
-| Dave: Settings → **Internal** → **Import file**, then back to the chat (the speech-bubble Chats icon at the top of the left rail) | At the top of Dave's chat, a grey collapsed row: "▸ 8 messages not yet confirmed by any member"                                                                                                                     |
-| Dave: click that row once to open it. It stays open from now on                                                                   | Eight grey entries, each "·xxxx · attributed to Alice/Bob/Carol", "(content unavailable)". The two fakes are among them, attributed to Bob                                                                          |
-| Alice types `found the poles!`                                                                                                    | The title becomes "2 messages not yet confirmed by any member". The genuine entries read "held by Alice", and Alice's own read "confirmed by Alice" (green). The two fakes have no label                            |
-| Bob types `great, see you at 9`                                                                                                   | The title becomes "Imported history: 8 messages". Bob's genuine entries read "confirmed by Bob" (green). The two fakes read **"not confirmed by Bob"** (red). Carol's entries read "held by Bob" until Carol writes |
+| Do                                                                                                                                                                                       | The audience sees                                                                                                                                                                                                    |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Bob: Settings → **Internal** → **Export store**, then back to the chat (the speech-bubble icon at the top of the left rail)                                                              | A result line                                                                                                                                                                                                        |
+| Wait for the terminal line `auto-doctor, beat 5 (Bob's export -> Dave): appended ·xxxx ·yyyy …` (1 to 2 s; Dave must be linked first). Do **not** click the panel's Beat 5 doctor button | Nothing on screen                                                                                                                                                                                                    |
+| Dave: Settings → **Internal** → **Import file**, then back to the chat (the speech-bubble Chats icon at the top of the left rail)                                                        | At the top of Dave's chat, a grey collapsed row: "▸ 11 messages not yet confirmed by any member"                                                                                                                     |
+| Dave: click that row once to open it. It stays open from now on                                                                                                                          | Eleven grey entries, each "·xxxx · attributed to Alice/Bob/Carol" with its time and text. The two fakes, attributed to Bob, are the last two, with no time and "(content unavailable)"                               |
+| Alice types `found the poles!`                                                                                                                                                           | The title becomes "2 messages not yet confirmed by any member". The genuine entries read "held by Alice", and Alice's own read "confirmed by Alice" (green). The two fakes have no label                             |
+| Bob types `great, see you at 9`                                                                                                                                                          | The title becomes "Imported history: 11 messages". Bob's genuine entries read "confirmed by Bob" (green). The two fakes read **"not confirmed by Bob"** (red). Carol's entries read "held by Bob" until Carol writes |
 
 Say: "Dave is new, so he restores the chat from a file Bob sent him. But
 someone slipped two fake 'Bob' messages into it. Dave's app trusts none of it
 yet: it is all grey. One message from Alice vouches for everything she holds.
 One message from Bob exposes the two fakes in his name."
 
-Exports carry message structure only (authors, links, count), not the text.
-So the imported messages show as "(content unavailable)". That is expected in
-this build: the labels carry the beat. The genuine messages do not leave the
-grey section; they get their labels inside it. With four windows on a laptop
+Exports carry each message's text with its opening, and Dave's app shows a
+text only if it matches the message's commitment, so the nine genuine messages
+show their text and the two fakes show "(content unavailable)". The imported
+text is kept in memory only. The genuine messages do not leave the grey
+section; they get their labels inside it. With four windows on a laptop
 screen, Dave's window is narrow: point at the red "not confirmed by Bob"
 pills.
 
@@ -262,13 +257,13 @@ Decide quickly: losing more than 20 s means switching to the fallback.
 **Fallback.**
 
 1. Press Ctrl-C once, then run `~/zrdt-demo-kit/run-demo.sh --stop`.
-2. Either run `~/zrdt-demo-kit/run-demo.sh --smoke` and narrate beats 1 to 3
-   while it plays them on screen, in about 50 s with visible windows; the
+2. Either run `~/zrdt-demo-kit/run-demo.sh --smoke` and narrate beats 1 to 5
+   while it plays them on screen, in about 60 s with visible windows; the
    villain's moves show in its log. Or open `~/zrdt-fallback` in Quick Look
    (select all, then Space) and narrate from the screenshots, in order:
-   `ready`, `beat1`, `beat2-gap`, `beat2-recovered`, `beat3-withheld`,
-   `beat3-recovered`. Then use the beat-4 and beat-5 shots from the
-   rehearsal.
+   `ready` (from the rehearsal), `beat1`, `beat2-gap`, `beat2-relayed`,
+   `beat2-recovered`, `beat3-withheld`, `beat3-recovered`, `beat4-rejected`,
+   `beat4-salvaged`, `beat5-imported`, `beat5-alice`, `beat5-bob`.
 3. Then go to the close. The claims do not change.
 
 ## Notes
