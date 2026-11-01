@@ -15,7 +15,7 @@ Everything here runs from the repository root with Node 24 and `tsx`. Build
 | `harness.ts` | the demo world: four phones (Alice, Bob, Carol, Dave), group "Camping", link, tile, warm-up, restart, teardown                                                     |
 | `launch.ts`  | the live demo: links Alice, Bob, Carol; warms up; starts the panel; links Dave on demand                                                                           |
 | `doctor.ts`  | beats 4 and 5: edits an exported store                                                                                                                             |
-| `smoke.ts`   | the F2 go/no-go test: beats 1–3 through the harness and the panel                                                                                                  |
+| `smoke.ts`   | the F2 go/no-go test: beats 1–5 through the harness and the panel                                                                                                  |
 
 ## Live demo
 
@@ -24,9 +24,30 @@ node --import tsx demo/launch.ts          # add --link-dave to link Dave at once
 # open the panel URL it prints (default http://127.0.0.1:7357/)
 ```
 
-It sets `SIGNAL_MOCK_TESTS_BACKGROUND=1`, `ZRDT_DAEMON` and
-`ZRDT_RESEND_DELAY_MS=4000` for the desktops (an existing value wins). Startup
-to READY takes about 7 s on the Mac mini. Ctrl-C closes everything.
+It sets `SIGNAL_MOCK_TESTS_BACKGROUND=1`, `ZRDT_DAEMON`,
+`ZRDT_RESEND_DELAY_MS=4000` and `ZRDT_AUTHOR_FASTPATH_DELAY_MS=3000` (how long
+beat 2's copy reads "relayed by Bob" before "confirmed by Alice") for the
+desktops (an existing value wins). Startup to READY takes about 7 s on the Mac
+mini. Ctrl-C closes everything.
+
+`doctor.ts` runs by itself on the live exports (`--no-auto-doctor` turns it
+off): when Carol clicks Settings → Internal → Export store, one linked,
+non-head record is removed from her file in place (beat 4; the original is
+kept as `.orig`); when Bob exports and Dave's desktop is linked, two fakes by
+Bob are appended and the result is written where Dave's Import file reads
+(beat 5). The terminal prints what it did (`auto-doctor, beat 4: removed ·61b5
+…`).
+
+### Presenter clicks, beats 4 and 5
+
+- Beat 4: Carol: Settings → Internal → **Export store**; (auto-doctor); Carol:
+  **Import file** (back to the chat: red banner "This copy of the chat does not
+  verify: message ·xxxx is missing"); **Keep what verifies** ("Kept N messages
+  that verify. Dropped 1 message: ·yyyy."); **OK**.
+- Beat 5: panel **Link Dave's desktop**; Bob: Settings → Internal → **Export
+  store**; (auto-doctor); Dave: Settings → Internal → **Import file**, back to
+  Camping; expand "N messages not yet confirmed by any member"; Alice writes;
+  Bob writes.
 
 Panel routes (also usable with curl):
 
@@ -49,9 +70,15 @@ curl -X POST "$P/actions/restart" -d '{"member":"carol"}'  # app.close(); app.st
 curl -X POST "$P/actions/quit"
 ```
 
-Exports follow lane T3: a raw store blob at
-`<profile>/zrdt-export-<conversation id>.bin`, and Import reads the same path
-for the importing desktop. So `doctor-remove` edits Carol's export in place
+Exports go to `<profile>/zrdt-export-<conversation id>.bin`, and Import reads
+the same path for the importing desktop. The file is JSON (RESTORE_PLAN.md
+§3): `{"zrdtDump": 1, "blob": <base64 store blob>, "content": {<hex digest>:
+<base64 opening>}}`; an opening is `nonce ‖ DataMessage bytes` without fields
+15 and 200, so no group master key. Import keeps a content entry only if its
+record is in the store and `COMMIT(opening) == record.commit` (zrdtd's
+ACCEPT_RECORD with the opening); the unconfirmed section shows that text for
+records without a message row (in memory only for now). A raw store blob is
+still accepted. So `doctor-remove` edits Carol's export in place
 (the original is kept as `.orig`), and `doctor-append` reads Bob's export and
 writes Dave's import path (Dave must be linked first). Both take an explicit
 `file` instead (`~/` allowed).
@@ -83,5 +110,8 @@ node --import tsx demo/smoke.ts                  # launches three desktops
 ```
 
 `smoke.ts` tags each check `harness` or `zrdt`, writes
-`demo/artifacts/smoke/run.json` and screenshots, and exits 0 only when every
-check passes (GO).
+`demo/artifacts/smoke/run.json` (every check with `atMs`/`ms`, and
+`beatTimings`) and screenshots, and exits 0 only when every check passes (GO).
+`ZRDT_SMOKE_BEATS=1,2` runs a subset (beat 1 always runs). It drives beats 4
+and 5 through the zrdt hooks (export, import) and doctor.ts in-process, and
+clicks the banner's "Keep what verifies".

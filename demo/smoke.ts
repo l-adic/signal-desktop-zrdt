@@ -482,6 +482,11 @@ async function beat2(
               sawRelayed = true;
               relayedEvidence = 'provenance';
             }
+            if (sawRelayed) {
+              // The moment the audience sees "relayed by Bob".
+              // oxlint-disable-next-line no-await-in-loop
+              await screenshots(demo, [carol], 'beat2-relayed');
+            }
           }
           if (inTimelineAt === undefined) {
             // oxlint-disable-next-line no-await-in-loop
@@ -517,9 +522,6 @@ async function beat2(
           `(wasRelayed=${wasRelayed}; ZRDT_AUTHOR_FASTPATH_DELAY_MS=` +
           `${process.env.ZRDT_AUTHOR_FASTPATH_DELAY_MS ?? 'unset'})`
   );
-  if (sawRelayed) {
-    await screenshots(demo, trio, 'beat2-relayed');
-  }
   await attempt('beat2 then "confirmed by Alice"', 'zrdt', async () => {
     if (!recovered) {
       return { ok: false, detail: 'not recovered' };
@@ -632,6 +634,7 @@ type ZrdtConvState = {
     digest: string;
     status: { kind: string; aci?: string };
     hasMessage: boolean;
+    text?: string;
   }>;
 };
 
@@ -960,6 +963,41 @@ async function beat5(demo: Demo): Promise<void> {
   } catch {
     say('could not expand the unconfirmed section on Dave');
   }
+  await attempt(
+    'beat5 imported history shows its verified text; the fakes have none',
+    'zrdt',
+    async () => {
+      if (!imported) {
+        return { ok: false, detail: 'skipped: the import failed' };
+      }
+      const state = await convState(demo, dave);
+      const items = state?.unconfirmed ?? [];
+      const fakeSet = new Set(fakes);
+      const withText = items.filter(i => !fakeSet.has(i.digest) && i.text);
+      const fakeText = items.filter(i => fakeSet.has(i.digest) && i.text);
+      const last = items.at(-1)?.digest;
+      const fakesLast =
+        items.length >= 2 &&
+        fakeSet.has(items.at(-1)?.digest ?? '') &&
+        fakeSet.has(items.at(-2)?.digest ?? '');
+      const onScreen = await visible(
+        page(dave),
+        "who's bringing the tent?",
+        UI_MS
+      );
+      return {
+        ok:
+          withText.length === genuine.length &&
+          fakeText.length === 0 &&
+          onScreen,
+        detail:
+          `${withText.length}/${genuine.length} genuine with text, ` +
+          `${fakeText.length} fakes with text; fakes listed last=${fakesLast} ` +
+          `(last ${last ? tag(last) : 'none'}); ` +
+          `"who's bringing the tent?" ${onScreen ? 'shown' : 'NOT shown'}`,
+      };
+    }
+  );
   await screenshots(demo, four, 'beat5-imported');
 
   // Alice writes.

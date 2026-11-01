@@ -21,6 +21,7 @@ import * as Errors from '../../types/errors.std.ts';
 import * as Bytes from '../../Bytes.std.ts';
 import { bytesToUuid } from '../../util/uuidToBytes.std.ts';
 import { DataReader } from '../../sql/Client.preload.ts';
+import { SignalService as Proto } from '../../protobuf/index.std.ts';
 import type { BoundActionCreatorsMapObject } from '../../hooks/useBoundActions.std.ts';
 import { useBoundActions } from '../../hooks/useBoundActions.std.ts';
 import type { StateType as RootStateType } from '../reducer.preload.ts';
@@ -128,9 +129,174 @@ export function getZrdtDumpPath(conversationId: string): string {
   );
 }
 
-// Import blobs that failed MERGE, kept for "Keep what verifies". Not in
+// --- Dump file (RESTORE_PLAN.md §3) --------------------------------------------
+//
+// JSON: { "zrdtDump": 1, "blob": base64 store blob,
+//         "content": { <hex digest>: base64 opening } }.
+// An opening is `nonce(32) ‖ DataMessage bytes without fields 15 and 200`
+// (message attribute zrdtOpening), so the file never holds the group master
+// key. A raw store blob (older exports) is read too. doctor.ts edits the
+// blob inside the JSON (its `locateBlob`).
+
+export type ZrdtDumpType = ReadonlyDeep<{
+  blob: Uint8Array<ArrayBuffer>;
+  content: ReadonlyMap<string, Uint8Array<ArrayBuffer>>;
+}>;
+
+const NONCE_BYTES = 32;
+const HEX_DIGEST = /^[0-9a-f]{64}$/;
+
+export function zrdtParseDump(bytes: Uint8Array<ArrayBuffer>): ZrdtDumpType {
+  // 0x7b is "{"
+  if (bytes[0] !== 0x7b) {
+    return { blob: bytes, content: new Map() };
+  }
+  const doc = JSON.parse(Bytes.toString(bytes)) as {
+    blob?: unknown;
+    content?: Record<string, unknown>;
+  };
+  if (typeof doc.blob !== 'string') {
+    throw new Error('not a zrdt dump (no "blob")');
+  }
+  const content = new Map<string, Uint8Array<ArrayBuffer>>();
+  for (const [hex, opening] of Object.entries(doc.content ?? {})) {
+    if (HEX_DIGEST.test(hex) && typeof opening === 'string') {
+      content.set(hex, Bytes.fromBase64(opening));
+    }
+  }
+  return { blob: Bytes.fromBase64(doc.blob), content };
+}
+
+export function zrdtEncodeDump(dump: ZrdtDumpType): Uint8Array<ArrayBuffer> {
+  const content: Record<string, string> = {};
+  for (const [hex, opening] of dump.content) {
+    content[hex] = Bytes.toBase64(opening);
+  }
+  return Bytes.fromString(
+    `${JSON.stringify({
+      zrdtDump: 1,
+      warning:
+        "Do not share: this file is outside Signal's encryption. It holds " +
+        'message text and who linked what.',
+      blob: Bytes.toBase64(dump.blob),
+      content,
+    })}\n`
+  );
+}
+
+/** The DataMessage inside an opening, or undefined if it does not decode. */
+function decodeOpening(
+  opening: Uint8Array<ArrayBuffer>
+): Proto.DataMessage | undefined {
+  if (opening.byteLength <= NONCE_BYTES) {
+    return undefined;
+  }
+  try {
+    return Proto.DataMessage.decode(opening.subarray(NONCE_BYTES));
+  } catch {
+    return undefined;
+  }
+}
+
+// Content left out of exports and refused on import (RESTORE_PLAN.md §3):
+// disappearing, view-once (deleted-for-everyone rows are checked on export).
+function isExcludedContent(decoded: Proto.DataMessage): boolean {
+  return (decoded.expireTimer ?? 0) > 0 || decoded.isViewOnce === true;
+}
+
+/** Openings of the conversation's messages, by hex digest, for an export. */
+async function getExportContent(
+  conversationId: string
+): Promise<Map<string, Uint8Array<ArrayBuffer>>> {
+  const rows = await DataReader.getZrdtRecords(conversationId);
+  const ids = await DataReader.getMessageIdsByZrdtDigest(
+    conversationId,
+    rows.map(row => zrdtHex(row.digest))
+  );
+  const content = new Map<string, Uint8Array<ArrayBuffer>>();
+  for (const { digest, messageId } of ids) {
+    // oxlint-disable-next-line no-await-in-loop
+    const message = await DataReader.getMessageById(messageId);
+    const opening = message?.zrdtOpening;
+    if (
+      opening == null ||
+      message == null ||
+      message.deletedForEveryone === true ||
+      (message.expireTimer ?? 0) > 0 ||
+      message.isViewOnce === true
+    ) {
+      continue;
+    }
+    const bytes = Bytes.fromBase64(opening);
+    const decoded = decodeOpening(bytes);
+    if (decoded != null && !isExcludedContent(decoded)) {
+      content.set(digest, bytes);
+    }
+  }
+  return content;
+}
+
+// Verified imported content, by conversation and hex digest: the text the
+// unconfirmed section shows for records without a message row. In memory
+// only. TODO(zrdt): persist it (a restart shows "content unavailable" again).
+const importedContent = new Map<
+  string,
+  Map<string, { text: string; sentAt?: number }>
+>();
+
+/**
+ * Keeps a content entry only if its record is in the store and
+ * COMMIT(opening) == record.commit: ACCEPT_RECORD with the opening (zrdtd
+ * checks the opening before it touches the store; the record is already
+ * held, so the accept is idempotent and its provenance is never lowered).
+ */
+async function verifyImportedContent(
+  conversationId: string,
+  content: ReadonlyMap<string, Uint8Array<ArrayBuffer>>
+): Promise<{ kept: number; refused: number }> {
+  let kept = 0;
+  let refused = 0;
+  let byDigest = importedContent.get(conversationId);
+  if (byDigest == null) {
+    byDigest = new Map();
+    importedContent.set(conversationId, byDigest);
+  }
+  for (const [hex, opening] of content) {
+    try {
+      const decoded = decodeOpening(opening);
+      // oxlint-disable-next-line no-await-in-loop
+      const held = await zrdtService.get(conversationId, zrdtFromHex(hex));
+      if (decoded == null || isExcludedContent(decoded) || held == null) {
+        refused += 1;
+        continue;
+      }
+      // oxlint-disable-next-line no-await-in-loop
+      const check = await zrdtService.acceptRecord(conversationId, {
+        record: held.record,
+        opening,
+        provenance: { kind: 'imported' },
+      });
+      if (check.status !== 'accepted') {
+        refused += 1;
+        continue;
+      }
+      const timestamp = Number(decoded.timestamp ?? 0);
+      byDigest.set(hex, {
+        text: decoded.body ?? '',
+        sentAt: timestamp > 0 ? timestamp : undefined,
+      });
+      kept += 1;
+    } catch (error) {
+      log.warn('verifyImportedContent', Errors.toLogFormat(error));
+      refused += 1;
+    }
+  }
+  return { kept, refused };
+}
+
+// Import dumps that failed MERGE, kept for "Keep what verifies". Not in
 // Redux: bytes do not belong in the store.
-const failedImportBlobs = new Map<string, Uint8Array<ArrayBuffer>>();
+const failedImportBlobs = new Map<string, ZrdtDumpType>();
 
 // --- State ----------------------------------------------------------------------
 
@@ -338,7 +504,19 @@ function refreshConversation(conversationId: string): ZrdtThunk<Promise<void>> {
           unconfirmed.push(item);
         }
       }
-      unconfirmed.sort((a, b) => (a.sentAt ?? 0) - (b.sentAt ?? 0));
+      // Causal order (a record after the ones it links), then time, then
+      // digest: the two fakes of beat 5 sit on top of the genuine head.
+      const depth = new Map<string, number>();
+      for (const item of unconfirmed) {
+        // oxlint-disable-next-line no-await-in-loop
+        depth.set(item.digest, await getDepth(conversationId, item.digest));
+      }
+      unconfirmed.sort(
+        (a, b) =>
+          (depth.get(a.digest) ?? 0) - (depth.get(b.digest) ?? 0) ||
+          (a.sentAt ?? 0) - (b.sentAt ?? 0) ||
+          a.digest.localeCompare(b.digest)
+      );
       dispatch(
         patchConversation(conversationId, {
           statuses,
@@ -356,8 +534,45 @@ function refreshConversation(conversationId: string): ZrdtThunk<Promise<void>> {
   };
 }
 
-// Records are immutable, so a digest's author never changes.
+// Records are immutable, so a digest's author, links and depth never change.
 const authorByDigest = new Map<string, string>();
+const depthByDigest = new Map<string, number>();
+
+/** Longest link path from a root (a record without links) to `hex`. */
+async function getDepth(conversationId: string, hex: string): Promise<number> {
+  const known = depthByDigest.get(hex);
+  if (known != null) {
+    return known;
+  }
+  // Iterative post-order walk over links (stores can be deep).
+  const stack: Array<{ hex: string; links?: Array<string> }> = [{ hex }];
+  const visiting = new Set<string>([hex]);
+  while (stack.length > 0) {
+    const top = stack[stack.length - 1];
+    if (top == null) {
+      break;
+    }
+    if (top.links == null) {
+      // oxlint-disable-next-line no-await-in-loop
+      const parts = await zrdtService.get(conversationId, zrdtFromHex(top.hex));
+      top.links = (parts?.links ?? []).map(zrdtHex);
+    }
+    const next = top.links.find(l => !depthByDigest.has(l) && !visiting.has(l));
+    if (next != null) {
+      visiting.add(next);
+      stack.push({ hex: next });
+      continue;
+    }
+    const d =
+      top.links.length === 0
+        ? 0
+        : 1 + Math.max(...top.links.map(l => depthByDigest.get(l) ?? 0));
+    depthByDigest.set(top.hex, d);
+    visiting.delete(top.hex);
+    stack.pop();
+  }
+  return depthByDigest.get(hex) ?? 0;
+}
 
 async function getUnconfirmedItem(
   conversationId: string,
@@ -388,6 +603,12 @@ async function getUnconfirmedItem(
       item.hasMessage = true;
       item.text = message.body;
       item.sentAt = message.sent_at;
+    } else {
+      const content = importedContent.get(conversationId)?.get(hex);
+      if (content != null) {
+        item.text = content.text;
+        item.sentAt = content.sentAt;
+      }
     }
   } catch (error) {
     log.warn('getUnconfirmedItem failed', Errors.toLogFormat(error));
@@ -428,11 +649,12 @@ function markRejected(
 /** "Keep what verifies" (SALVAGE) for a failed import. */
 function keepWhatVerifies(conversationId: string): ZrdtThunk<Promise<void>> {
   return async dispatch => {
-    const blob = failedImportBlobs.get(conversationId);
-    if (blob == null) {
+    const dump = failedImportBlobs.get(conversationId);
+    if (dump == null) {
       await dispatch(keepWhatVerifiesStored(conversationId));
       return;
     }
+    const { blob } = dump;
     dispatch(patchConversation(conversationId, { busy: true }));
     try {
       const result = await zrdtService.salvageBlob(conversationId, blob);
@@ -442,6 +664,7 @@ function keepWhatVerifies(conversationId: string): ZrdtThunk<Promise<void>> {
         return;
       }
       failedImportBlobs.delete(conversationId);
+      await verifyImportedContent(conversationId, dump.content);
       const count = zrdtBlobRecordCount(blob) ?? result.dropped.length;
       const dropped = result.dropped.map(zrdtHex);
       dispatch(
@@ -525,11 +748,14 @@ function exportConversation(
     const target = path || getZrdtDumpPath(conversationId);
     try {
       const blob = await zrdtService.exportBlob(conversationId);
-      await writeFile(target, blob);
+      const content = await getExportContent(conversationId);
+      const file = zrdtEncodeDump({ blob, content });
+      await writeFile(target, file);
       const count = zrdtBlobRecordCount(blob);
       dispatch(
         setInternalResult(
-          `Exported ${count ?? '?'} records (${blob.byteLength} bytes) to ${target}`
+          `Exported ${count ?? '?'} records, ${content.size} with content ` +
+            `(${file.byteLength} bytes) to ${target}`
         )
       );
       return target;
@@ -549,15 +775,23 @@ function importConversation(
   return async dispatch => {
     const source = path || getZrdtDumpPath(conversationId);
     try {
-      const blob = new Uint8Array(await readFile(source));
-      const outcome = await zrdtService.importBlob(conversationId, blob);
+      const dump = zrdtParseDump(new Uint8Array(await readFile(source)));
+      const outcome = await zrdtService.importBlob(conversationId, dump.blob);
       if (outcome.status === 'ok') {
         failedImportBlobs.delete(conversationId);
+        const { kept, refused } = await verifyImportedContent(
+          conversationId,
+          dump.content
+        );
         dispatch(patchConversation(conversationId, {}, ['rejected']));
-        dispatch(setInternalResult(`Import of ${source}: ok`));
+        dispatch(
+          setInternalResult(
+            `Import of ${source}: ok (content: ${kept} kept, ${refused} refused)`
+          )
+        );
         await dispatch(refreshConversation(conversationId));
       } else {
-        failedImportBlobs.set(conversationId, blob);
+        failedImportBlobs.set(conversationId, dump);
         dispatch(markRejected(conversationId, outcome, 'import'));
         const reason = zrdtRejectReasonFromOutcome(outcome);
         dispatch(
@@ -585,7 +819,7 @@ function salvageFile(
     try {
       failedImportBlobs.set(
         conversationId,
-        new Uint8Array(await readFile(source))
+        zrdtParseDump(new Uint8Array(await readFile(source)))
       );
     } catch (error) {
       dispatch(setInternalResult(`Salvage failed: ${errorText(error)}`));

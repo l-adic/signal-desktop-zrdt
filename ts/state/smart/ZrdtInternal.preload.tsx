@@ -65,9 +65,10 @@ const SmartZrdtInternal = memo(function SmartZrdtInternal(): JSX.Element {
       return;
     }
     const outcome = await importConversation(conversationId, effectivePath);
-    if (outcome != null && outcome.status !== 'ok') {
-      // Beat 4: back to the chat, where the red banner names what is
-      // missing and offers "Keep what verifies".
+    if (outcome != null) {
+      // Back to the chat. Beat 4: the red banner names what is missing and
+      // offers "Keep what verifies". Beat 5: the imported history waits in
+      // the collapsed "not yet confirmed" section.
       await showConversation({ conversationId });
     }
   }, [conversationId, effectivePath, importConversation, showConversation]);
