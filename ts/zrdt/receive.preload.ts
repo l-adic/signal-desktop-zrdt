@@ -256,6 +256,10 @@ export async function zrdtReceiveLive({
           missing,
           isSync ? undefined : senderAci
         );
+        // One gap row per missing message: digests an open gap row already
+        // shows get no second row (two replies to one dropped message).
+        const shown = await getDigestsInGapRows(conversationId);
+        missing = missing.filter(d => !shown.has(d));
       }
     }
 
@@ -426,6 +430,13 @@ async function loadGapRows(
   const ids = await DataReader.getZrdtGapMessageIds(conversationId);
   const rows = await Promise.all(ids.map(id => getMessageById(id)));
   return rows.filter(isNotNil);
+}
+
+async function getDigestsInGapRows(
+  conversationId: string
+): Promise<Set<string>> {
+  const rows = await loadGapRows(conversationId);
+  return new Set(rows.flatMap(row => row.get('zrdtGap')?.missingDigests ?? []));
 }
 
 async function findGapsFor(
