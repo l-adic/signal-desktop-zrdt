@@ -8,8 +8,8 @@ const COMMENT_LINE_2_EXACT = /^ SPDX-License-Identifier: AGPL-3.0-only$/;
 
 const COMMENT_LINE_1_LOOSE = /Copyright (\d{4}) Signal Messenger, LLC/;
 
-// zrdt fork: new files under ts/zrdt, demo/ and ts/test-*/zrdt may carry
-// "Copyright <year> zrdt contributors" instead.
+// zrdt fork: new files under ts/zrdt, demo/ and ts/test-*/zrdt may carry the
+// zrdt contributors' copyright line instead.
 const ZRDT_COMMENT_LINE_1_EXACT = /^ Copyright \d{4} zrdt contributors$/;
 const ZRDT_PATH =
   /(^|[\\/])(ts[\\/]zrdt|demo|ts[\\/]test-[^\\/]+[\\/]zrdt)[\\/]/;
