@@ -395,10 +395,11 @@ const reacceptedConversations = new Set<string>();
 /**
  * APP.md §4 step 8: re-accept our sent messages whose digest is missing from
  * the store. Runs once per conversation per session: lazily before the first
- * zrdt send in that conversation, or when called after zrdtService.init().
+ * zrdt send in that conversation. TODO(zrdt T0): export and call after
+ * zrdtService.init() if sent records should be back before the first send.
  * Never throws.
  */
-export async function reacceptOutgoingForConversation(
+async function reacceptOutgoingForConversation(
   conversation: ConversationModel,
   log: LoggerType = defaultLog
 ): Promise<void> {
