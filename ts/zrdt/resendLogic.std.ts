@@ -44,6 +44,10 @@ export type ResendSchedulerOptions = Readonly<{
   giveUpAfterMs: number;
   // Automatic asks: one per digest per this window (handleRetry's dedupe).
   dedupeMs: number;
+  // ZRDT_AUTHOR_FASTPATH_DELAY_MS: after a relayed message is shown, how
+  // long until we ask its author for the live copy (step 9). 0 in the app;
+  // the demo sets 3000 so "relayed by Bob" shows before "confirmed by Alice".
+  authorFastPathDelayMs: number;
 }>;
 
 export function readResendOptions(
@@ -59,6 +63,7 @@ export function readResendOptions(
     groupAfterMs: num('ZRDT_RESEND_GROUP_AFTER_MS', 5000),
     giveUpAfterMs: num('ZRDT_RESEND_GIVE_UP_AFTER_MS', 5000),
     dedupeMs: num('ZRDT_RESEND_DEDUPE_MS', 60_000),
+    authorFastPathDelayMs: num('ZRDT_AUTHOR_FASTPATH_DELAY_MS', 0),
   };
 }
 
@@ -258,8 +263,14 @@ export type HeldRecord = Readonly<{
 }>;
 
 export type ResendPlan = Readonly<{
-  // Our own messages: re-send the original via the SavedProto job.
-  savedProto: ReadonlyArray<{ digest: Hex; sentAt: number }>;
+  // Our own messages: re-send the original via the SavedProto job. If the
+  // sendLog entry is gone by then (pruned on a delivery receipt, or expired),
+  // relay the record with `fallbackOpening`, our stored opening.
+  savedProto: ReadonlyArray<{
+    digest: Hex;
+    sentAt: number;
+    fallbackOpening?: string;
+  }>;
   // Everything else we hold: ZrdtResend 1:1.
   relay: ReadonlyArray<{
     digest: Hex;
@@ -286,7 +297,11 @@ export function planResendResponse({
   requesterIsMember: boolean;
   requesterWasMemberAtSend: (sentAt: number | undefined) => boolean;
 }>): ResendPlan {
-  const savedProto: Array<{ digest: Hex; sentAt: number }> = [];
+  const savedProto: Array<{
+    digest: Hex;
+    sentAt: number;
+    fallbackOpening?: string;
+  }> = [];
   const relay: Array<{
     digest: Hex;
     record: Uint8Array<ArrayBuffer>;
@@ -302,15 +317,19 @@ export function planResendResponse({
       notFound.push(digest);
       continue;
     }
-    if (item.authorAci === ourAci && item.message && item.inSendLog) {
-      savedProto.push({ digest, sentAt: item.message.sentAt });
-      continue;
-    }
     const opening =
       item.message?.opening != null &&
       requesterWasMemberAtSend(item.message.sentAt)
         ? item.message.opening
         : undefined;
+    if (item.authorAci === ourAci && item.message && item.inSendLog) {
+      savedProto.push({
+        digest,
+        sentAt: item.message.sentAt,
+        ...(opening != null ? { fallbackOpening: opening } : {}),
+      });
+      continue;
+    }
     relay.push({ digest, record: item.record, opening });
   }
   return { savedProto, relay, notFound };

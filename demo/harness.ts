@@ -15,6 +15,8 @@
 //                                   ZRDT_FOREGROUND=1 turns this off
 //   ZRDT_DAEMON                     zrdt/core/.lake/build/bin/zrdtd, if built
 //   ZRDT_RESEND_DELAY_MS=4000       how long a gap row waits before asking
+//   ZRDT_AUTHOR_FASTPATH_DELAY_MS=3000  how long "relayed by Bob" shows
+//                                   before the app asks the author (beat 2)
 
 import { existsSync } from 'node:fs';
 import fs from 'node:fs/promises';
@@ -99,10 +101,12 @@ export function configureEnv(): string {
     );
   }
   process.env.ZRDT_RESEND_DELAY_MS ??= '4000';
+  process.env.ZRDT_AUTHOR_FASTPATH_DELAY_MS ??= '3000';
   return (
     `SIGNAL_MOCK_TESTS_BACKGROUND=${process.env.SIGNAL_MOCK_TESTS_BACKGROUND ?? ''} ` +
     `ZRDT_DAEMON=${process.env.ZRDT_DAEMON ?? '(unset)'} ` +
     `ZRDT_RESEND_DELAY_MS=${process.env.ZRDT_RESEND_DELAY_MS} ` +
+    `ZRDT_AUTHOR_FASTPATH_DELAY_MS=${process.env.ZRDT_AUTHOR_FASTPATH_DELAY_MS} ` +
     `ZRDT_REQUIRE_LEAN=${process.env.ZRDT_REQUIRE_LEAN ?? '(unset)'}`
   );
 }

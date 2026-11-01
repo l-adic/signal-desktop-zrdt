@@ -54,6 +54,7 @@ function harness(options?: Partial<ReturnType<typeof readResendOptions>>) {
       groupAfterMs: 5000,
       giveUpAfterMs: 5000,
       dedupeMs: 60_000,
+      authorFastPathDelayMs: 0,
       ...options,
     }
   );
@@ -85,6 +86,20 @@ function harness(options?: Partial<ReturnType<typeof readResendOptions>>) {
 }
 
 describe('zrdt resend scheduling', () => {
+  it('reads ZRDT_AUTHOR_FASTPATH_DELAY_MS, default 0', () => {
+    assert.strictEqual(readResendOptions({}).authorFastPathDelayMs, 0);
+    assert.strictEqual(
+      readResendOptions({ ZRDT_AUTHOR_FASTPATH_DELAY_MS: '3000' })
+        .authorFastPathDelayMs,
+      3000
+    );
+    assert.strictEqual(
+      readResendOptions({ ZRDT_AUTHOR_FASTPATH_DELAY_MS: '-1' })
+        .authorFastPathDelayMs,
+      0
+    );
+  });
+
   it('reads ZRDT_RESEND_DELAY_MS, default 4000', () => {
     assert.strictEqual(readResendOptions({}).delayMs, 4000);
     assert.strictEqual(
@@ -211,9 +226,24 @@ describe('zrdt resend responder', () => {
       requesterIsMember: true,
       requesterWasMemberAtSend: () => true,
     });
-    assert.deepEqual(plan.savedProto, [{ digest: D1, sentAt: 111 }]);
+    // The stored opening rides along, in case the sendLog entry is gone by
+    // the time the SavedProto job runs.
+    assert.deepEqual(plan.savedProto, [
+      { digest: D1, sentAt: 111, fallbackOpening: 'b3Blbg==' },
+    ]);
     assert.deepEqual(plan.relay, [{ digest: D2, record, opening: 'b3Blbg==' }]);
     assert.deepEqual(plan.notFound, [D3]);
+  });
+
+  it('SavedProto fallback: no opening for a requester who was not a member at send time', () => {
+    const plan = planResendResponse({
+      digests: [D1],
+      held,
+      ourAci: ALICE,
+      requesterIsMember: true,
+      requesterWasMemberAtSend: () => false,
+    });
+    assert.deepEqual(plan.savedProto, [{ digest: D1, sentAt: 111 }]);
   });
 
   it('own message no longer in the sendLog: relay it', () => {

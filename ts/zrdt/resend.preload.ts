@@ -18,6 +18,7 @@ import { messageSender } from '../textsecure/SendMessage.preload.ts';
 import { conversationJobQueue } from '../jobs/conversationJobQueue.preload.ts';
 import { getSendOptions } from '../util/getSendOptions.preload.ts';
 import { drop } from '../util/drop.std.ts';
+import { sleep } from '../util/sleep.std.ts';
 import { itemStorage } from '../textsecure/Storage.preload.ts';
 import type { AciString } from '../types/ServiceId.std.ts';
 import { isAciString } from '../util/isAciString.std.ts';
@@ -84,13 +85,30 @@ export async function requestMissing(
 }
 
 // Author fast path (step 9): we hold the record (relayed); ask its author 1:1
-// so its app re-sends the original, which arrives live.
+// so its app re-sends the original, which arrives live. Waits
+// ZRDT_AUTHOR_FASTPATH_DELAY_MS first (0 in the app; the demo sets 3000 so
+// the message reads "relayed by Bob" for a while before "confirmed by
+// Alice"), and skips the ask if the live copy came meanwhile.
 export async function requestAuthorCopy(
   conversationId: string,
   digest: string,
   authorAci: AciString
 ): Promise<void> {
   try {
+    const delayMs = zrdtResendScheduler.options.authorFastPathDelayMs;
+    if (delayMs > 0) {
+      log.info(
+        `author fast path for ${digest.slice(0, 8)}: asking in ${delayMs} ms`
+      );
+      await sleep(delayMs);
+      if (await isLiveRecord(conversationId, digest)) {
+        log.info(
+          `author fast path for ${digest.slice(0, 8)}: live copy came; not asking`
+        );
+        return;
+      }
+    }
+    log.info(`author fast path: asking ${authorAci} for ${digest.slice(0, 8)}`);
     await sendResendRequest(
       conversationId,
       { kind: 'direct', aci: authorAci },
@@ -99,6 +117,14 @@ export async function requestAuthorCopy(
   } catch (error) {
     log.warn('author fast path failed', Errors.toLogFormat(error));
   }
+}
+
+async function isLiveRecord(
+  conversationId: string,
+  digest: string
+): Promise<boolean> {
+  const rows = await DataReader.getZrdtProvenance(conversationId);
+  return rows.some(row => row.kind === 'live' && toHex(row.digest) === digest);
 }
 
 // --- sending --------------------------------------------------------------------------
@@ -310,15 +336,33 @@ async function onResendRequest(
       requesterWasMemberAtSend: () => conversation.hasMember(requesterAci),
     });
 
-    for (const { digest, sentAt } of plan.savedProto) {
-      // oxlint-disable-next-line no-await-in-loop
-      const ok = await resendFromSendLog(conversation, requesterAci, sentAt);
-      if (!ok) {
-        const item = held.get(digest);
-        if (item) {
-          // oxlint-disable-next-line no-await-in-loop
-          await sendRelay(conversation, requesterAci, item.record, undefined);
-        }
+    for (const { digest, sentAt, fallbackOpening } of plan.savedProto) {
+      let ok = false;
+      try {
+        // oxlint-disable-next-line no-await-in-loop
+        ok = await resendFromSendLog(conversation, requesterAci, sentAt);
+      } catch (error) {
+        log.warn(
+          `sendLog re-send of ${digest.slice(0, 8)} failed`,
+          Errors.toLogFormat(error)
+        );
+      }
+      const item = ok ? undefined : held.get(digest);
+      if (item) {
+        // The sendLog entry vanished (pruned on a delivery receipt, or
+        // expired) between the check and the re-send: relay our record with
+        // our stored opening. We are the author, so it still arrives live.
+        const what = fallbackOpening ? 'our stored opening' : 'no opening';
+        log.info(
+          `own ${digest.slice(0, 8)}: sendLog entry gone; relaying with ${what}`
+        );
+        // oxlint-disable-next-line no-await-in-loop
+        await sendRelay(
+          conversation,
+          requesterAci,
+          item.record,
+          fallbackOpening ? Bytes.fromBase64(fallbackOpening) : undefined
+        );
       }
     }
     for (const { record, opening } of plan.relay) {

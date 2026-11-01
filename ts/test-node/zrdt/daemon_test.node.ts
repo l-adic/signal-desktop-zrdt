@@ -6,11 +6,13 @@ import { assert } from 'chai';
 import { ZrdtBackendError } from '../../zrdt/ZrdtBackend.std.ts';
 import type { Bytes } from '../../zrdt/ZrdtBackend.std.ts';
 import {
+  DEFAULT_DAEMON_TIMEOUT_MS,
   DaemonBackend,
   FrameReader,
   MAX_FRAME_BYTES,
   Op,
   encodeFrame,
+  readDaemonTimeoutMs,
 } from '../../zrdt/backends/daemon.node.ts';
 import type { Frame } from '../../zrdt/backends/daemon.node.ts';
 
@@ -28,6 +30,7 @@ function asText(bytes: Bytes): string {
  * - "env": the value of LEAN_ABORT_ON_PANIC;
  * - "exit": exits with code 3 without answering;
  * - "hang": never answers;
+ * - "slow": answers 600 ms after the previous answer;
  * - "badlength": sends a frame header with length 0;
  * - "twice": answers twice;
  * - anything else: echoes the frame.
@@ -57,6 +60,9 @@ function handle(tag, body) {
     process.exit(3);
   } else if (command === 'hang') {
     // no answer
+  } else if (command === 'slow') {
+    queue = queue.then(() => pause(600));
+    reply(tag, body);
   } else if (command === 'badlength') {
     process.stdout.write(Buffer.from([0, 0, 0, 0]));
   } else if (command === 'twice') {
@@ -81,12 +87,13 @@ process.stdin.on('data', chunk => {
 });
 `;
 
-function fakeDaemon(): DaemonBackend {
+function fakeDaemon(timeoutMs?: number): DaemonBackend {
   return new DaemonBackend({
     path: process.execPath,
     args: ['-e', FAKE_DAEMON],
     // Under electron-mocha, process.execPath is Electron.
     env: { ELECTRON_RUN_AS_NODE: '1' },
+    ...(timeoutMs === undefined ? {} : { timeoutMs }),
   });
 }
 
@@ -186,6 +193,72 @@ describe('zrdt daemon backend', () => {
         backend.call(Op.HEADS, new Uint8Array(0)),
         /unavailable/
       );
+    });
+
+    it('reads ZRDT_DAEMON_TIMEOUT_MS, default 10 s, 0 turns it off', () => {
+      assert.strictEqual(DEFAULT_DAEMON_TIMEOUT_MS, 10_000);
+      assert.strictEqual(readDaemonTimeoutMs({}), 10_000);
+      assert.strictEqual(
+        readDaemonTimeoutMs({ ZRDT_DAEMON_TIMEOUT_MS: '2500' }),
+        2500
+      );
+      assert.strictEqual(
+        readDaemonTimeoutMs({ ZRDT_DAEMON_TIMEOUT_MS: '0' }),
+        0
+      );
+      assert.strictEqual(
+        readDaemonTimeoutMs({ ZRDT_DAEMON_TIMEOUT_MS: 'soon' }),
+        10_000
+      );
+      assert.strictEqual(
+        readDaemonTimeoutMs({ ZRDT_DAEMON_TIMEOUT_MS: '-5' }),
+        10_000
+      );
+    });
+
+    it('fails closed when zrdtd does not answer in time', async () => {
+      // The warm-up starts the child; its replies come in two parts 30 ms
+      // apart, well within the timeout.
+      backend = fakeDaemon(1000);
+      await backend.call(Op.HEADS, ascii('warm-up'));
+      const failures = new Array<ZrdtBackendError>();
+      backend.onUnavailable(error => failures.push(error));
+
+      const started = Date.now();
+      const hanging = backend.call(Op.ACCEPT, ascii('hang'));
+      // (The fake answers out of order; zrdtd would not answer this one
+      // before the first, so it hangs too.)
+      const queued = backend.call(Op.HEADS, ascii('hang'));
+      await assert.isRejected(hanging, /did not answer ACCEPT within 1000 ms/);
+      await assert.isRejected(queued, /unavailable/);
+      assert.isAtLeast(Date.now() - started, 900);
+
+      assert.isFalse(backend.isAvailable());
+      assert.strictEqual(failures.length, 1);
+      assert.strictEqual(failures[0]?.code, 'unavailable');
+      await assert.isRejected(
+        backend.call(Op.HEADS, new Uint8Array(0)),
+        /unavailable/
+      );
+    });
+
+    it('a slow answer within the timeout is fine; the clock restarts on every reply', async () => {
+      backend = fakeDaemon(1000);
+      await backend.call(Op.HEADS, ascii('warm-up'));
+      // Three answers about 630 ms apart: about 1.9 s in all, each gap under
+      // the timeout.
+      const replies = await Promise.all([
+        backend.call(Op.HASH, ascii('slow')),
+        backend.call(Op.HASH, ascii('slow')),
+        backend.call(Op.HASH, ascii('slow')),
+      ]);
+      assert.deepEqual(
+        replies.map(r => asText(r.body)),
+        ['slow', 'slow', 'slow']
+      );
+      // Idle with nothing pending: no timeout.
+      await new Promise(resolve => setTimeout(resolve, 1200));
+      assert.isTrue(backend.isAvailable());
     });
 
     it('fails closed when zrdtd is killed', async () => {
