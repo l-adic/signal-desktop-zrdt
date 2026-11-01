@@ -388,9 +388,22 @@ export function commitWithOpening(
   };
 }
 
-/** Whether `opening` opens the record's commitment. */
+/**
+ * Whether `opening` opens the record's commitment (Lean `openingMatches`):
+ * a 32-byte nonce, then well-formed protobuf bytes with no top-level field
+ * 15 or 200, whose commitment under the record's group and author is the
+ * record's commit.
+ */
 export function opens(record: StubRecord, opening: Bytes): boolean {
   if (opening.length < NONCE_BYTES) {
+    return false;
+  }
+  const committed = opening.subarray(NONCE_BYTES);
+  const stripped = removeTopLevelFields(
+    committed,
+    new Set([FIELD_GROUP_V2, FIELD_ZRDT])
+  );
+  if (stripped === undefined || !equal(stripped, committed)) {
     return false;
   }
   return equal(

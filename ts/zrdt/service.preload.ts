@@ -35,7 +35,9 @@ export type {
   ZrdtStatus,
 } from './serviceCore.node.ts';
 
-function groupIdOf(conversationId: string): Uint8Array | undefined {
+function groupIdOf(
+  conversationId: string
+): Uint8Array<ArrayBuffer> | undefined {
   const groupId =
     window.ConversationController?.get(conversationId)?.get('groupId');
   if (groupId == null) {

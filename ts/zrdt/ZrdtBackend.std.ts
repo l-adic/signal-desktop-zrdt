@@ -33,12 +33,12 @@ export const MAX_LINKS = 4096;
 export const RECORD_COUNT_LIMIT = 2 ** 24;
 
 /**
- * The frame protocol version of zrdt core as of this host. Version 1 is the
- * layout of core/Zrdt/Proto.lean at zrdt e2b3160. The lead's changes (an
- * ACCEPT reply with the record bytes, a COMMIT reply with the opening, and
- * ACCEPT_RECORD) are read by body length, so the host speaks both.
+ * The frame protocol version this host speaks: 2 (zrdt build/t5-core: the
+ * ACCEPT reply carries the record bytes, the COMMIT reply the opening, and
+ * ACCEPT_RECORD exists). The daemon backend also reads protocol 1 replies
+ * (zrdt e2b3160), by body length, and falls back for ACCEPT_RECORD.
  */
-export const PROTOCOL_VERSION = 1;
+export const PROTOCOL_VERSION = 2;
 
 /**
  * The parts of a record. `group` is the group's 32-byte id, `commit` the

@@ -1,5 +1,6 @@
 // Copyright 2026 zrdt contributors
 // SPDX-License-Identifier: AGPL-3.0-only
+// oxlint-disable max-classes-per-file
 
 // The bytes of every zrdtd request and reply (zrdt core/Zrdt/Proto.lean, the
 // module header). Both directions are here: the daemon backend encodes
@@ -74,7 +75,9 @@ export enum Code {
 // Writing
 // ---------------------------------------------------------------------------
 
-export function concatBytes(parts: ReadonlyArray<Uint8Array>): Bytes {
+export function concatBytes(
+  parts: ReadonlyArray<Uint8Array<ArrayBuffer>>
+): Bytes {
   let length = 0;
   for (const part of parts) {
     length += part.length;
@@ -99,7 +102,7 @@ export function u32(value: number): Bytes {
 }
 
 /** `bytes`: a u32 length, then the bytes. */
-export function wBytes(bytes: Uint8Array): Bytes {
+export function wBytes(bytes: Uint8Array<ArrayBuffer>): Bytes {
   return concatBytes([u32(bytes.length), bytes]);
 }
 
@@ -109,7 +112,9 @@ export function wStr(text: string): Bytes {
 }
 
 /** `digests`: a u32 count, then the digests. */
-export function wDigests(digests: ReadonlyArray<Uint8Array>): Bytes {
+export function wDigests(
+  digests: ReadonlyArray<Uint8Array<ArrayBuffer>>
+): Bytes {
   return concatBytes([u32(digests.length), ...digests]);
 }
 
@@ -177,7 +182,7 @@ export class Reader {
   #offset = 0;
   readonly #bytes: Bytes;
 
-  constructor(bytes: Uint8Array) {
+  constructor(bytes: Uint8Array<ArrayBuffer>) {
     this.#bytes = new Uint8Array(bytes);
   }
 
@@ -298,7 +303,7 @@ export class Reader {
 
 /** Runs `read` on `bytes`; undefined if a field is cut short or bytes are left. */
 export function readAll<T>(
-  bytes: Uint8Array,
+  bytes: Uint8Array<ArrayBuffer>,
   read: (r: Reader) => T
 ): T | undefined {
   const r = new Reader(bytes);
@@ -396,7 +401,7 @@ export function encodeRequestBody(req: Request): Bytes {
  * ACCEPT_RECORD.
  */
 export function decodeRequest(
-  payload: Uint8Array,
+  payload: Uint8Array<ArrayBuffer>,
   { withAcceptRecord = true }: { withAcceptRecord?: boolean } = {}
 ): Request | Code.BAD_REQUEST | Code.UNKNOWN_OP {
   if (payload.length === 0) {
@@ -689,7 +694,7 @@ function readRefusal(
 export function decodeReply<O extends Op>(
   op: O,
   status: number,
-  body: Uint8Array
+  body: Uint8Array<ArrayBuffer>
 ): ResultOf[O] | undefined {
   if (isHostError(status)) {
     throw new ReplyError(op, status);

@@ -1,5 +1,6 @@
 // Copyright 2026 zrdt contributors
 // SPDX-License-Identifier: AGPL-3.0-only
+// oxlint-disable no-await-in-loop, no-loop-func
 
 // Rung 7 (zrdt docs/PLAN.md section 6): the TypeScript stub against the Lean
 // reference. Three comparisons:
@@ -121,7 +122,7 @@ function fromHex(text: string): Bytes {
   return new Uint8Array(Buffer.from(text, 'hex'));
 }
 
-function hex(bytes: Uint8Array): string {
+function hex(bytes: Uint8Array<ArrayBuffer>): string {
   return Buffer.from(bytes).toString('hex');
 }
 
@@ -270,14 +271,11 @@ function expectReply(step: Step, actual: Bytes, label: string): void {
 // ---------------------------------------------------------------------------
 
 function prng(seed: number): () => number {
-  let state = seed >>> 0 || 1;
+  // Park-Miller: state stays below 2^31, products below 2^53.
+  let state = (Math.abs(Math.floor(seed)) % 2147483646) + 1;
   return () => {
-    state ^= state << 13;
-    state >>>= 0;
-    state ^= state >>> 17;
-    state ^= state << 5;
-    state >>>= 0;
-    return state / 0x100000000;
+    state = (state * 48271) % 2147483647;
+    return (state - 1) / 2147483646;
   };
 }
 
@@ -364,7 +362,7 @@ describe('zrdt rung 7: stub vs Lean (vectors.json, zrdtd)', function (this: Moch
           fromHex(v.nonce),
           fromHex(v.dataMessage)
         );
-        if (v.commit === null || v.committedBytes === null) {
+        if (v.commit == null || v.committedBytes == null) {
           assert.strictEqual(result.kind, 'malformed', v.name);
           continue;
         }
@@ -395,7 +393,7 @@ describe('zrdt rung 7: stub vs Lean (vectors.json, zrdtd)', function (this: Moch
   });
 
   const haveDaemon = existsSync(ZRDTD);
-  const describeDaemon = haveDaemon ? describe : describe.skip;
+  const describeDaemon = haveDaemon ? describe : () => undefined;
 
   describeDaemon(`sessions on zrdtd (${ZRDTD})`, () => {
     let daemon: DaemonBackend | undefined;
@@ -544,11 +542,7 @@ describe('zrdt rung 7: stub vs Lean (vectors.json, zrdtd)', function (this: Moch
               chat: key,
               group: pick(groups),
               input:
-                random() < 0.5
-                  ? subset
-                  : blobs.length > 0
-                    ? pick(blobs)
-                    : subset,
+                random() < 0.5 || blobs.length === 0 ? subset : pick(blobs),
             };
           } else if (roll < 0.85) {
             const facts = new Array<ProvenanceFact>();
@@ -580,7 +574,7 @@ describe('zrdt rung 7: stub vs Lean (vectors.json, zrdtd)', function (this: Moch
             // A DataMessage: body (field 1), field 15, field 200, or junk.
             const dm = pick([
               fromHex('0a0568656c6c6f'),
-              fromHex('0a026869' + '7a020000' + 'c20c00'),
+              fromHex('0a0268697a020000c20c00'),
               fromHex('0f'),
               bytes(Math.floor(random() * 8)),
             ]);
@@ -591,7 +585,19 @@ describe('zrdt rung 7: stub vs Lean (vectors.json, zrdtd)', function (this: Moch
               nonce: bytes(32),
               dataMessage: dm,
             };
-          } else if (roll < 0.95 && records.length > 0) {
+          } else if (roll < 0.93 && records.length > 0) {
+            // ACCEPT_RECORD: a known record (maybe from another chat), cut
+            // short, or with a junk opening.
+            const record = pick(records);
+            const r = random();
+            req = {
+              op: Op.ACCEPT_RECORD,
+              chat,
+              record: r < 0.1 ? record.subarray(1) : record,
+              opening:
+                r > 0.7 ? bytes(32 + Math.floor(random() * 6)) : undefined,
+            };
+          } else if (roll < 0.96 && records.length > 0) {
             req = {
               op: Op.HASH,
               parts: makeRecord(

@@ -1,5 +1,6 @@
 // Copyright 2026 zrdt contributors
 // SPDX-License-Identifier: AGPL-3.0-only
+// oxlint-disable max-classes-per-file
 
 // The zrdt service: the contract of ./service.preload.ts on top of one
 // backend (Lean daemon or stub) and the zrdt SQL tables. Everything it needs
@@ -18,6 +19,7 @@
 import { EventEmitter } from 'node:events';
 
 import { createLogger } from '../logging/log.std.ts';
+import { drop } from '../util/drop.std.ts';
 import type { AciString } from '../types/ServiceId.std.ts';
 import type {
   UpsertZrdtProvenanceOptionsType,
@@ -43,7 +45,7 @@ const log = createLogger('zrdt/service');
 // The contract types (shared by every lane; do not change their shape)
 // ---------------------------------------------------------------------------
 
-// Inputs are `Uint8Array`; outputs are `Uint8Array<ArrayBuffer>` (a subtype),
+// Inputs are `Uint8Array<ArrayBuffer>`; outputs are `Uint8Array<ArrayBuffer>` (a subtype),
 // so callers typed either way compile.
 type Bytes = Uint8Array<ArrayBuffer>;
 
@@ -97,11 +99,11 @@ export type ZrdtBackendInfo = {
 };
 
 export type ZrdtAcceptOwnArgs = {
-  groupId: Uint8Array;
-  authorAci: Uint8Array;
-  nonce: Uint8Array;
-  dataMessageBytes: Uint8Array;
-  links: Array<Uint8Array>;
+  groupId: Uint8Array<ArrayBuffer>;
+  authorAci: Uint8Array<ArrayBuffer>;
+  nonce: Uint8Array<ArrayBuffer>;
+  dataMessageBytes: Uint8Array<ArrayBuffer>;
+  links: Array<Uint8Array<ArrayBuffer>>;
 };
 
 export type ZrdtAcceptIncomingArgs = ZrdtAcceptOwnArgs & {
@@ -109,8 +111,8 @@ export type ZrdtAcceptIncomingArgs = ZrdtAcceptOwnArgs & {
 };
 
 export type ZrdtAcceptRecordArgs = {
-  record: Uint8Array;
-  opening?: Uint8Array;
+  record: Uint8Array<ArrayBuffer>;
+  opening?: Uint8Array<ArrayBuffer>;
   provenance: ZrdtProvenance;
 };
 
@@ -125,12 +127,12 @@ export type ZrdtSalvageOutcome =
   | { dropped: Array<Bytes>; missing: Array<Bytes> }
   | ZrdtOpenOutcome;
 
-export interface ZrdtServiceType {
+export type ZrdtServiceType = {
   init(): Promise<void>;
   backendInfo(): ZrdtBackendInfo;
   ensureConversation(
     conversationId: string,
-    groupId: Uint8Array
+    groupId: Uint8Array<ArrayBuffer>
   ): Promise<void>;
   heads(conversationId: string): Promise<Array<Bytes>>;
   disownSet(conversationId: string): Promise<Array<Bytes>>;
@@ -146,31 +148,34 @@ export interface ZrdtServiceType {
     conversationId: string,
     a: ZrdtAcceptRecordArgs
   ): Promise<ZrdtAcceptOutcome>;
-  has(conversationId: string, digest: Uint8Array): Promise<boolean>;
+  has(
+    conversationId: string,
+    digest: Uint8Array<ArrayBuffer>
+  ): Promise<boolean>;
   get(
     conversationId: string,
-    digest: Uint8Array
+    digest: Uint8Array<ArrayBuffer>
   ): Promise<ZrdtGetResult | undefined>;
   reachSet(
     conversationId: string,
-    from: Array<Uint8Array>
+    from: Array<Uint8Array<ArrayBuffer>>
   ): Promise<Array<Bytes>>;
   classify(conversationId: string): Promise<Map<string, ZrdtStatus>>;
   markDisowned(
     conversationId: string,
-    digest: Uint8Array,
+    digest: Uint8Array<ArrayBuffer>,
     byAci: string
   ): Promise<void>;
   exportBlob(conversationId: string): Promise<Bytes>;
   importBlob(
     conversationId: string,
-    blob: Uint8Array
+    blob: Uint8Array<ArrayBuffer>
   ): Promise<ZrdtOpenOutcome>;
   salvageBlob(
     conversationId: string,
-    blob: Uint8Array
+    blob: Uint8Array<ArrayBuffer>
   ): Promise<ZrdtSalvageOutcome>;
-}
+};
 
 // ---------------------------------------------------------------------------
 // Dependencies
@@ -212,7 +217,7 @@ export type ZrdtServiceDeps = Readonly<{
   intendedKind: () => 'lean' | 'stub';
   storage: ZrdtServiceStorage;
   /** The group's 32-byte id, if the conversation is a known group. */
-  groupIdOf: (conversationId: string) => Uint8Array | undefined;
+  groupIdOf: (conversationId: string) => Uint8Array<ArrayBuffer> | undefined;
   /** Our ACI (uuid string), if registered. */
   ourAci: () => string | undefined;
 }>;
@@ -223,18 +228,18 @@ export type ZrdtServiceDeps = Readonly<{
 
 type B = Uint8Array<ArrayBuffer>;
 
-function own(bytes: Uint8Array): B {
+function own(bytes: Uint8Array<ArrayBuffer>): B {
   return new Uint8Array(bytes);
 }
 
-export function toHex(bytes: Uint8Array): string {
+export function toHex(bytes: Uint8Array<ArrayBuffer>): string {
   return Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength).toString(
     'hex'
   );
 }
 
 /** 16 bytes -> "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx". */
-export function aciBytesToString(bytes: Uint8Array): string {
+export function aciBytesToString(bytes: Uint8Array<ArrayBuffer>): string {
   const h = toHex(bytes);
   return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`;
 }
@@ -249,8 +254,10 @@ export function aciStringToBytes(aci: string): B {
 }
 
 /** The author of an encoded record: its last 16 bytes. */
-function authorOfRecord(record: Uint8Array): Uint8Array {
-  return record.subarray(record.length - 16);
+function authorOfRecord(
+  record: Uint8Array<ArrayBuffer>
+): Uint8Array<ArrayBuffer> {
+  return record.subarray(-16);
 }
 
 function openOutcome(result: OpenResult | SalvageResult): ZrdtOpenOutcome {
@@ -283,7 +290,7 @@ function statusOf(status: Status): ZrdtStatus {
 
 function provenanceRow(
   conversationId: string,
-  digest: Uint8Array,
+  digest: Uint8Array<ArrayBuffer>,
   provenance: ZrdtProvenance
 ): ZrdtProvenanceRowType {
   return {
@@ -418,19 +425,34 @@ export class ZrdtServiceCore implements ZrdtServiceType {
 
   /** Runs `fn` after every earlier call for the same conversation. */
   #serial<T>(conversationId: string, fn: () => Promise<T>): Promise<T> {
-    const previous = this.#locks.get(conversationId) ?? Promise.resolve();
-    const next = previous.then(fn, fn);
-    const settled = next.then(
-      () => undefined,
-      () => undefined
-    );
-    this.#locks.set(conversationId, settled);
-    void settled.then(() => {
-      if (this.#locks.get(conversationId) === settled) {
-        this.#locks.delete(conversationId);
+    const previous = this.#locks.get(conversationId);
+    const run = async (): Promise<T> => {
+      try {
+        await previous;
+      } catch {
+        // An earlier call failed; this one runs anyway.
       }
-    });
+      return fn();
+    };
+    const next = run();
+    const settle = async (): Promise<void> => {
+      try {
+        await next;
+      } catch {
+        // Reported to the caller of `next`.
+      }
+    };
+    const settled = settle();
+    this.#locks.set(conversationId, settled);
+    drop(this.#unlock(conversationId, settled));
     return next;
+  }
+
+  async #unlock(conversationId: string, settled: Promise<void>): Promise<void> {
+    await settled;
+    if (this.#locks.get(conversationId) === settled) {
+      this.#locks.delete(conversationId);
+    }
   }
 
   async #enter<T>(
@@ -488,7 +510,10 @@ export class ZrdtServiceCore implements ZrdtServiceType {
   }
 
   /** NEW unless a store is open; throws for a rejected conversation. */
-  async #ensure(conversationId: string, groupId: Uint8Array): Promise<B> {
+  async #ensure(
+    conversationId: string,
+    groupId: Uint8Array<ArrayBuffer>
+  ): Promise<B> {
     const state = this.#state.get(conversationId);
     if (state?.kind === 'open') {
       return state.group;
@@ -529,7 +554,7 @@ export class ZrdtServiceCore implements ZrdtServiceType {
 
   ensureConversation(
     conversationId: string,
-    groupId: Uint8Array
+    groupId: Uint8Array<ArrayBuffer>
   ): Promise<void> {
     return this.#enter(conversationId, async () => {
       await this.#ensure(conversationId, groupId);
@@ -545,7 +570,10 @@ export class ZrdtServiceCore implements ZrdtServiceType {
     });
   }
 
-  has(conversationId: string, digest: Uint8Array): Promise<boolean> {
+  has(
+    conversationId: string,
+    digest: Uint8Array<ArrayBuffer>
+  ): Promise<boolean> {
     return this.#enter(conversationId, async backend => {
       if (this.#state.get(conversationId)?.kind !== 'open') {
         return false;
@@ -556,7 +584,7 @@ export class ZrdtServiceCore implements ZrdtServiceType {
 
   get(
     conversationId: string,
-    digest: Uint8Array
+    digest: Uint8Array<ArrayBuffer>
   ): Promise<ZrdtGetResult | undefined> {
     return this.#enter(conversationId, async backend => {
       if (this.#state.get(conversationId)?.kind !== 'open') {
@@ -577,7 +605,7 @@ export class ZrdtServiceCore implements ZrdtServiceType {
 
   reachSet(
     conversationId: string,
-    from: Array<Uint8Array>
+    from: Array<Uint8Array<ArrayBuffer>>
   ): Promise<Array<Bytes>> {
     return this.#enter(conversationId, async backend => {
       if (this.#state.get(conversationId)?.kind !== 'open') {
@@ -631,8 +659,8 @@ export class ZrdtServiceCore implements ZrdtServiceType {
 
   async #stored(
     conversationId: string,
-    digest: Uint8Array,
-    record: Uint8Array,
+    digest: Uint8Array<ArrayBuffer>,
+    record: Uint8Array<ArrayBuffer>,
     provenance: ZrdtProvenance
   ): Promise<void> {
     await this.#deps.storage.insertZrdtRecords([
@@ -646,7 +674,7 @@ export class ZrdtServiceCore implements ZrdtServiceType {
 
   async #pending(
     conversationId: string,
-    record: Uint8Array,
+    record: Uint8Array<ArrayBuffer>,
     provenance: ZrdtProvenance
   ): Promise<B | undefined> {
     const parts = decodeRecord(own(record));
@@ -955,7 +983,7 @@ export class ZrdtServiceCore implements ZrdtServiceType {
 
   markDisowned(
     conversationId: string,
-    digest: Uint8Array,
+    digest: Uint8Array<ArrayBuffer>,
     byAci: string
   ): Promise<void> {
     return this.#enter(conversationId, async () => {
@@ -1020,7 +1048,7 @@ export class ZrdtServiceCore implements ZrdtServiceType {
    */
   importBlob(
     conversationId: string,
-    blob: Uint8Array
+    blob: Uint8Array<ArrayBuffer>
   ): Promise<ZrdtOpenOutcome> {
     return this.#enter(conversationId, async backend => {
       await this.#ensureKnown(conversationId);
@@ -1045,7 +1073,7 @@ export class ZrdtServiceCore implements ZrdtServiceType {
    */
   salvageBlob(
     conversationId: string,
-    blob: Uint8Array
+    blob: Uint8Array<ArrayBuffer>
   ): Promise<ZrdtSalvageOutcome> {
     return this.#enter(conversationId, async backend => {
       const state = this.#state.get(conversationId);

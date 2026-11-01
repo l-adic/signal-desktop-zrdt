@@ -885,7 +885,7 @@ describe('zrdt stub', () => {
       const stub = newStub();
       assert.strictEqual(stub.kind, 'stub');
       assert.isTrue(stub.isAvailable());
-      assert.deepEqual(await stub.version(), { protocol: 1, build: 'stub' });
+      assert.deepEqual(await stub.version(), { protocol: 2, build: 'stub' });
     });
 
     it('is refused when ZRDT_REQUIRE_LEAN=1', () => {
@@ -915,7 +915,7 @@ describe('zrdt stub', () => {
       await stub.create(CHAT, GROUP);
       const nonce = filled(32, 0x4e);
       // body "hi" (field 1), groupV2 (field 15, dropped), zrdt (200, dropped)
-      const dataMessage = fromHex('0a026869' + '7a020000' + 'c20c00');
+      const dataMessage = fromHex('0a0268697a020000c20c00');
       const committed = await stub.commit(GROUP, ALICE, nonce, dataMessage);
       assert.strictEqual(committed.kind, 'ok');
       if (committed.kind !== 'ok') {
@@ -930,7 +930,7 @@ describe('zrdt stub', () => {
       };
       const record = encodeRecord(makeRecord(parts));
       const bad = new Uint8Array(committed.opening);
-      bad[bad.length - 1] = (bad[bad.length - 1] ?? 0) ^ 1;
+      bad[bad.length - 1] = ((bad[bad.length - 1] ?? 0) + 1) % 256;
       assert.deepEqual(await stub.acceptRecord(CHAT, record, bad), {
         kind: 'badOpening',
       });

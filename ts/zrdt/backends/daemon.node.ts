@@ -345,6 +345,7 @@ export class DaemonBackend implements ZrdtBackend {
       this.#fail(message);
       throw new ZrdtBackendError('unavailable', message);
     }
+    // oxlint-disable-next-line typescript/non-nullable-type-assertion-style
     return result as ResultOf[O];
   }
 
@@ -443,6 +444,15 @@ export class DaemonBackend implements ZrdtBackend {
     }
     if (opening !== undefined) {
       if (opening.length < 32) {
+        return { kind: 'badOpening' };
+      }
+      // Lean's openingMatches: the committed bytes hold no field 15 or 200.
+      const committed = opening.subarray(32);
+      const stripped = removeTopLevelFields(committed, new Set([15, 200]));
+      if (
+        stripped === undefined ||
+        Buffer.compare(Buffer.from(stripped), Buffer.from(committed)) !== 0
+      ) {
         return { kind: 'badOpening' };
       }
       const check = await this.commit(
