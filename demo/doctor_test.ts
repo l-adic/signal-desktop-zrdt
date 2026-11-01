@@ -13,6 +13,7 @@ import { test } from 'node:test';
 
 import {
   analyse,
+  dropContentEntry,
   appendFakes,
   checkOpen,
   defaultDaemon,
@@ -241,3 +242,13 @@ void test(
     );
   }
 );
+
+void test('dropContentEntry removes one content entry of a JSON dump', () => {
+  const doc = { zrdtDump: 1, blob: 'enJkdFMy', content: { aa: 'x', bb: 'y' } };
+  const json = Buffer.from(JSON.stringify(doc));
+  const out = JSON.parse(dropContentEntry(json, 'aa').toString('utf8')) as {
+    content: Record<string, string>;
+  };
+  assert.deepEqual(out.content, { bb: 'y' });
+  assert.equal(dropContentEntry(json, 'cc'), json);
+});

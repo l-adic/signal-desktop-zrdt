@@ -10,8 +10,16 @@
 // the panel's "Link Dave's desktop" button, `POST /actions/link-dave`, or
 // `--link-dave` (link right after the warm-up, for rehearsals).
 //
+// doctor.ts runs on the live exports by itself (RESTORE_PLAN.md §6): when
+// Carol exports (Settings → Internal → Export store), one linked, non-head
+// record is removed from her file in place (beat 4; the original is kept as
+// .orig); when Bob exports and Dave's desktop is linked, two fakes by Bob are
+// appended and the result is written where Dave's "Import file" reads (beat
+// 5). `--no-auto-doctor` turns this off (then use the panel's doctor actions).
+//
 // Run from the repository root (build zrdtd first: cd zrdt/core && lake build):
-//   node --import tsx demo/launch.ts [--link-dave] [--port 7357] [--verbose]
+//   node --import tsx demo/launch.ts [--link-dave] [--no-auto-doctor]
+//        [--port 7357] [--verbose]
 //
 // Then open the panel URL it prints. Ctrl-C (or POST /actions/quit) closes
 // every desktop and the server. Artifacts (villain log, screenshots, desktop
@@ -54,6 +62,7 @@ const DEFAULT_PORT = 7357;
 
 type Options = {
   linkDave: boolean;
+  autoDoctor: boolean;
   port: number;
   verbose: boolean;
 };
@@ -61,6 +70,7 @@ type Options = {
 function parseArgs(argv: ReadonlyArray<string>): Options {
   const opts: Options = {
     linkDave: false,
+    autoDoctor: true,
     port: Number(process.env.ZRDT_PANEL_PORT ?? DEFAULT_PORT),
     verbose: false,
   };
@@ -68,6 +78,8 @@ function parseArgs(argv: ReadonlyArray<string>): Options {
     const a = argv[i];
     if (a === '--link-dave') {
       opts.linkDave = true;
+    } else if (a === '--no-auto-doctor') {
+      opts.autoDoctor = false;
     } else if (a === '--verbose') {
       opts.verbose = true;
     } else if (a === '--port') {
@@ -105,6 +117,81 @@ async function needExport(file: string, who: string): Promise<string> {
 function fileParam(value: string): string {
   const v = value.trim();
   return v.startsWith('~/') ? path.join(os.homedir(), v.slice(2)) : v;
+}
+
+/**
+ * Watches Carol's and Bob's export files (once a second) and runs doctor.ts
+ * on each new export: beat 4 removes a linked record from Carol's file in
+ * place; beat 5 appends two fakes by Bob and writes Dave's import path (only
+ * once Dave's desktop is linked). Returns a stop function.
+ */
+function startAutoDoctor(demo: Demo): () => void {
+  const { carol, bob, dave } = demo.byName;
+  const seen = new Map<string, number>();
+  let carolFile: string | undefined;
+  let bobFile: string | undefined;
+  let busy = false;
+  const mtime = async (file: string): Promise<number | undefined> => {
+    try {
+      return (await fs.stat(file)).mtimeMs;
+    } catch {
+      return undefined;
+    }
+  };
+  // True once per new version of `file` (and records it as seen).
+  const fresh = async (file: string): Promise<boolean> => {
+    const t = await mtime(file);
+    if (t === undefined || seen.get(file) === t) {
+      return false;
+    }
+    // Let the app finish writing: the same mtime twice, 300 ms apart.
+    await new Promise(resolve => setTimeout(resolve, 300));
+    if ((await mtime(file)) !== t) {
+      return false;
+    }
+    seen.set(file, t);
+    return true;
+  };
+  const tick = async () => {
+    if (busy) {
+      return;
+    }
+    busy = true;
+    try {
+      carolFile ??= await dumpPath(demo, carol);
+      bobFile ??= await dumpPath(demo, bob);
+      if (await fresh(carolFile)) {
+        await fs.copyFile(carolFile, `${carolFile}.orig`);
+        const summary = await doctorRemove(carolFile, carolFile);
+        const t = await mtime(carolFile);
+        if (t !== undefined) {
+          seen.set(carolFile, t);
+        }
+        say(`auto-doctor, beat 4 (Carol's export): ${summary}`);
+      }
+      if (dave.app && (await fresh(bobFile))) {
+        const out = await dumpPath(demo, dave);
+        const summary = await doctorAppend(
+          bobFile,
+          bob.boot.phone.device.aci,
+          out
+        );
+        say(`auto-doctor, beat 5 (Bob's export -> Dave): ${summary}`);
+      }
+    } catch (error) {
+      say(`auto-doctor: ${String(error)}`);
+    } finally {
+      busy = false;
+    }
+  };
+  const timer = setInterval(() => {
+    void tick();
+  }, 1_000);
+  say(
+    "auto-doctor on: Carol's export loses a linked record; Bob's export " +
+      "gains two fakes by Bob, written to Dave's import path"
+  );
+  return () => clearInterval(timer);
 }
 
 function actions(demo: Demo, quit: () => void): Record<string, PanelAction> {
@@ -155,7 +242,7 @@ function actions(demo: Demo, quit: () => void): Record<string, PanelAction> {
     'doctor-remove': {
       label:
         "Beat 4: remove a linked record from Carol's export (in place; " +
-        'the original is kept as .orig)',
+        'the original is kept as .orig). Automatic unless --no-auto-doctor',
       fields: ['file', 'digest'],
       run: async p => {
         const file = p.file?.trim()
@@ -168,7 +255,7 @@ function actions(demo: Demo, quit: () => void): Record<string, PanelAction> {
     'doctor-append': {
       label:
         "Beat 5: append two fakes by Bob to Bob's export, written where " +
-        "Dave's desktop imports from",
+        "Dave's desktop imports from. Automatic unless --no-auto-doctor",
       fields: ['file'],
       run: async p => {
         const file = p.file?.trim()
@@ -244,6 +331,7 @@ async function main(): Promise<void> {
   process.once('SIGTERM', () => quit());
 
   const demo = await setUp({ artifacts, verbose: opts.verbose });
+  let stopAutoDoctor: () => void = () => undefined;
   let panel: Awaited<ReturnType<typeof startPanel>> | undefined;
   try {
     const { alice, bob, carol, dave } = demo.byName;
@@ -259,6 +347,9 @@ async function main(): Promise<void> {
     }
     await warmUp(first);
     await screenshots(demo, first, 'ready');
+    if (opts.autoDoctor) {
+      stopAutoDoctor = startAutoDoctor(demo);
+    }
 
     if (opts.linkDave) {
       await linkDesktop(demo, 'dave');
@@ -284,6 +375,7 @@ async function main(): Promise<void> {
     process.exitCode = 1;
   } finally {
     say('closing');
+    stopAutoDoctor();
     await panel?.close();
     await fs.writeFile(
       path.join(artifacts, 'evil-log.txt'),

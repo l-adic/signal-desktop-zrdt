@@ -19,8 +19,9 @@ import { backendBadgeText } from '../../zrdt/ui/labels.std.ts';
 /**
  * Settings → Internal, beat 4 (APP.md §7 "Import / Export history", §9):
  * export the chat's store blob to a file under the profile dir, import a
- * (possibly doctored) file, or salvage it. Demo only: no OS authentication,
- * no content section yet (TODO(zrdt): RESTORE_PLAN.md dump format).
+ * (possibly doctored) file, or salvage it. Demo only: no OS authentication
+ * (TODO(zrdt)). The file is the dump of RESTORE_PLAN.md §3 (see
+ * zrdtEncodeDump in ducks/zrdt.preload.ts).
  */
 const SmartZrdtInternal = memo(function SmartZrdtInternal(): JSX.Element {
   const selectId = useId();
@@ -65,9 +66,10 @@ const SmartZrdtInternal = memo(function SmartZrdtInternal(): JSX.Element {
       return;
     }
     const outcome = await importConversation(conversationId, effectivePath);
-    if (outcome != null && outcome.status !== 'ok') {
-      // Beat 4: back to the chat, where the red banner names what is
-      // missing and offers "Keep what verifies".
+    if (outcome != null) {
+      // Back to the chat. Beat 4: the red banner names what is missing and
+      // offers "Keep what verifies". Beat 5: the imported history waits in
+      // the collapsed "not yet confirmed" section.
       await showConversation({ conversationId });
     }
   }, [conversationId, effectivePath, importConversation, showConversation]);
@@ -119,8 +121,8 @@ const SmartZrdtInternal = memo(function SmartZrdtInternal(): JSX.Element {
             />
           </div>
           <div>
-            Exports hold message structure only (authors, links, count). Do not
-            share them: they leave Signal&apos;s encryption.
+            Exports hold the chat&apos;s messages (their text, authors and
+            links). Do not share them: they leave Signal&apos;s encryption.
           </div>
           {result != null && (
             <div data-testid="zrdt-internal-result">{result}</div>
