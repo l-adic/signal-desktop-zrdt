@@ -626,7 +626,7 @@ describe('zrdt protocol 3 on the stub (JOIN_PLAN §3.2, §5)', () => {
       );
 
       const reply = await s.backend.serve(req);
-      const payload = encodeReply(Op.SERVE, reply, { extended: true });
+      const payload = encodeReply(Op.SERVE, reply);
       assert.strictEqual(payload[0], Code.OK);
       assert.strictEqual(
         hex(payload.subarray(1)),
@@ -645,11 +645,7 @@ describe('zrdt protocol 3 on the stub (JOIN_PLAN §3.2, §5)', () => {
         op: Op.AUDIENCE,
         members,
       });
-      const tooLarge = encodeReply(
-        Op.AUDIENCE,
-        { kind: 'tooLarge' },
-        { extended: true }
-      );
+      const tooLarge = encodeReply(Op.AUDIENCE, { kind: 'tooLarge' });
       assert.deepEqual([...tooLarge], [Code.TOO_LARGE]);
       assert.deepEqual(
         decodeReply(Op.AUDIENCE, Code.TOO_LARGE, new Uint8Array(0)),
@@ -690,20 +686,30 @@ describe('zrdt protocol 3 on the stub (JOIN_PLAN §3.2, §5)', () => {
         parts,
         opening,
       });
-      // Protocol 2 vectors read ACCEPT without the flag byte.
-      const old = encodeRequestBody({ op: Op.ACCEPT, chat: CHAT, parts });
+      // Protocol 3 only: ACCEPT without the opening flag is cut short, and
+      // the flag is 0 or 1.
+      const bare = encodeRequestBody({ op: Op.ACCEPT, chat: CHAT, parts });
+      assert.strictEqual(bare.at(-1), 0);
       assert.deepEqual(
-        decodeRequest(concat([Uint8Array.of(Op.ACCEPT), old.slice(0, -1)]), {
-          protocol: 2,
-        }),
+        decodeRequest(concat([Uint8Array.of(Op.ACCEPT), bare])),
         { op: Op.ACCEPT, chat: CHAT, parts }
       );
       assert.strictEqual(
-        decodeRequest(Uint8Array.of(Op.SERVE), { protocol: 2 }),
-        Code.UNKNOWN_OP
+        decodeRequest(concat([Uint8Array.of(Op.ACCEPT), bare.slice(0, -1)])),
+        Code.BAD_REQUEST
       );
+      const flag2 = bare.slice();
+      flag2[flag2.length - 1] = 2;
+      assert.strictEqual(
+        decodeRequest(concat([Uint8Array.of(Op.ACCEPT), flag2])),
+        Code.BAD_REQUEST
+      );
+      // The ACCEPT reply holds the record bytes, the COMMIT reply the opening:
+      // a reply without them cannot be read.
+      assert.isUndefined(decodeReply(Op.ACCEPT, Code.OK, fill(4, 32)));
+      assert.isUndefined(decodeReply(Op.COMMIT, Code.OK, fill(5, 32)));
       assert.deepEqual(
-        [...encodeReply(Op.ACCEPT, { kind: 'noAudience' }, { extended: true })],
+        [...encodeReply(Op.ACCEPT, { kind: 'noAudience' })],
         [Code.NO_AUDIENCE]
       );
       assert.deepEqual(

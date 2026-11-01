@@ -415,6 +415,7 @@ const STATUS_NAMES: Record<number, string> = {
   0x06: 'UNVERIFIABLE',
   0x07: 'NOT_FOUND',
   0x08: 'BAD_OPENING',
+  0x09: 'NO_AUDIENCE',
   0x80: 'BAD_REQUEST',
   0x81: 'UNKNOWN_OP',
   0x82: 'NO_CHAT',
@@ -540,10 +541,13 @@ export class Zrdtd {
         parts.commit,
         digests(parts.links),
         parts.author,
+        // Protocol 3: the opening flag. A fake has no opening, so zrdtd
+        // records no audience for it.
+        Buffer.from([0]),
       ])
     );
     expectOk('ACCEPT', r);
-    // The digest comes first (later protocol versions append the record).
+    // The digest, then the record's encoding.
     return Buffer.from(r.body.subarray(0, DIGEST));
   }
 

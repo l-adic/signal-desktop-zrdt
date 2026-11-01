@@ -29,6 +29,8 @@ export type ZrdtCIMessageType = {
   received_at: number;
   sourceServiceId?: string;
   zrdtDigest?: string;
+  /** The opening (base64): nonce ‖ the committed DataMessage, field 201 in it. */
+  zrdtOpening?: string;
   zrdtProvenance?: MessageAttributesType['zrdtProvenance'];
   zrdtStatus?: MessageAttributesType['zrdtStatus'];
   /** CLASSIFY status from the UI slice (fresher than the attribute). */
@@ -88,6 +90,7 @@ function toCIMessage(message: MessageAttributesType): ZrdtCIMessageType {
     received_at: message.received_at,
     sourceServiceId: message.sourceServiceId,
     zrdtDigest: message.zrdtDigest,
+    zrdtOpening: message.zrdtOpening,
     zrdtProvenance: message.zrdtProvenance,
     zrdtStatus: message.zrdtStatus,
     classify:

@@ -8,7 +8,10 @@
 // villain armed through the panel's HTTP API (so the panel is tested too):
 //
 //   beat 1  three messages; every desktop shows each one with the SAME
-//           zrdtDigest; Bob's compare code pasted at Carol reads "Identical".
+//           zrdtDigest, and its opening commits the author's audience
+//           (DataMessage field 201): the four members, each under the tag of
+//           its identity key; Bob's compare code pasted at Carol reads
+//           "Identical".
 //   beat 2  dropGroupMsg(alice, carol); Alice sends, Bob replies plainly.
 //           Carol shows Bob's reply and a gap row, then recovers Alice's
 //           message ("relayed by Bob", then "confirmed by Alice").
@@ -36,6 +39,7 @@
 //   node --import tsx demo/smoke.ts [--only-harness]
 // Artifacts: demo/artifacts/smoke/ (ZRDT_SMOKE_OUT): run.json, screenshots, logs.
 
+import { createHash } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
@@ -177,6 +181,8 @@ type MessageView = {
   body?: string;
   type?: string;
   zrdtDigest?: string;
+  // base64: nonce ‖ the committed DataMessage (only from the T3 hooks).
+  zrdtOpening?: string;
   zrdtProvenance?: { kind: string; byAci?: string };
   zrdtStatus?: { kind: string; wasRelayed?: boolean };
   // Only from the T3 hooks: the label the UI shows ("relayed by Bob").
@@ -220,6 +226,120 @@ async function sameDigest(
       first !== undefined &&
       HEX64.test(first) &&
       digests.every(d => d === first);
+    return { ok, detail: `"${sent.text}": ${detail}` };
+  });
+}
+
+/**
+ * The values of the top-level fields 201 of a DataMessage, or undefined if
+ * it does not parse (varint, 64-bit, length-delimited and 32-bit fields).
+ */
+function field201Values(
+  message: Buffer<ArrayBuffer>
+): Array<Buffer<ArrayBuffer>> | undefined {
+  const out = new Array<Buffer<ArrayBuffer>>();
+  let at = 0;
+  const varint = (): number | undefined => {
+    let value = 0;
+    for (let shift = 0; shift < 64 && at < message.length; shift += 7) {
+      const byte = message[at] ?? 0;
+      at += 1;
+      value += (byte % 0x80) * 2 ** shift;
+      if (byte < 0x80) {
+        return value;
+      }
+    }
+    return undefined;
+  };
+  while (at < message.length) {
+    const key = varint();
+    if (key === undefined) {
+      return undefined;
+    }
+    const wire = key % 8;
+    if (wire === 0) {
+      if (varint() === undefined) {
+        return undefined;
+      }
+    } else if (wire === 1) {
+      at += 8;
+    } else if (wire === 5) {
+      at += 4;
+    } else if (wire === 2) {
+      const n = varint();
+      if (n === undefined || at + n > message.length) {
+        return undefined;
+      }
+      if (Math.floor(key / 8) === 201) {
+        out.push(message.subarray(at, at + n));
+      }
+      at += n;
+    } else {
+      return undefined;
+    }
+  }
+  return at === message.length ? out : undefined;
+}
+
+/**
+ * The field-201 value the group's messages must carry: every member's ACI
+ * and the tag of its identity key (SHA-256("zrdtK1" ‖ key), 16 bytes),
+ * sorted by ACI (JOIN_PLAN §3.2).
+ */
+async function expectedAudience(
+  members: ReadonlyArray<Member>
+): Promise<string> {
+  const entries = await Promise.all(
+    members.map(async m => {
+      const { device } = m.boot.phone;
+      const key = (await device.getIdentityKey()).serialize();
+      const keyTag = createHash('sha256')
+        .update('zrdtK1')
+        .update(key)
+        .digest()
+        .subarray(0, 16);
+      return Buffer.concat([aciBytes(device.aci), keyTag]);
+    })
+  );
+  entries.sort(Buffer.compare);
+  return Buffer.concat(entries).toString('hex');
+}
+
+/**
+ * zrdt: on every desktop in `on`, the message's opening commits exactly one
+ * field 201, and it is `expected` (an audience is required: zrdtd refuses an
+ * opening without one).
+ */
+async function audienceCommitted(
+  id: string,
+  sent: Sent,
+  on: ReadonlyArray<Member>,
+  expected: string
+): Promise<boolean> {
+  return attempt(id, 'zrdt', async () => {
+    const seen = await Promise.all(
+      on.map(async m => {
+        const opening = (await messageAt(m, sent))?.zrdtOpening;
+        if (opening === undefined) {
+          return 'no opening';
+        }
+        const values = field201Values(
+          Buffer.from(opening, 'base64').subarray(32)
+        );
+        if (values === undefined) {
+          return 'unreadable';
+        }
+        if (values.length !== 1) {
+          return `${values.length} fields 201`;
+        }
+        const value = values[0]?.toString('hex') ?? '';
+        return value === expected
+          ? `${value.length / 64} seats`
+          : `other audience ${value.slice(0, 16)}`;
+      })
+    );
+    const ok = seen.every(x => x === `${expected.length / 64} seats`);
+    const detail = on.map((m, i) => `${m.name}=${seen[i]}`).join(' ');
     return { ok, detail: `"${sent.text}": ${detail}` };
   });
 }
@@ -344,6 +464,16 @@ async function beat1(demo: Demo, trio: ReadonlyArray<Member>): Promise<void> {
   for (const sent of sentAll) {
     // oxlint-disable-next-line no-await-in-loop
     await sameDigest(`beat1 same zrdtDigest "${sent.text}"`, sent, trio);
+  }
+  const audience = await expectedAudience(demo.members);
+  for (const sent of sentAll) {
+    // oxlint-disable-next-line no-await-in-loop
+    await audienceCommitted(
+      `beat1 field 201 seats the four members "${sent.text}"`,
+      sent,
+      trio,
+      audience
+    );
   }
   await attempt('beat1 compare codes identical', 'zrdt', async () => {
     const outcome = await compare(demo, bob, carol);

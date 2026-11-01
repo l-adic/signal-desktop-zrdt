@@ -365,6 +365,7 @@ export function removeTopLevelFields(
  * `SHA-256("zrdtP1" ‖ group ‖ author ‖ nonce ‖ DataMessage without fields
  * 15 and 200)`. Throws `badInput` on wrong sizes or bytes that are not
  * protobuf.
+ * @testexport
  */
 export function commitment(
   group: Bytes,

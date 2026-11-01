@@ -6,14 +6,19 @@
 // reference. Three comparisons:
 //
 // 1. zrdt/vectors/vectors.json (written by the Lean code): the static
-//    encodings, and every session step run on a fresh stub, through
-//    codec.decodeRequest -> StubBackend -> codec.encodeReply, compared byte
-//    for byte with Lean's reply.
+//    encodings (records, blobs, commitments and the audience each opening
+//    carries, key tags, reply bytes), and every session step run on a fresh
+//    stub, through codec.decodeRequest -> StubBackend -> codec.encodeReply,
+//    compared byte for byte with Lean's reply.
 // 2. The same sessions on zrdtd: raw frames (rung 6, here in TypeScript),
 //    and through the typed DaemonBackend (its request encoders and reply
-//    decoders).
-// 3. A randomized differential: the same random op sequence on the stub and
-//    on zrdtd, typed replies compared.
+//    decoders). On zrdtd the VERSION reply must match too: the binary is the
+//    build the vectors were written from.
+// 3. Randomized differentials: the same random op sequence on the stub and
+//    on zrdtd, replies compared byte for byte.
+//
+// Protocol 3 only (greenfield): no step may differ, and vectors of another
+// protocol fail the run.
 //
 // zrdtd: $ZRDTD, else zrdt/core/.lake/build/bin/zrdtd (cd zrdt/core && lake
 // build). Without it, parts 2 and 3 are skipped.
@@ -43,11 +48,7 @@ import {
   encodeReply,
   encodeRequestBody,
 } from '../../zrdt/backends/codec.std.ts';
-import type {
-  ReplyOptions,
-  Request,
-  ResultOf,
-} from '../../zrdt/backends/codec.std.ts';
+import type { Request, ResultOf } from '../../zrdt/backends/codec.std.ts';
 import { DaemonBackend } from '../../zrdt/backends/daemon.node.ts';
 import {
   StubBackend,
@@ -58,7 +59,10 @@ import {
   hashRecord,
   makeRecord,
   sha256,
+  stubKeyTag,
 } from '../../zrdt/backends/stub.node.ts';
+import { audienceOfOpening } from '../../zrdt/audience.std.ts';
+import { keyTag } from '../../zrdt/seal.node.ts';
 
 // ---------------------------------------------------------------------------
 // Vectors
@@ -113,7 +117,11 @@ type Vectors = Readonly<{
     dataMessage: string;
     committedBytes: string | null;
     commit: string | null;
+    opening: string | null;
+    audience: string | null;
   }>;
+  keyTag: ReadonlyArray<{ name: string; key: string; tag: string }>;
+  replies: ReadonlyArray<{ name: string; reply: string }>;
   sessions: ReadonlyArray<{ name: string; steps: ReadonlyArray<Step> }>;
 }>;
 
@@ -132,24 +140,6 @@ function hex(bytes: Uint8Array<ArrayBuffer>): string {
 
 function loadVectors(): Vectors {
   return JSON.parse(readFileSync(VECTORS_PATH, 'utf8')) as Vectors;
-}
-
-/** Whether the vectors carry the lead's extended ACCEPT and COMMIT replies. */
-function replyOptions(vectors: Vectors): ReplyOptions {
-  for (const session of vectors.sessions) {
-    for (const step of session.steps) {
-      if (step.op === 'ACCEPT' && step.status === 'OK') {
-        return { extended: step.reply.length > 2 + 64 };
-      }
-    }
-  }
-  return { extended: false };
-}
-
-function hasAcceptRecord(vectors: Vectors): boolean {
-  return vectors.sessions.some(s =>
-    s.steps.some(step => step.op === 'ACCEPT_RECORD')
-  );
 }
 
 // ---------------------------------------------------------------------------
@@ -207,18 +197,14 @@ async function runTyped(
 }
 
 /** A request payload in, a reply payload out, as zrdtd would answer. */
-async function serve(
-  backend: ZrdtBackend,
-  payload: Bytes,
-  options: ReplyOptions & { withAcceptRecord: boolean; protocol?: number }
-): Promise<Bytes> {
-  const req = decodeRequest(payload, options);
+async function serve(backend: ZrdtBackend, payload: Bytes): Promise<Bytes> {
+  const req = decodeRequest(payload);
   if (typeof req === 'number') {
     return Uint8Array.of(req);
   }
   try {
     const result = await runTyped(backend, req);
-    return encodeReply(req.op, result, options);
+    return encodeReply(req.op, result);
   } catch (error) {
     if (error instanceof ZrdtBackendError) {
       if (error.code === 'unknownChat') {
@@ -236,36 +222,11 @@ async function serve(
 }
 
 /**
- * Steps where the Lean of these vectors differs from a decision the lead
- * made after wave 1, which the stub already follows and lane T5 is putting
- * into Lean: step name -> the reply the decision gives. Once vectors.json
- * from build/t5-core gives these replies, the entries are inert.
+ * Compares a reply byte for byte. A build-dependent step (VERSION) on the
+ * stub compares status and protocol only: the stub's build text is "stub".
  */
-const PENDING_T5: ReadonlyMap<string, string> = new Map([
-  // Lead decision (3): a blob count >= 2^24 is TOO_LARGE, checked first.
-  [
-    'OPEN a blob whose header claims 2^32 - 1 records: malformed, nothing allocated',
-    '04',
-  ],
-  ['SALVAGE the same blob', '04'],
-]);
-
-/** Compares a reply, or only status and protocol for build-dependent steps. */
 function expectReply(step: Step, actual: Bytes, label: string): void {
-  const decided = PENDING_T5.get(step.name);
-  if (
-    decided !== undefined &&
-    label === 'stub' &&
-    hex(actual) === decided &&
-    step.reply !== decided
-  ) {
-    // eslint-disable-next-line no-console
-    console.log(
-      `      (pending T5) ${step.name}: Lean ${step.reply}, stub ${decided}`
-    );
-    return;
-  }
-  if (step.buildDependent) {
+  if (step.buildDependent && label === 'stub') {
     assert.strictEqual(
       hex(actual).slice(0, 10),
       step.reply.slice(0, 10),
@@ -274,6 +235,20 @@ function expectReply(step: Step, actual: Bytes, label: string): void {
     return;
   }
   assert.strictEqual(hex(actual), step.reply, `${label}: ${step.name}`);
+}
+
+/** The reply of a `replies` vector, by the op its name starts with. */
+function replyOp(name: string): Op.ACCEPT | Op.OPEN | Op.SALVAGE {
+  if (name.startsWith('ACCEPT')) {
+    return Op.ACCEPT;
+  }
+  if (name.startsWith('SALVAGE')) {
+    return Op.SALVAGE;
+  }
+  if (name.startsWith('OPEN')) {
+    return Op.OPEN;
+  }
+  throw new Error(`no op for reply vector "${name}"`);
 }
 
 // ---------------------------------------------------------------------------
@@ -297,23 +272,10 @@ describe('zrdt rung 7: stub vs Lean (vectors.json, zrdtd)', function (this: Moch
   this.timeout(120_000);
 
   const vectors = loadVectors();
-  const options = {
-    ...replyOptions(vectors),
-    withAcceptRecord: hasAcceptRecord(vectors),
-    protocol: vectors.protocol,
-  };
-  // The sessions pin frames of one protocol. Vectors of an older protocol
-  // (the zrdt submodule before the join core lands) cannot run on a
-  // protocol-3 stub, and that checkout's zrdtd speaks the older protocol too.
-  const sameProtocol = vectors.protocol === PROTOCOL_VERSION;
-  const describeSessions = sameProtocol ? describe : () => undefined;
-  if (!sameProtocol) {
-    // eslint-disable-next-line no-console
-    console.log(
-      `      vectors.json is protocol ${vectors.protocol}, the host ` +
-        `${PROTOCOL_VERSION}: sessions skipped until the vectors are regenerated`
-    );
-  }
+
+  it('vectors.json is protocol 3, the protocol the host speaks', () => {
+    assert.strictEqual(vectors.protocol, PROTOCOL_VERSION);
+  });
 
   describe('static encodings on the stub', () => {
     it('sha256', () => {
@@ -397,25 +359,64 @@ describe('zrdt rung 7: stub vs Lean (vectors.json, zrdtd)', function (this: Moch
             v.name
           );
           assert.strictEqual(hex(result.commit), v.commit, v.name);
+          assert.strictEqual(hex(result.opening), v.opening, v.name);
         }
+      }
+    });
+
+    it('commit: the audience each opening carries (field 201)', () => {
+      let withAudience = 0;
+      for (const v of vectors.commit) {
+        if (v.opening == null) {
+          continue;
+        }
+        const seats = audienceOfOpening(fromHex(v.opening));
+        const actual =
+          seats === undefined
+            ? null
+            : seats.map(seat => hex(seat.aci) + hex(seat.tag)).join('');
+        assert.strictEqual(actual, v.audience, v.name);
+        if (seats !== undefined) {
+          withAudience += 1;
+        }
+      }
+      assert.isAbove(withAudience, 0, 'some opening carries an audience');
+    });
+
+    it('keyTag: the stub and the sealing code give the tags', () => {
+      assert.isAbove(vectors.keyTag.length, 0);
+      for (const v of vectors.keyTag) {
+        assert.strictEqual(hex(stubKeyTag(fromHex(v.key))), v.tag, v.name);
+        assert.strictEqual(hex(keyTag(fromHex(v.key))), v.tag, v.name);
+      }
+    });
+
+    it('replies no request can produce: read and written again', () => {
+      assert.isAbove(vectors.replies.length, 0);
+      for (const v of vectors.replies) {
+        const op = replyOp(v.name);
+        const bytes = fromHex(v.reply);
+        const result = decodeReply(op, bytes[0] ?? 0, bytes.slice(1));
+        assert.isDefined(result, v.name);
+        assert.strictEqual(hex(encodeReply(op, result)), v.reply, v.name);
       }
     });
   });
 
-  describeSessions('sessions on the stub', () => {
+  describe('sessions on the stub', () => {
     for (const session of vectors.sessions) {
       it(`session ${session.name}`, async () => {
         const stub = new StubBackend({ env: {} });
         for (const step of session.steps) {
           // oxlint-disable-next-line no-await-in-loop
-          const reply = await serve(stub, fromHex(step.request), options);
+          const reply = await serve(stub, fromHex(step.request));
           expectReply(step, reply, 'stub');
         }
       });
     }
   });
 
-  const haveDaemon = existsSync(ZRDTD) && sameProtocol;
+  const haveDaemon = existsSync(ZRDTD);
   const describeDaemon = haveDaemon ? describe : () => undefined;
 
   describeDaemon(`sessions on zrdtd (${ZRDTD})`, () => {
@@ -441,7 +442,7 @@ describe('zrdt rung 7: stub vs Lean (vectors.json, zrdtd)', function (this: Moch
         const backend = daemon;
         for (const step of session.steps) {
           // oxlint-disable-next-line no-await-in-loop
-          const reply = await serve(backend, fromHex(step.request), options);
+          const reply = await serve(backend, fromHex(step.request));
           expectReply(step, reply, 'zrdtd typed');
         }
       });
@@ -494,7 +495,6 @@ describe('zrdt rung 7: stub vs Lean (vectors.json, zrdtd)', function (this: Moch
         const known = new Array<Digest>();
         const records = new Array<Bytes>();
         const blobs = new Array<Bytes>();
-        const extended = { extended: true, withAcceptRecord: true };
 
         const both = async (req: Request, label: string): Promise<void> => {
           const payload = concatBytes([
@@ -502,8 +502,8 @@ describe('zrdt rung 7: stub vs Lean (vectors.json, zrdtd)', function (this: Moch
             encodeRequestBody(req),
           ]);
           const [a, b] = await Promise.all([
-            serve(stub, payload, extended),
-            serve(lean, payload, extended),
+            serve(stub, payload),
+            serve(lean, payload),
           ]);
           assert.strictEqual(hex(a), hex(b), `seed ${seed}: ${label}`);
           const k = `${Op[req.op]} ${Code[a[0] ?? 0] ?? a[0]}`;
@@ -665,15 +665,21 @@ describe('zrdt rung 7: stub vs Lean (vectors.json, zrdtd)', function (this: Moch
     }
   });
 
-  // Protocol 3 (JOIN_PLAN §3.2, §5): records with audiences, then AUDIENCE,
-  // ACCEPT with an opening, SERVE and ADDRESSED with random queries, on the
-  // stub and on zrdtd, replies compared byte for byte.
+  // Protocol 3 (JOIN_PLAN §3.2, §5): AUDIENCE (members in any order, too
+  // many, an ACI twice), COMMIT, ACCEPT and ACCEPT_RECORD with openings (their
+  // own, another record's, none; field 201 once, twice, malformed, missing),
+  // SERVE and ADDRESSED with random queries and held openings (some not the
+  // record's), and restarts (ENCODE, CLOSE, OPEN, the held openings sent
+  // again with ACCEPT_RECORD), on the stub and on zrdtd, replies compared
+  // byte for byte.
   describeDaemon('randomized SERVE differential: stub vs zrdtd', () => {
     let daemon: DaemonBackend | undefined;
     afterEach(() => {
       daemon?.dispose();
       daemon = undefined;
     });
+    // Which (op, reply status) pairs the random runs reached.
+    const coverage = new Map<string, number>();
 
     const seedCount = Number(process.env.ZRDT_DIFF_SEEDS ?? 4);
     for (let seed = 1; seed <= seedCount; seed += 1) {
@@ -691,92 +697,252 @@ describe('zrdt rung 7: stub vs Lean (vectors.json, zrdtd)', function (this: Moch
         };
         const some = <T>(items: ReadonlyArray<T>, p: number): Array<T> =>
           items.filter(() => random() < p);
+        const shuffle = <T>(items: ReadonlyArray<T>): Array<T> => {
+          const out = [...items];
+          for (let i = out.length - 1; i > 0; i -= 1) {
+            const j = Math.floor(random() * (i + 1));
+            const x = out[i] as T;
+            out[i] = out[j] as T;
+            out[j] = x;
+          }
+          return out;
+        };
         const fill = (n: number, b: number): Bytes => new Uint8Array(n).fill(b);
+        const varint = (value: number): Array<number> => {
+          const out = new Array<number>();
+          let n = value;
+          while (n >= 0x80) {
+            out.push((n % 0x80) + 0x80);
+            n = Math.floor(n / 0x80);
+          }
+          out.push(n);
+          return out;
+        };
+        // Field 201 (key 1610: the varint ca 0c) holding `value`.
+        const field201 = (value: Bytes): Array<number> => [
+          0xca,
+          0x0c,
+          ...varint(value.length),
+          ...value,
+        ];
+        // `n` distinct ACIs, none of them a member's.
+        const crowd = (n: number): Array<{ aci: Bytes }> =>
+          Array.from({ length: n }, (_, i) => {
+            const aci = new Uint8Array(16);
+            aci[0] = 0xe0;
+            aci[1] = Math.floor(i / 256);
+            aci[2] = i % 256;
+            return { aci };
+          });
+
         const group = fill(32, 0x67);
         const chat = 'camping';
-        const members = [0xa1, 0xb0, 0xc0, 0xd0].map(b => fill(16, b));
+        // Not in byte order: AUDIENCE sorts.
+        const members = [0xd0, 0xa1, 0xc0, 0xb0, 0x07].map(b => fill(16, b));
         const keys = [0x05, 0x06, 0x07, 0x08, 0x09].map(b => fill(33, b));
         const known = new Array<Digest>();
+        const recordOf = new Map<string, Bytes>();
         const openings = new Array<{ digest: Digest; opening: Bytes }>();
+        // Every opening COMMIT gave, accepted or not.
+        const allOpenings = new Array<Bytes>();
         let nonceByte = 0;
-        // What the SERVE replies held, so the run is known to reach content.
         let served = 0;
         let content = 0;
         let structure = 0;
+        let restarts = 0;
 
         const both = async (req: Request, label: string): Promise<Bytes> => {
           const payload = concatBytes([
             Uint8Array.of(req.op),
             encodeRequestBody(req),
           ]);
-          const opts = { extended: true, withAcceptRecord: true };
           const [a, b] = await Promise.all([
-            serve(stub, payload, opts),
-            serve(lean, payload, opts),
+            serve(stub, payload),
+            serve(lean, payload),
           ]);
           assert.strictEqual(hex(a), hex(b), `seed ${seed}: ${label}`);
+          const k = `${Op[req.op]} ${Code[a[0] ?? 0] ?? a[0]}`;
+          coverage.set(k, (coverage.get(k) ?? 0) + 1);
           return a;
         };
 
         await both({ op: Op.NEW, chat, group }, 'NEW');
         for (let i = 0; i < 150; i += 1) {
-          // A record: its author's audience, committed, accepted with it.
+          // The author's audience.
           const author = pick(members);
-          const audienceMembers = some(members, 0.7).map(aci =>
-            random() < 0.8 ? { aci, key: pick(keys) } : { aci }
-          );
+          const roll = random();
+          let audienceMembers: Array<{ aci: Bytes; key?: Bytes }>;
+          if (roll < 0.04) {
+            audienceMembers = crowd(257);
+          } else if (roll < 0.07) {
+            audienceMembers = shuffle([
+              ...crowd(255),
+              { aci: author, key: pick(keys) },
+            ]);
+          } else if (roll < 0.1) {
+            const twice = pick(members);
+            audienceMembers = shuffle([
+              { aci: twice, key: pick(keys) },
+              { aci: twice },
+              ...some(members, 0.5)
+                .filter(m => m !== twice)
+                .map(aci => ({ aci })),
+            ]);
+          } else {
+            audienceMembers = shuffle(
+              some(members, 0.7).map(aci =>
+                random() < 0.8 ? { aci, key: pick(keys) } : { aci }
+              )
+            );
+          }
           // oxlint-disable-next-line no-await-in-loop
           const aud = await both(
             { op: Op.AUDIENCE, members: audienceMembers },
             `step ${i} AUDIENCE`
           );
+          const audience =
+            aud[0] === Code.OK
+              ? decodeReply(Op.AUDIENCE, Code.OK, aud.slice(1))
+              : undefined;
+          const value =
+            audience?.kind === 'ok' ? audience.audience : fill(32, 0xe1);
+
+          // The DataMessage: field 201 once (mostly), twice, out of order,
+          // or missing.
           const body = new TextEncoder().encode(`m${i}`);
-          const field201 =
-            aud[0] === Code.OK && random() < 0.9
-              ? [0xca, 0x0c, aud.length - 5, ...aud.subarray(5)]
-              : [];
+          const shape = random();
+          let audienceFields: Array<number>;
+          if (shape < 0.82) {
+            audienceFields = field201(value);
+          } else if (shape < 0.88) {
+            audienceFields = [...field201(value), ...field201(value)];
+          } else if (shape < 0.94) {
+            // Two entries swapped (or one cut short): not an audience.
+            audienceFields =
+              value.length >= 64
+                ? field201(
+                    concatBytes([value.slice(32, 64), value.slice(0, 32)])
+                  )
+                : field201(value.slice(0, 31));
+          } else {
+            audienceFields = [];
+          }
           const ephemeral = random() < 0.15 ? [0x28, 60] : [];
           const dataMessage = new Uint8Array([
             0x0a,
             body.length,
             ...body,
             ...ephemeral,
-            ...field201,
+            ...audienceFields,
           ]);
           nonceByte = (nonceByte + 1) % 256;
-          const nonce = fill(32, nonceByte);
           // oxlint-disable-next-line no-await-in-loop
-          const committed = await stub.commit(
-            group,
-            author,
-            nonce,
-            dataMessage
+          const committedReply = await both(
+            {
+              op: Op.COMMIT,
+              group,
+              author,
+              nonce: fill(32, nonceByte),
+              dataMessage,
+            },
+            `step ${i} COMMIT`
           );
-          if (committed.kind !== 'ok') {
+          const committed = decodeReply(
+            Op.COMMIT,
+            committedReply[0] ?? 0,
+            committedReply.slice(1)
+          );
+          if (committed?.kind !== 'ok') {
             continue;
           }
+          allOpenings.push(committed.opening);
           const links = some(known, 0.2).slice(0, 3);
-          const opening = random() < 0.9 ? committed.opening : undefined;
+          const parts: RecordParts = {
+            group,
+            commit: committed.commit,
+            links,
+            author,
+          };
+
+          // ACCEPT with its opening, none, another one's; or ACCEPT_RECORD.
+          const how = random();
+          let opening: Bytes | undefined;
+          if (how < 0.08) {
+            opening = undefined;
+          } else if (how < 0.15 && allOpenings.length > 1) {
+            opening = pick(allOpenings);
+          } else {
+            opening = committed.opening;
+          }
+          const asRecord = random() < 0.15;
           // oxlint-disable-next-line no-await-in-loop
-          const accepted = await both(
-            {
-              op: Op.ACCEPT,
-              chat,
-              parts: { group, commit: committed.commit, links, author },
-              opening,
-            },
-            `step ${i} ACCEPT`
+          let accepted = await both(
+            asRecord
+              ? {
+                  op: Op.ACCEPT_RECORD,
+                  chat,
+                  record: encodeRecord(makeRecord(parts)),
+                  opening,
+                }
+              : { op: Op.ACCEPT, chat, parts, opening },
+            `step ${i} ${asRecord ? 'ACCEPT_RECORD' : 'ACCEPT'}`
           );
+          if (accepted[0] === Code.NO_AUDIENCE && random() < 0.5) {
+            // Stored without an opening: nothing is recorded for it, and
+            // the host may still hold the opening.
+            // oxlint-disable-next-line no-await-in-loop
+            accepted = await both(
+              { op: Op.ACCEPT, chat, parts },
+              `step ${i} ACCEPT without the opening`
+            );
+            opening = committed.opening;
+          }
           if (accepted[0] === Code.OK) {
             const digest = accepted.slice(1, 33);
             known.push(digest);
+            recordOf.set(hex(digest), accepted.slice(37));
             if (opening !== undefined && random() < 0.8) {
               openings.push({ digest, opening });
             }
           }
 
+          if (random() < 0.03 && known.length > 0) {
+            // A restart: zrdtd keeps audiences only while the store is open,
+            // so the host sends the openings it holds again.
+            // oxlint-disable-next-line no-await-in-loop
+            const encoded = await both({ op: Op.ENCODE, chat }, 'ENCODE');
+            // oxlint-disable-next-line no-await-in-loop
+            await both({ op: Op.CLOSE, chat }, 'CLOSE');
+            // oxlint-disable-next-line no-await-in-loop
+            await both(
+              { op: Op.OPEN, chat, group, input: encoded.slice(5) },
+              'OPEN after a restart'
+            );
+            for (const held of some(openings, 0.8)) {
+              const record = recordOf.get(hex(held.digest));
+              if (record !== undefined) {
+                // oxlint-disable-next-line no-await-in-loop
+                await both(
+                  {
+                    op: Op.ACCEPT_RECORD,
+                    chat,
+                    record,
+                    opening: held.opening,
+                  },
+                  'ACCEPT_RECORD after a restart'
+                );
+              }
+            }
+            restarts += 1;
+          }
+
           if (random() < 0.4 && known.length > 0) {
             const perDigest = random() < 0.4;
+            // Held openings, and now and then one that is not the record's.
+            const held = some(openings, 0.7);
+            if (random() < 0.15 && allOpenings.length > 0) {
+              held.push({ digest: pick(known), opening: pick(allOpenings) });
+            }
             // oxlint-disable-next-line no-await-in-loop
             const reply = await both(
               {
@@ -794,7 +960,7 @@ describe('zrdt rung 7: stub vs Lean (vectors.json, zrdtd)', function (this: Moch
                 strict: random() < 0.2,
                 live: some(known, 0.5),
                 disown: some(known, 0.1),
-                held: some(openings, 0.7),
+                held,
               },
               `step ${i} SERVE`
             );
@@ -824,7 +990,37 @@ describe('zrdt rung 7: stub vs Lean (vectors.json, zrdtd)', function (this: Moch
         assert.isAbove(served, 10, 'the run served');
         assert.isAbove(content, 0, 'some replies carried content');
         assert.isAbove(structure, 0, 'some replies carried structure');
+        coverage.set('restarts', (coverage.get('restarts') ?? 0) + restarts);
       });
     }
+
+    it('the runs reached every protocol-3 reply', () => {
+      if (seedCount === 0) {
+        return;
+      }
+      const line = [...coverage.entries()]
+        .sort(([x], [y]) => x.localeCompare(y))
+        .map(([k, n]) => `${k}: ${n}`)
+        .join(', ');
+      // eslint-disable-next-line no-console
+      console.log(`      coverage: ${line}`);
+      for (const k of [
+        'AUDIENCE OK',
+        'AUDIENCE TOO_LARGE',
+        'AUDIENCE MALFORMED',
+        'COMMIT OK',
+        'ACCEPT OK',
+        'ACCEPT NO_AUDIENCE',
+        'ACCEPT BAD_OPENING',
+        'ACCEPT_RECORD OK',
+        'ACCEPT_RECORD NO_AUDIENCE',
+        'OPEN OK',
+        'SERVE OK',
+        'ADDRESSED OK',
+        'restarts',
+      ]) {
+        assert.isAbove(coverage.get(k) ?? 0, 0, k);
+      }
+    });
   });
 });

@@ -2,22 +2,18 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // oxlint-disable max-classes-per-file
 
-// The bytes of every zrdtd request and reply (zrdt core/Zrdt/Proto.lean, the
-// module header). Both directions are here: the daemon backend encodes
-// requests and decodes replies; the rung-7 differential test decodes the
-// vector requests, runs them on a backend, and encodes the replies again.
+// The bytes of every zrdtd request and reply, protocol 3 (zrdt
+// core/Zrdt/Proto.lean, the module header). Both directions are here: the
+// daemon backend encodes requests and decodes replies; the rung-7
+// differential test decodes the vector requests, runs them on a backend, and
+// encodes the replies again.
 //
-// Lead decision (4), implemented in Lean by lane T5: the ACCEPT reply also
-// carries the record bytes, the COMMIT reply also carries the opening, and a
-// new op ACCEPT_RECORD (with status BAD_OPENING) takes an encoded record.
-// The readers below accept both the old and the new reply layouts (by body
-// length), so the host works with either zrdtd.
-//
-// Protocol 3 (zrdt docs/JOIN_PLAN.md section 10.2; core/Zrdt/Proto.lean of
-// zrdt join-core 59a9d08): ACCEPT takes `u8 flag ‖ opening?` after the parts;
-// the status NO_AUDIENCE (0x09); the ops AUDIENCE (0x11), SERVE (0x12) and
-// ADDRESSED (0x13). A SERVE `held` item is `digest ‖ opening` (always an
-// opening); an addressed entry is `record ‖ authorCopy flag ‖ opening?`.
+// Greenfield: protocol 3 only, no older layout is read. The ACCEPT and
+// ACCEPT_RECORD replies carry the record bytes, the COMMIT reply carries the
+// opening; ACCEPT takes `u8 flag ‖ opening?` after the parts; the status
+// NO_AUDIENCE (0x09); the ops AUDIENCE (0x11), SERVE (0x12) and ADDRESSED
+// (0x13). A SERVE `held` item is `digest ‖ opening` (always an opening); an
+// addressed entry is `record ‖ authorCopy flag ‖ opening?`.
 
 import type {
   AcceptRecordResult,
@@ -547,16 +543,11 @@ export function encodeRequestBody(req: Request): Bytes {
 /**
  * A request payload (`op ‖ body`) as a typed request, or the host error
  * zrdtd replies with: BAD_REQUEST (empty payload, wrong layout) or
- * UNKNOWN_OP. `withAcceptRecord` is false for a protocol without
- * ACCEPT_RECORD; `protocol` below 3 reads ACCEPT without the opening flag
- * and knows no protocol-3 op.
+ * UNKNOWN_OP. The rung-7 tests read the vector requests with it.
+ * @testexport
  */
 export function decodeRequest(
-  payload: Uint8Array<ArrayBuffer>,
-  {
-    withAcceptRecord = true,
-    protocol = 3,
-  }: { withAcceptRecord?: boolean; protocol?: number } = {}
+  payload: Uint8Array<ArrayBuffer>
 ): Request | Code.BAD_REQUEST | Code.UNKNOWN_OP {
   if (payload.length === 0) {
     return Code.BAD_REQUEST;
@@ -596,9 +587,6 @@ export function decodeRequest(
       req = readAll(body, r => {
         const chat = r.str();
         const parts = r.parts();
-        if (protocol < 3) {
-          return { op, chat, parts };
-        }
         const opening = r.optionalBytes();
         return opening === undefined
           ? { op, chat, parts }
@@ -632,9 +620,6 @@ export function decodeRequest(
       });
       break;
     case Op.ACCEPT_RECORD:
-      if (!withAcceptRecord) {
-        return Code.UNKNOWN_OP;
-      }
       req = readAll(body, r => {
         const chat = r.str();
         const record = r.bytes();
@@ -647,9 +632,6 @@ export function decodeRequest(
     case Op.AUDIENCE:
     case Op.SERVE:
     case Op.ADDRESSED:
-      if (protocol < 3) {
-        return Code.UNKNOWN_OP;
-      }
       req = readAll(body, r => readProtocol3Request(op, r));
       break;
     default:
@@ -756,15 +738,6 @@ export type ResultOf = {
   [Op.ADDRESSED]: Array<Digest>;
 };
 
-export type ReplyOptions = Readonly<{
-  /**
-   * Lead decision (4): the ACCEPT and ACCEPT_RECORD replies carry the record
-   * bytes, and the COMMIT reply carries the opening. False for the protocol
-   * 1 layout of zrdt e2b3160.
-   */
-  extended: boolean;
-}>;
-
 /** Replies shared by OPEN, SALVAGE, MERGE, ACCEPT, ACCEPT_RECORD. */
 function refusalBytes(result: { kind: string; digest?: Digest }): Bytes {
   switch (result.kind) {
@@ -788,14 +761,9 @@ function refusalBytes(result: { kind: string; digest?: Digest }): Bytes {
   }
 }
 
-function acceptBytes(
-  result: AcceptRecordResult,
-  { extended }: ReplyOptions
-): Bytes {
+function acceptBytes(result: AcceptRecordResult): Bytes {
   if (result.kind === 'accepted') {
-    return extended
-      ? concatBytes([u8(Code.OK), result.digest, wBytes(result.record)])
-      : concatBytes([u8(Code.OK), result.digest]);
+    return concatBytes([u8(Code.OK), result.digest, wBytes(result.record)]);
   }
   if (result.kind === 'missing') {
     return concatBytes([u8(Code.MISSING), wDigests(result.digests)]);
@@ -817,12 +785,11 @@ function openBytes(result: OpenResult): Bytes {
   return refusalBytes(result);
 }
 
-/** The reply payload (`status ‖ body`) for a typed result. */
-export function encodeReply<O extends Op>(
-  op: O,
-  result: ResultOf[O],
-  options: ReplyOptions
-): Bytes {
+/**
+ * The reply payload (`status ‖ body`) for a typed result, as zrdtd writes it.
+ * @testexport
+ */
+export function encodeReply<O extends Op>(op: O, result: ResultOf[O]): Bytes {
   const ok = u8(Code.OK);
   switch (op) {
     case Op.VERSION: {
@@ -847,15 +814,13 @@ export function encodeReply<O extends Op>(
       if (c.kind === 'malformed') {
         return u8(Code.MALFORMED);
       }
-      return options.extended
-        ? concatBytes([ok, c.commit, wBytes(c.opening)])
-        : concatBytes([ok, c.commit]);
+      return concatBytes([ok, c.commit, wBytes(c.opening)]);
     }
     case Op.HASH:
       return concatBytes([ok, result as Digest]);
     case Op.ACCEPT:
     case Op.ACCEPT_RECORD:
-      return acceptBytes(result as AcceptRecordResult, options);
+      return acceptBytes(result as AcceptRecordResult);
     case Op.HEADS:
     case Op.REACH_SET:
       return concatBytes([ok, wDigests(result as Array<Digest>)]);
@@ -958,10 +923,9 @@ function readRefusal(
 }
 
 /**
- * Reads a reply of `op`. For ACCEPT and COMMIT replies of the protocol 1
- * layout, `record` and `opening` are empty: the caller fills them in.
- * Throws `ReplyError` for host errors and for statuses the op cannot reply;
- * returns undefined if the body does not have the layout of its status.
+ * Reads a reply of `op`. Throws `ReplyError` for host errors and for
+ * statuses the op cannot reply; returns undefined if the body does not have
+ * the layout of its status.
  */
 export function decodeReply<O extends Op>(
   op: O,
@@ -1024,9 +988,7 @@ export function decodeReply<O extends Op>(
         if (status !== Code.OK) {
           break;
         }
-        const commit = r.take(32);
-        const opening = r.done ? new Uint8Array(0) : r.bytes();
-        return { kind: 'ok', commit, opening } as R;
+        return { kind: 'ok', commit: r.take(32), opening: r.bytes() } as R;
       }
       case Op.HASH:
         if (status !== Code.OK) {
@@ -1036,9 +998,11 @@ export function decodeReply<O extends Op>(
       case Op.ACCEPT:
       case Op.ACCEPT_RECORD: {
         if (status === Code.OK) {
-          const digest = r.take(32);
-          const record = r.done ? new Uint8Array(0) : r.bytes();
-          return { kind: 'accepted', digest, record } as R;
+          return {
+            kind: 'accepted',
+            digest: r.take(32),
+            record: r.bytes(),
+          } as R;
         }
         if (status === Code.MISSING) {
           return { kind: 'missing', digests: r.digests() } as R;
