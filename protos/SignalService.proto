@@ -114,6 +114,10 @@ message Content {
     bytes /* DecryptionErrorMessage */ decryptionErrorMessage = 8;
     StoryMessage storyMessage = 9;
     EditMessage editMessage = 11;
+    // zrdt control messages: resend by digest (zrdt PLAN.md section 3.5)
+    ZrdtResendRequest zrdtResendRequest = 200;
+    ZrdtResend zrdtResend = 201;
+    ZrdtNotFound zrdtNotFound = 202;
   }
 
   optional bytes /* SenderKeyDistributionMessage */ senderKeyDistributionMessage = 7;
@@ -452,6 +456,35 @@ message DataMessage {
   optional UnpinMessage unpinMessage = 28;
   optional AdminDelete adminDelete = 29;
   // NEXT ID: 30
+  // zrdt: if present (even empty), the message is a zrdt record when in scope
+  optional ZrdtMeta zrdt = 200;
+}
+
+// zrdt: the hash links that a group message carries
+message ZrdtMeta {
+  repeated bytes links = 1; // 32-byte digests: the sender's heads at send time
+  optional bytes nonce = 2; // 32 bytes, the commitment salt
+  optional uint32 version = 3;
+  repeated bytes disown = 4; // digests of records in the sender's name it did not create
+}
+
+// zrdt: ask a member for records by digest
+message ZrdtResendRequest {
+  optional bytes groupId = 1;
+  repeated bytes digests = 2;
+}
+
+// zrdt: one record, and its opening if the responder still holds it
+message ZrdtResend {
+  optional bytes groupId = 1;
+  optional bytes record = 2;
+  optional bytes opening = 3; // nonce || DataMessage bytes without fields 15 and 200
+}
+
+// zrdt: the responder does not hold these records
+message ZrdtNotFound {
+  optional bytes groupId = 1;
+  repeated bytes digests = 2;
 }
 
 message NullMessage {

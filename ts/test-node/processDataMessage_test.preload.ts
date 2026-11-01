@@ -58,6 +58,7 @@ const EMPTY_DATA_MESSAGE: Proto.DataMessage.Params = {
   pinMessage: null,
   unpinMessage: null,
   adminDelete: null,
+  zrdt: null,
 };
 
 const UNPROCESSED_ATTACHMENT: Proto.AttachmentPointer.Params = {

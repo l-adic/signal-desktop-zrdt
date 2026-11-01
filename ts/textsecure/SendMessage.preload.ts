@@ -718,6 +718,7 @@ class Message {
       // Handled separately
       pollVote: null,
       pollTerminate: null,
+      zrdt: null,
 
       expireTimer: this.expireTimer ?? null,
       expireTimerVersion: this.expireTimerVersion ?? null,
@@ -915,6 +916,7 @@ export class MessageSender {
       pinMessage: null,
       unpinMessage: null,
       adminDelete: null,
+      zrdt: null,
     };
   }
 
@@ -1007,6 +1009,7 @@ export class MessageSender {
       pinMessage: null,
       unpinMessage: null,
       adminDelete: null,
+      zrdt: null,
     };
   }
 
