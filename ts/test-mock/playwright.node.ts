@@ -51,6 +51,13 @@ export type StorageServiceInfoType = Readonly<{
   manifestVersion: bigint;
 }>;
 
+export type WindowBoundsType = Readonly<{
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}>;
+
 export type AppOptionsType = Readonly<{
   main: string;
   args: ReadonlyArray<string>;
@@ -314,6 +321,23 @@ export class App extends EventEmitter {
 
   public async getWindow(): Promise<Page> {
     return this.#app.firstWindow();
+  }
+
+  // The work area of the primary display, in screen points.
+  public async getScreenWorkArea(): Promise<WindowBoundsType> {
+    return this.#app.evaluate(
+      ({ screen }) => screen.getPrimaryDisplay().workArea
+    );
+  }
+
+  // Moves and resizes the main window (demo/launch.ts tiles several apps).
+  public async setWindowBounds(bounds: WindowBoundsType): Promise<void> {
+    await this.#app.evaluate(({ BrowserWindow }, b) => {
+      const main = BrowserWindow.getAllWindows().find(w =>
+        w.webContents.getURL().includes('background.html')
+      );
+      main?.setBounds(b);
+    }, bounds);
   }
 
   public async waitForWindow(): Promise<Page> {
