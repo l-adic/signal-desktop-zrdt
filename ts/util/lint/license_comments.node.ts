@@ -188,9 +188,15 @@ async function main() {
 
     const warnings = [];
 
+    const repoPath = path.relative(rootPath, file).split(path.sep).join('/');
     if (
       firstLine == null ||
-      !/Copyright \d{4} Signal Messenger, LLC/.test(firstLine)
+      !(
+        /Copyright \d{4} Signal Messenger, LLC/.test(firstLine) ||
+        // zrdt fork: new files under these paths carry this line instead.
+        (/Copyright \d{4} zrdt contributors/.test(firstLine) &&
+          /^(?:ts\/zrdt|demo|ts\/test-[^/]+\/zrdt)\//.test(repoPath))
+      )
     ) {
       const commit = await getCommitFileWasAdded(file);
       warnings.push(
