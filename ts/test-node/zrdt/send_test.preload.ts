@@ -10,6 +10,7 @@ import type { MessageAttributesType } from '../../model-types.d.ts';
 import type { ZrdtSendAttributesType } from '../../types/Zrdt.std.ts';
 import {
   StubBackend,
+  commitment,
   encodeRecord,
   makeRecord,
   removeTopLevelFields,
@@ -97,7 +98,7 @@ class FakeService implements ZrdtSendServiceType {
       this.failNextAccept = false;
       throw new Error('zrdtd unavailable');
     }
-    const commit = await this.backend.commit(
+    const commit = commitment(
       a.groupId,
       a.authorAci,
       a.nonce,
