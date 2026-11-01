@@ -1,0 +1,4 @@
+[submodule "zrdt"]
+	path = zrdt
+	url = git@github.com:l-adic/zrdt.git
+	branch = review/2026-11-01-plan-amendments
