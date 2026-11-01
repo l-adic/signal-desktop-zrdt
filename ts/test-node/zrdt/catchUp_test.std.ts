@@ -11,6 +11,7 @@ import {
   catchUpSince,
   catchUpTargets,
   catchUpStoreMode,
+  catchUpStoreStep,
   joinRemovedSince,
   needsCatchUp,
 } from '../../zrdt/catchUp.std.ts';
@@ -28,6 +29,34 @@ describe('zrdt catch-up decisions', () => {
     assert.isTrue(needsCatchUp({ isMember: true, hasStore: false }));
     assert.isFalse(needsCatchUp({ isMember: true, hasStore: true }));
     assert.isFalse(needsCatchUp({ isMember: false, hasStore: false }));
+    // A catch-up that had no reply before a restart is asked again.
+    assert.isTrue(
+      needsCatchUp({ isMember: true, hasStore: true, waiting: true })
+    );
+    assert.isFalse(
+      needsCatchUp({ isMember: false, hasStore: true, waiting: true })
+    );
+  });
+
+  it('a store opened before the first reply is relative, and that reply decides it', () => {
+    const step = (
+      store: 'none' | 'closed' | 'relative',
+      provisional: boolean,
+      reply: 'relative' | 'closed'
+    ) => catchUpStoreStep({ store, provisional, reply });
+    // No store: the reply's mode.
+    assert.strictEqual(step('none', true, 'relative'), 'newRelative');
+    assert.strictEqual(step('none', true, 'closed'), 'newClosed');
+    assert.strictEqual(step('none', false, 'closed'), 'newClosed');
+    // A newcomer wrote first: his relative store stays relative.
+    assert.strictEqual(step('relative', true, 'relative'), 'keep');
+    // A founder's or an old member's new device wrote first: closed again.
+    assert.strictEqual(step('relative', true, 'closed'), 'close');
+    // A re-add (or a store the first reply already decided) stays.
+    assert.strictEqual(step('relative', false, 'closed'), 'keep');
+    // A closed store never becomes relative.
+    assert.strictEqual(step('closed', true, 'relative'), 'keep');
+    assert.strictEqual(step('closed', false, 'relative'), 'keep');
   });
 
   it('the first catch-up reply decides the store: relative only with a boundary', () => {

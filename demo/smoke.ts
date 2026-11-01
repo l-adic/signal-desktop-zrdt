@@ -32,12 +32,17 @@
 //           unconfirmed. Bob writes: Bob's genuine ones confirmed, the fakes
 //           "not confirmed by Bob".
 //   rules   hold(carol) / release(carol) (no zrdt needed).
-//   beat 6  JOIN (zrdt docs/JOIN_PLAN.md): Alice adds Dave to "Camping" (a
+//   beat 6  JOIN (zrdt docs/JOIN_PLAN.md): the old desktops' stores are
+//           closed. Alice adds Dave to "Camping" (a
 //           real add through the mock, after everything above); Bob and
 //           Carol write; Dave links his desktop, which has no store: it asks
 //           Alice (the adder) for a catch-up, and SERVE's sealed reply gives
 //           it the messages sent to Dave, with content, and the older heads
-//           as boundary digests. Dave holds every post-join message, shows a
+//           as boundary digests. The server holds everything for Alice, Bob
+//           and Carol while Dave links and writes "hi all, dave here" before
+//           any reply: his store is relative from that send on, and after
+//           the release nothing stays pending and his heads equal Alice's.
+//           Dave holds every post-join message, shows a
 //           boundary row, and holds no pre-join content anywhere (messages
 //           table, zrdt tables, window); his heads equal Alice's. Live
 //           messages flow both ways. Dave asks Alice and Bob for a pre-join
@@ -94,7 +99,7 @@ import {
   tag,
 } from './doctor.ts';
 import type { Analysed } from './doctor.ts';
-import { formatEntry } from './evil.ts';
+import { formatEntry, hold } from './evil.ts';
 import { startPanel } from './panel.ts';
 import {
   DELIVERY_MS,
@@ -1506,6 +1511,7 @@ async function allMessages(demo: Demo, m: Member): Promise<Array<CIMessage>> {
 type CatchUpView = {
   hasStore: boolean;
   relative: boolean;
+  waiting: boolean;
   reason?: string;
   asked: Array<string>;
   answeredBy?: string;
@@ -1573,6 +1579,30 @@ async function beat6(demo: Demo): Promise<void> {
     `${preDigests.size} messages (${preTexts.length} texts) before the add`
   );
 
+  // Every desktop so far is a member's from the start: whatever opened its
+  // store before its first catch-up reply, that reply (no boundary digest)
+  // left it closed (JOIN_PLAN §6.1).
+  await attempt(
+    "beat6 the old desktops' stores are closed, none still waiting",
+    'zrdt',
+    async () =>
+      until(CATCH_UP_MS, async () => {
+        const states = await Promise.all(
+          old.map(m => hookValue<CatchUpView>(demo, m, 'catchUpState'))
+        );
+        return {
+          ok: states.every(st => st.hasStore && !st.relative && !st.waiting),
+          detail: old
+            .map(
+              (m, i) =>
+                `${m.name}: ${states[i]?.relative ? 'relative' : 'closed'}` +
+                (states[i]?.waiting ? ' (waiting)' : '')
+            )
+            .join(', '),
+        };
+      })
+  );
+
   // The add: Alice's phone adds Dave; every old desktop applies it.
   const added = await attempt(
     'beat6 Alice adds Dave; every old desktop sees him as a member',
@@ -1631,7 +1661,15 @@ async function beat6(demo: Demo): Promise<void> {
     );
   }
 
-  // Dave links his desktop: no store, so it catches up from the adder.
+  // Dave links his desktop: no store, so it catches up from the adder. The
+  // server holds everything for Alice, Bob and Carol meanwhile, his
+  // catch-up request included, and Dave writes before any reply: the store
+  // his send opens must still take the reply's boundary (the race the
+  // fix-wave verifier found: it was closed, and his records linking older
+  // history stayed pending for good).
+  for (const name of ['alice', 'bob', 'carol']) {
+    demo.server.arm(hold(name));
+  }
   const linkedOk = await attempt(
     "beat6 Dave's desktop links and shows Camping",
     'harness',
@@ -1645,9 +1683,38 @@ async function beat6(demo: Demo): Promise<void> {
     }
   );
   if (!linkedOk) {
+    await demo.server.clear();
     return;
   }
   const four = linked(demo).filter(m => m !== dave);
+  const early = { from: dave, text: 'hi all, dave here', ts: 0 };
+  await attempt(
+    'beat6 Dave writes before his catch-up has a reply (founders held): a relative store',
+    'zrdt',
+    async () => {
+      const first = await hookValue<CatchUpView>(demo, dave, 'catchUpState');
+      early.ts = await send(dave, early.text);
+      const res = await until(UI_MS, async () => {
+        const state = await hookValue<CatchUpView>(demo, dave, 'catchUpState');
+        return {
+          ok:
+            first.replies === 0 &&
+            state.replies === 0 &&
+            state.hasStore &&
+            state.relative &&
+            state.waiting,
+          detail:
+            `before the send: replies=${first.replies} store=${first.hasStore}; ` +
+            `after: store=${state.hasStore} relative=${state.relative} ` +
+            `waiting=${state.waiting} replies=${state.replies}; ` +
+            `held ${JSON.stringify(demo.server.heldCounts())}`,
+        };
+      });
+      return res;
+    }
+  );
+  const released = await demo.server.clear();
+  say(`beat6: released ${released} held envelope(s)`);
   const caughtUp = await attempt(
     'beat6 catch-up: Dave asks Alice (the adder); her sealed SERVE reply fills a relative store',
     'zrdt',
@@ -1671,6 +1738,42 @@ async function beat6(demo: Demo): Promise<void> {
       return {
         ok: res.ok && firstAsked === aciOf(alice),
         detail: `${res.detail}; first asked ${firstAsked === aciOf(alice) ? 'Alice' : firstAsked}`,
+      };
+    }
+  );
+
+  await attempt(
+    "beat6 Dave's early message reaches everyone; nothing pending, his heads equal Alice's",
+    'zrdt',
+    async () => {
+      const got = await Promise.all(
+        four.map(o => shown(o, early.ts, early.text, CATCH_UP_MS))
+      );
+      const res = await until(CATCH_UP_MS, async () => {
+        const [a, d, tables, state] = await Promise.all([
+          sortedHeads(demo, alice),
+          sortedHeads(demo, dave),
+          hookValue<TablesView>(demo, dave, 'tables'),
+          hookValue<CatchUpView>(demo, dave, 'catchUpState'),
+        ]);
+        return {
+          ok:
+            a === d &&
+            a.length > 0 &&
+            tables.pending.length === 0 &&
+            tables.relative &&
+            tables.boundary.length > 0 &&
+            !state.waiting,
+          detail:
+            `relative=${tables.relative} records=${tables.records.length} ` +
+            `pending=${tables.pending.length} boundary=${tables.boundary.length} ` +
+            `waiting=${state.waiting}; alice [${a.split(',').map(tag).join(' ')}] ` +
+            `dave [${d.split(',').map(tag).join(' ')}]`,
+        };
+      });
+      return {
+        ok: got.every(Boolean) && res.ok,
+        detail: `${four.map((o, i) => `${o.name}=${got[i]}`).join(' ')}; ${res.detail}`,
       };
     }
   );
@@ -1728,8 +1831,8 @@ async function beat6(demo: Demo): Promise<void> {
   });
   await screenshots(demo, [...four, dave], 'beat6-caught-up');
 
-  // Live messages, both ways.
-  const live: Array<Sent> = [];
+  // Live messages, both ways (Dave's early one included).
+  const live: Array<Sent> = [early];
   const fromAlice = { from: alice, text: 'Dave, bring a headlamp', ts: 0 };
   fromAlice.ts = await send(alice, fromAlice.text);
   live.push(fromAlice);

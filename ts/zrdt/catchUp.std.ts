@@ -6,8 +6,8 @@
 // Digests are lowercase hex here.
 //
 // - When: this device has no zrdt store for a group whose `membersV2`
-//   includes its own ACI (at startup, after a group update, or when a live
-//   record arrives that links history), whatever the join revision says
+//   includes its own ACI (at startup, after a group update, when a live
+//   record arrives, or before a send), whatever the join revision says
 //   (JOIN_PLAN §0 point 5: zrdt reads no join revision). The membership fact
 //   decides nothing about what a responder releases (SERVE does, from each
 //   record's committed audience); a server lie only wastes a request.
@@ -16,8 +16,21 @@
 //   start: every record it holds was sent to us) gives a closed store, as a
 //   genesis member's (JOIN_PLAN §6.2). A re-add opens a relative store at
 //   once (its `since` makes the reply relative anyway).
+// - Before that reply: a send, a live record or an export can need a store
+//   while the catch-up still waits (the reply may be slow, or held by the
+//   server). Such a store is opened relative, since only a relative store
+//   can take the reply's boundary later, and it stays provisional: the
+//   first reply keeps it relative, or (no boundary digest in it, nor taken
+//   meanwhile) re-OPENs it closed (settleCatchUpStore). So a founder or an
+//   old member whose device has no store never ends up relative, and a
+//   newcomer who wrote first still takes his boundary. The wait is kept on
+//   the conversation (zrdtCatchUp), so it survives a restart, and the
+//   catch-up is asked again at the next start.
 // - Whom: the adder first (the sender of the group change that added us, if
-//   it is still a member), then, after a timeout, two more members.
+//   it is still a member), then, after a timeout, two more members. While
+//   no reply has come, the author of a live record is asked too (once): it
+//   holds a store now, though it may have had none when first asked (a new
+//   group, where nobody has one yet).
 // - What: `since` = the old store's heads ∪ its pending digests ∪ the digests
 //   it knows are referenced but missing (a re-add); empty for a new device.
 
@@ -29,13 +42,19 @@ export const CATCH_UP_MORE = 2;
 
 /**
  * A device catches up (JOIN_PLAN §6.1) whenever it has no store for a group
- * it is a member of. Nothing else (no join revision) is read.
+ * it is a member of, or its catch-up never got a first reply (a restart
+ * while it waited). Nothing else (no join revision) is read.
  */
 export function needsCatchUp({
   isMember,
   hasStore,
-}: Readonly<{ isMember: boolean; hasStore: boolean }>): boolean {
-  return isMember && !hasStore;
+  waiting = false,
+}: Readonly<{
+  isMember: boolean;
+  hasStore: boolean;
+  waiting?: boolean;
+}>): boolean {
+  return isMember && (!hasStore || waiting);
 }
 
 /**
@@ -47,6 +66,41 @@ export function catchUpStoreMode(
   entryKinds: ReadonlyArray<'addressed' | 'after' | 'boundary'>
 ): 'relative' | 'closed' {
   return entryKinds.includes('boundary') ? 'relative' : 'closed';
+}
+
+/** What a catch-up's first reply (or an export for this account) does to the store. */
+export type CatchUpStoreStep =
+  // No store yet: open one of the reply's mode.
+  | 'newRelative'
+  | 'newClosed'
+  // A store opened relative while the catch-up waited, and the reply has no
+  // boundary digest: re-OPEN it closed (if it took no boundary meanwhile).
+  | 'close'
+  // The store stays as it is.
+  | 'keep';
+
+/**
+ * The step for the first reply (JOIN_PLAN §6.1). `provisional`: the store
+ * was opened while this catch-up waited for its first reply (not by a
+ * re-add, which is relative for good). A closed store never becomes
+ * relative.
+ */
+export function catchUpStoreStep({
+  store,
+  provisional,
+  reply,
+}: Readonly<{
+  store: 'none' | 'closed' | 'relative';
+  provisional: boolean;
+  reply: 'relative' | 'closed';
+}>): CatchUpStoreStep {
+  if (store === 'none') {
+    return reply === 'relative' ? 'newRelative' : 'newClosed';
+  }
+  if (store === 'relative' && provisional && reply === 'closed') {
+    return 'close';
+  }
+  return 'keep';
 }
 
 export type CatchUpTargets = Readonly<{

@@ -44,6 +44,7 @@ import {
   loadServeHostState,
   requestMissing,
   setZrdtStrict,
+  settleCatchUpStore,
 } from '../../zrdt/resend.preload.ts';
 import {
   aciHex,
@@ -60,7 +61,6 @@ import {
 } from '../../zrdt/seal.node.ts';
 import { decodeServeEntries } from '../../zrdt/backends/codec.std.ts';
 import type { ServeEntry } from '../../zrdt/ZrdtBackend.std.ts';
-import { catchUpStoreMode } from '../../zrdt/catchUp.std.ts';
 import { isZrdtStrict, ownSinceFor } from '../../zrdt/serveArgs.std.ts';
 import { isAciString } from '../../util/isAciString.std.ts';
 import { signalProtocolStore } from '../../SignalProtocolStore.preload.ts';
@@ -718,12 +718,13 @@ async function importServedExport(
     }
     entries.push(...decoded);
   }
-  if (
-    !(await zrdtService.hasStore(conversationId)) &&
-    catchUpStoreMode(entries.map(entry => entry.kind)) === 'relative'
-  ) {
-    await zrdtService.startRelative(conversationId, groupId);
-  }
+  // The store, as a catch-up's first reply would decide it (also closing a
+  // store opened relative while a catch-up waited, if no boundary comes).
+  await settleCatchUpStore(
+    conversation,
+    groupId,
+    entries.map(entry => entry.kind)
+  );
   await zrdtService.ensureConversation(conversationId, groupId);
   // A SERVE catch-up reply for us: catch-up mode keeps its boundary (the
   // giver's frontier, as a catch-up from the giver would).

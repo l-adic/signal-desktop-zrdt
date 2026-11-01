@@ -223,6 +223,7 @@ export type ZrdtServiceType = {
     conversationId: string,
     groupId: Uint8Array<ArrayBuffer>
   ): Promise<ZrdtStoreModeType>;
+  closeRelative(conversationId: string): Promise<ZrdtStoreModeType>;
   acceptView(
     conversationId: string,
     a: Readonly<{
@@ -305,6 +306,13 @@ export type ZrdtServiceDeps = Readonly<{
   ) => Promise<
     Array<{ digest: Uint8Array<ArrayBuffer>; opening: Uint8Array<ArrayBuffer> }>
   >;
+  /**
+   * Whether the conversation's catch-up waits for its first reply (JOIN_PLAN
+   * §6.1; the host keeps this on the conversation). A store opened
+   * meanwhile is relative (#ensure): only a relative store can take that
+   * reply's boundary, and the reply may still close it (closeRelative).
+   */
+  awaitingCatchUp?: (conversationId: string) => boolean;
 }>;
 
 // ---------------------------------------------------------------------------
@@ -743,7 +751,11 @@ export class ZrdtServiceCore implements ZrdtServiceType {
     log.info(`zrdt: ${conversationId}: ${recorded} audience(s) recorded`);
   }
 
-  /** NEW unless a store is open; throws for a rejected conversation. */
+  /**
+   * NEW unless a store is open; throws for a rejected conversation. While
+   * the conversation's catch-up waits for its first reply, NEW_RELATIVE
+   * instead (a send or a live record came first; the reply decides).
+   */
   async #ensure(
     conversationId: string,
     groupId: Uint8Array<ArrayBuffer>
@@ -759,6 +771,14 @@ export class ZrdtServiceCore implements ZrdtServiceType {
       );
     }
     const group = own(groupId);
+    if (this.#deps.awaitingCatchUp?.(conversationId) === true) {
+      await this.#newRelative(
+        conversationId,
+        group,
+        'its catch-up waits for a first reply'
+      );
+      return group;
+    }
     try {
       await this.#ready().create(conversationId, group);
     } catch (error) {
@@ -1267,7 +1287,7 @@ export class ZrdtServiceCore implements ZrdtServiceType {
     conversationId: string,
     groupId: Uint8Array<ArrayBuffer>
   ): Promise<ZrdtStoreModeType> {
-    return this.#enter(conversationId, async backend => {
+    return this.#enter(conversationId, async () => {
       const state = this.#state.get(conversationId);
       if (state?.kind === 'open') {
         return state.relative ? 'relative' : 'closed';
@@ -1278,13 +1298,92 @@ export class ZrdtServiceCore implements ZrdtServiceType {
           `${conversationId} does not verify; salvage or import first`
         );
       }
-      const group = own(groupId);
-      await backend.close(conversationId);
-      await backend.createRelative(conversationId, group);
-      await this.#deps.storage.setZrdtStoreMode(conversationId, 'relative');
-      this.#state.set(conversationId, { kind: 'open', group, relative: true });
-      log.info(`zrdt: ${conversationId}: new relative store (catch-up)`);
+      await this.#newRelative(conversationId, own(groupId), 'catch-up');
       return 'relative';
+    });
+  }
+
+  /** NEW_RELATIVE for a conversation that has no store. */
+  async #newRelative(
+    conversationId: string,
+    group: B,
+    why: string
+  ): Promise<void> {
+    const backend = this.#ready();
+    await backend.close(conversationId);
+    await backend.createRelative(conversationId, group);
+    await this.#deps.storage.setZrdtStoreMode(conversationId, 'relative');
+    this.#state.set(conversationId, { kind: 'open', group, relative: true });
+    log.info(`zrdt: ${conversationId}: new relative store (${why})`);
+  }
+
+  /**
+   * The first catch-up reply has no boundary digest (a member from the
+   * start, JOIN_PLAN §6.1), but the store was opened relative while the
+   * catch-up waited for it (#ensure). If the store took no boundary digest,
+   * its records are OPENed again as a closed store: over an empty boundary a
+   * relative store accepts exactly what a closed one does
+   * (`rawAcceptRel_empty`), so every row comes back. They are tried under a
+   * scratch key first, and a store that would not reopen closed stays
+   * relative. Returns the mode the store has now.
+   */
+  closeRelative(conversationId: string): Promise<ZrdtStoreModeType> {
+    return this.#enter(conversationId, async backend => {
+      const state = this.#state.get(conversationId);
+      if (state?.kind !== 'open') {
+        throw new ZrdtServiceError('rejected', `${conversationId} is not open`);
+      }
+      if (!state.relative) {
+        return 'closed';
+      }
+      const boundary = await this.#deps.storage.getZrdtBoundary(conversationId);
+      if (boundary.length > 0) {
+        return 'relative';
+      }
+      const { group } = state;
+      const rows = await this.#deps.storage.getZrdtRecords(conversationId);
+      const records = rows.map(row => own(row.record));
+      if (records.length > 0) {
+        this.#scratchCounter += 1;
+        const scratch = `zrdt-scratch-${this.#scratchCounter}-${conversationId}`;
+        await backend.close(scratch);
+        try {
+          const tried = await backend.open(scratch, group, records);
+          if (tried.kind !== 'ok') {
+            log.warn(
+              `zrdt: ${conversationId} does not reopen closed ` +
+                `(${openOutcome(tried).status}); it stays relative`
+            );
+            return 'relative';
+          }
+        } finally {
+          await backend.close(scratch);
+        }
+      }
+      await backend.close(conversationId);
+      if (records.length === 0) {
+        await backend.create(conversationId, group);
+      } else {
+        const result = await backend.open(conversationId, group, records);
+        if (result.kind !== 'ok') {
+          // Not expected: the same records opened under the scratch key.
+          log.error(
+            `zrdt: ${conversationId}: closed OPEN failed; relative again`
+          );
+          await this.#reopenRelative(conversationId, group, rows);
+          return 'relative';
+        }
+      }
+      await this.#deps.storage.setZrdtStoreMode(conversationId, 'closed');
+      this.#state.set(conversationId, { kind: 'open', group, relative: false });
+      log.info(
+        `zrdt: ${conversationId}: closed store (the first catch-up reply ` +
+          `had no boundary digest), ${rows.length} record(s)`
+      );
+      await this.#reRecordAudiences(conversationId, rows);
+      await this.#drain(conversationId);
+      this.#emit('classify', conversationId);
+      return 'closed';
     });
   }
 

@@ -118,6 +118,8 @@ export type ZrdtCIHooks = {
   catchUpState: (conversationId: string) => Promise<{
     hasStore: boolean;
     relative: boolean;
+    // The catch-up still waits for its first reply (zrdtCatchUp is set).
+    waiting: boolean;
     reason?: string;
     asked: Array<string>;
     answeredBy?: string;
@@ -310,6 +312,10 @@ export function installZrdtCIHooks(): void {
       return {
         hasStore,
         relative,
+        waiting:
+          window.ConversationController.get(conversationId)?.get(
+            'zrdtCatchUp'
+          ) != null,
         reason: state?.reason,
         asked: [...(state?.asked ?? [])],
         answeredBy: state?.answeredBy,

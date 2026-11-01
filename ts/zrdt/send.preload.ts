@@ -32,6 +32,7 @@ import * as Bytes from '../Bytes.std.ts';
 import { strictAssert } from '../util/assert.std.ts';
 import * as Errors from '../types/errors.std.ts';
 import { createLogger } from '../logging/log.std.ts';
+import { drop } from '../util/drop.std.ts';
 import type { LoggerType } from '../types/Logging.std.ts';
 import type { MessageAttributesType } from '../model-types.d.ts';
 import type { ZrdtSendAttributesType } from '../types/Zrdt.std.ts';
@@ -66,6 +67,7 @@ import { getSendOptions } from '../util/getSendOptions.preload.ts';
 import type { AciString } from '../types/ServiceId.std.ts';
 import { isAciString } from '../util/isAciString.std.ts';
 import { zrdtService } from './service.preload.ts';
+import { startCatchUp } from './resend.preload.ts';
 import type { ConversationModel } from '../models/conversations.preload.ts';
 import type { MessageModel } from '../models/messages.preload.ts';
 import type { MessageSender } from '../textsecure/SendMessage.preload.ts';
@@ -730,6 +732,13 @@ export async function getZrdtGroupSendContent({
     }
   }
   const groupId = getGroupIdBytes(conversation);
+  if (!(await zrdtService.hasStore(conversation.id))) {
+    // No store (JOIN_PLAN §6.1): this device catches up. The catch-up waits
+    // for its first reply from the moment it starts, so the store this send
+    // opens is relative until that reply decides it (catchUp.std.ts): a
+    // newcomer who writes first still takes the reply's boundary.
+    drop(startCatchUp(conversation, { reason: 'no store at a send' }));
+  }
   await zrdtService.ensureConversation(conversation.id, groupId);
   await reacceptOutgoingForConversation(conversation, log);
   const contentMessage = await freezeZrdtSend({
