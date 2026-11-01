@@ -457,6 +457,57 @@ describe('zrdt/send: freeze once', () => {
     );
   });
 
+  it('reacceptOutgoingMessages re-accepts in any order (a record linking one we lost)', async () => {
+    const m1 = makeMessage([]);
+    await freeze(m1, 'one');
+    const m2 = makeMessage([]);
+    await freeze(m2, 'two');
+    // m2 links m1.
+    assert.deepEqual(m2.attributes.zrdt?.links, [digestOf(m1)]);
+
+    service = new FakeService();
+    await service.init();
+    const count = await reacceptOutgoingMessages({
+      conversationId: CHAT,
+      groupId: GROUP_ID,
+      ourAci: OUR_ACI,
+      messages: [
+        { id: 'm2', type: 'outgoing', zrdt: m2.attributes.zrdt },
+        { id: 'm1', type: 'outgoing', zrdt: m1.attributes.zrdt },
+      ],
+      service,
+      log,
+    });
+    assert.strictEqual(count, 2);
+    assert.deepEqual(await service.backend.heads(CHAT), [
+      Bytes.fromHex(digestOf(m2)),
+    ]);
+  });
+
+  it('reacceptOutgoingMessages stops when a pass re-accepts nothing', async () => {
+    const m1 = makeMessage([]);
+    await freeze(m1, 'one');
+    const m2 = makeMessage([]);
+    await freeze(m2, 'two');
+
+    service = new FakeService();
+    await service.init();
+    // m1 is not in the list, so m2 never resolves.
+    const count = await reacceptOutgoingMessages({
+      conversationId: CHAT,
+      groupId: GROUP_ID,
+      ourAci: OUR_ACI,
+      messages: [{ id: 'm2', type: 'outgoing', zrdt: m2.attributes.zrdt }],
+      service,
+      log,
+    });
+    assert.strictEqual(count, 0);
+    assert.deepEqual(
+      service.calls.filter(call => call === 'acceptOwn'),
+      ['acceptOwn']
+    );
+  });
+
   it('rich content (attachments, quote, preview, mentions) re-encodes byte for byte', async () => {
     const aci = generateAci();
     const attachment: Proto.AttachmentPointer.Params = {

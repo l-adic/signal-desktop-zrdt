@@ -217,6 +217,7 @@ import { onStoryRecipientUpdate } from './util/onStoryRecipientUpdate.preload.ts
 import { flushAttachmentDownloadQueue } from './util/attachmentDownloadQueue.preload.ts';
 import { initializeRedux } from './state/initializeRedux.preload.ts';
 import { zrdtService } from './zrdt/service.preload.ts';
+import { reacceptZrdtOutgoingAtStartup } from './zrdt/send.preload.ts';
 import { StartupQueue } from './util/StartupQueue.std.ts';
 import { showConfirmationDialog } from './util/showConfirmationDialog.dom.tsx';
 import { onCallEventSync } from './util/onCallEventSync.preload.ts';
@@ -1238,8 +1239,10 @@ async function startApp(): Promise<void> {
       // This needs to load before we prime the data because we expect
       // ConversationController to be loaded and ready to use by then.
       await window.ConversationController.load();
-      // zrdt: pick the backend and re-OPEN every conversation from its rows.
+      // zrdt: pick the backend and re-OPEN every conversation from its rows,
+      // then re-accept our sent records the store lacks (APP.md §4 step 8).
       drop(zrdtService.init());
+      drop(reacceptZrdtOutgoingAtStartup());
 
       await Promise.all([
         window.ConversationController.getOrCreateSignalConversation(),

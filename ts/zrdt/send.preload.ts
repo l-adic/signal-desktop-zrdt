@@ -334,7 +334,9 @@ export type ZrdtOutgoingMessageType = Readonly<
 /**
  * Re-accepts our sent records that the store lacks (lost rows, a store
  * rebuilt from fewer rows). Messages still frozen with digest '' are left to
- * their send job. Returns the number re-accepted. Never throws.
+ * their send job. One of our records can link another we lost, so this runs
+ * passes until one re-accepts nothing (any message order works). Returns the
+ * number re-accepted. Never throws.
  */
 export async function reacceptOutgoingMessages({
   conversationId,
@@ -352,35 +354,54 @@ export async function reacceptOutgoingMessages({
   log?: LoggerType;
 }>): Promise<number> {
   let count = 0;
-  for (const message of messages) {
-    const { zrdt } = message;
-    if (message.type !== 'outgoing' || !zrdt || zrdt.digest === '') {
-      continue;
-    }
-    try {
-      // oxlint-disable-next-line no-await-in-loop
-      if (await service.has(conversationId, Bytes.fromHex(zrdt.digest))) {
+  let todo = messages.filter(
+    message =>
+      message.type === 'outgoing' &&
+      message.zrdt != null &&
+      message.zrdt.digest !== ''
+  );
+  const failures = new Map<string, unknown>();
+  while (todo.length > 0) {
+    const retry = new Array<ZrdtOutgoingMessageType>();
+    let progress = false;
+    for (const message of todo) {
+      const { zrdt } = message;
+      if (!zrdt) {
         continue;
       }
-      // oxlint-disable-next-line no-await-in-loop
-      const accepted = await service.acceptOwn(
-        conversationId,
-        getAcceptOwnArgs(zrdt, groupId, ourAci)
-      );
-      const digest = Bytes.toHex(toArrayBytes(accepted.digest));
-      if (digest !== zrdt.digest) {
-        log.error(
-          `zrdt/reaccept: message ${message.id} gave ${digest}, ` +
-            `expected ${zrdt.digest}`
+      try {
+        // oxlint-disable-next-line no-await-in-loop
+        if (await service.has(conversationId, Bytes.fromHex(zrdt.digest))) {
+          failures.delete(message.id);
+          continue;
+        }
+        // oxlint-disable-next-line no-await-in-loop
+        const accepted = await service.acceptOwn(
+          conversationId,
+          getAcceptOwnArgs(zrdt, groupId, ourAci)
         );
+        const digest = Bytes.toHex(toArrayBytes(accepted.digest));
+        if (digest !== zrdt.digest) {
+          log.error(
+            `zrdt/reaccept: message ${message.id} gave ${digest}, ` +
+              `expected ${zrdt.digest}`
+          );
+        }
+        failures.delete(message.id);
+        count += 1;
+        progress = true;
+      } catch (error) {
+        // Maybe it links one of ours later in the list: try again next pass.
+        failures.set(message.id, error);
+        retry.push(message);
       }
-      count += 1;
-    } catch (error) {
-      log.error(
-        `zrdt/reaccept: message ${message.id} failed`,
-        Errors.toLogFormat(error)
-      );
     }
+    todo = progress ? retry : [];
+  }
+  for (const [id, error] of failures) {
+    // TODO(zrdt): a record whose links we lack for good (someone else's
+    // record lost too) could go to zrdt_pending instead.
+    log.error(`zrdt/reaccept: message ${id} failed`, Errors.toLogFormat(error));
   }
   if (count > 0) {
     log.info(`zrdt/reaccept(${conversationId}): re-accepted ${count}`);
@@ -400,24 +421,35 @@ function getOurAciBytes(): ArrayBytes {
   return uuidToBytes(itemStorage.user.getCheckedAci());
 }
 
-// Conversations whose sent records were re-checked this session.
-const reacceptedConversations = new Set<string>();
+// Conversations whose sent records were re-checked (or are being re-checked)
+// this session.
+const reacceptedConversations = new Map<string, Promise<void>>();
 
 /**
  * APP.md §4 step 8: re-accept our sent messages whose digest is missing from
- * the store. Runs once per conversation per session: lazily before the first
- * zrdt send in that conversation. TODO(zrdt T0): export and call after
- * zrdtService.init() if sent records should be back before the first send.
+ * the store. Runs once per conversation per session: at startup for every
+ * conversation with zrdt rows (reacceptZrdtOutgoingAtStartup), else before
+ * the first zrdt send in that conversation; a send waits for a re-check
+ * that is still running. A failed re-check runs again on the next send.
  * Never throws.
  */
-async function reacceptOutgoingForConversation(
+function reacceptOutgoingForConversation(
   conversation: ConversationModel,
   log: LoggerType = defaultLog
 ): Promise<void> {
-  if (reacceptedConversations.has(conversation.id)) {
-    return;
+  const running = reacceptedConversations.get(conversation.id);
+  if (running) {
+    return running;
   }
-  reacceptedConversations.add(conversation.id);
+  const promise = reacceptOutgoingOnce(conversation, log);
+  reacceptedConversations.set(conversation.id, promise);
+  return promise;
+}
+
+async function reacceptOutgoingOnce(
+  conversation: ConversationModel,
+  log: LoggerType
+): Promise<void> {
   try {
     const groupId = getGroupIdBytes(conversation);
     await zrdtService.ensureConversation(conversation.id, groupId);
@@ -435,10 +467,43 @@ async function reacceptOutgoingForConversation(
       log,
     });
   } catch (error) {
+    reacceptedConversations.delete(conversation.id);
     log.error(
       `zrdt/reaccept(${conversation.idForLogging()}) failed`,
       Errors.toLogFormat(error)
     );
+  }
+}
+
+/**
+ * APP.md §4 step 8, at startup: after zrdtService.init() re-OPENed every
+ * conversation from its rows, re-accept our sent messages the store lacks,
+ * in every group conversation that has zrdt rows. Conversations without any
+ * rows are re-checked lazily before their first send. Never throws.
+ */
+export async function reacceptZrdtOutgoingAtStartup(
+  log: LoggerType = defaultLog
+): Promise<void> {
+  try {
+    await zrdtService.init();
+    if (!zrdtService.backendInfo().available) {
+      log.warn('zrdt/reaccept: backend unavailable; skipped at startup');
+      return;
+    }
+    if (itemStorage.user.getAci() == null) {
+      return;
+    }
+    const ids = await DataReader.getZrdtConversationIds();
+    for (const id of ids) {
+      const conversation = window.ConversationController.get(id);
+      if (!conversation?.get('groupId') || !conversation.areWeAGroupMember()) {
+        continue;
+      }
+      // oxlint-disable-next-line no-await-in-loop
+      await reacceptOutgoingForConversation(conversation, log);
+    }
+  } catch (error) {
+    log.error('zrdt/reaccept at startup failed', Errors.toLogFormat(error));
   }
 }
 
