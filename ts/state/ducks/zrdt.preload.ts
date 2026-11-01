@@ -41,6 +41,7 @@ import {
 import { requestMissing } from '../../zrdt/resend.preload.ts';
 import { drop } from '../../util/drop.std.ts';
 import type { ZrdtRejectReason } from '../../zrdt/ui/labels.std.ts';
+import { rejectedText } from '../../zrdt/ui/labels.std.ts';
 import type { ZrdtCompareOutcome } from '../../zrdt/ui/ZrdtCompareModal.dom.tsx';
 import {
   classifyCompare,
@@ -558,9 +559,10 @@ function importConversation(
       } else {
         failedImportBlobs.set(conversationId, blob);
         dispatch(markRejected(conversationId, outcome, 'import'));
+        const reason = zrdtRejectReasonFromOutcome(outcome);
         dispatch(
           setInternalResult(
-            `Import of ${source}: ${outcome.status} (see the banner in the chat)`
+            `Import of ${source}: ${reason ? rejectedText(reason) : outcome.status}`
           )
         );
       }

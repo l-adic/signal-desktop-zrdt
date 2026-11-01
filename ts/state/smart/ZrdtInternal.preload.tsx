@@ -7,6 +7,8 @@ import { useSelector } from 'react-redux';
 import type { StateType } from '../reducer.preload.ts';
 import { getZrdtDumpPath, useZrdtActions } from '../ducks/zrdt.preload.ts';
 import { getSelectedConversationId } from '../selectors/nav.std.ts';
+import { useConversationsActions } from '../ducks/conversations.preload.ts';
+import { drop } from '../../util/drop.std.ts';
 import {
   SettingsRow,
   FlowingSettingsControl,
@@ -57,11 +59,18 @@ const SmartZrdtInternal = memo(function SmartZrdtInternal(): JSX.Element {
       void exportConversation(conversationId, effectivePath);
     }
   }, [conversationId, effectivePath, exportConversation]);
-  const onImport = useCallback(() => {
-    if (conversationId) {
-      void importConversation(conversationId, effectivePath);
+  const { showConversation } = useConversationsActions();
+  const onImport = useCallback(async () => {
+    if (!conversationId) {
+      return;
     }
-  }, [conversationId, effectivePath, importConversation]);
+    const outcome = await importConversation(conversationId, effectivePath);
+    if (outcome != null && outcome.status !== 'ok') {
+      // Beat 4: back to the chat, where the red banner names what is
+      // missing and offers "Keep what verifies".
+      await showConversation({ conversationId });
+    }
+  }, [conversationId, effectivePath, importConversation, showConversation]);
   const onSalvage = useCallback(() => {
     if (conversationId) {
       void salvageFile(conversationId, effectivePath);
@@ -129,7 +138,7 @@ const SmartZrdtInternal = memo(function SmartZrdtInternal(): JSX.Element {
           <AxoButton.Root
             variant="strong-secondary"
             size="lg"
-            onClick={onImport}
+            onClick={() => drop(onImport())}
             disabled={!conversationId}
           >
             Import file
