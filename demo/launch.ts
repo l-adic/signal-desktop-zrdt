@@ -88,6 +88,19 @@ function memberParam(demo: Demo, value: string | undefined): Member {
   return demo.byName[name as MemberName];
 }
 
+/** Throws a presenter-friendly error when `who` has not exported yet. */
+async function needExport(file: string, who: string): Promise<string> {
+  try {
+    await fs.access(file);
+  } catch {
+    throw new Error(
+      `${who} has not exported yet (Settings → Internal → Export); ` +
+        `expected ${file}`
+    );
+  }
+  return file;
+}
+
 /** A path from the panel; "~/" means the home directory. */
 function fileParam(value: string): string {
   const v = value.trim();
@@ -147,7 +160,7 @@ function actions(demo: Demo, quit: () => void): Record<string, PanelAction> {
       run: async p => {
         const file = p.file?.trim()
           ? fileParam(p.file)
-          : await dumpPath(demo, byName.carol);
+          : await needExport(await dumpPath(demo, byName.carol), 'Carol');
         await fs.copyFile(file, `${file}.orig`);
         return doctorRemove(file, file, p.digest?.trim() || undefined);
       },
@@ -160,7 +173,7 @@ function actions(demo: Demo, quit: () => void): Record<string, PanelAction> {
       run: async p => {
         const file = p.file?.trim()
           ? fileParam(p.file)
-          : await dumpPath(demo, byName.bob);
+          : await needExport(await dumpPath(demo, byName.bob), 'Bob');
         const out = byName.dave.app
           ? await dumpPath(demo, byName.dave)
           : doctoredPath(file);
