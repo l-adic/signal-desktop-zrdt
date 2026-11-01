@@ -203,10 +203,11 @@ const SmartZrdtInternal = memo(function SmartZrdtInternal(): JSX.Element {
             </label>
           </div>
           <div>
-            Your own export holds the chat&apos;s messages (their text, authors
-            and links); only this account can import it. An export for another
-            member holds only what that member was sent, sealed to their key. Do
-            not share either: they leave Signal&apos;s encryption.
+            Your own export holds the chat&apos;s messages: their text sealed to
+            this account&apos;s key, their authors and links readable; only this
+            account can import it. An export for another member holds only what
+            that member was sent, sealed to their key. Do not share either: they
+            leave Signal&apos;s encryption.
           </div>
           {result != null && (
             <div data-testid="zrdt-internal-result">{result}</div>
