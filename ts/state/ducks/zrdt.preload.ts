@@ -134,9 +134,12 @@ export type ZrdtBackendInfoType = ReadonlyDeep<{
 
 export type ZrdtUnconfirmedItemType = ReadonlyDeep<{
   digest: string;
+  status: ZrdtStatus;
   attributedToAci?: string;
   text?: string;
   sentAt?: number;
+  /** A message row carries this digest (then it is also in the timeline). */
+  hasMessage: boolean;
 }>;
 
 export type ZrdtConversationStateType = ReadonlyDeep<{
@@ -148,7 +151,11 @@ export type ZrdtConversationStateType = ReadonlyDeep<{
   rejected?: { reason: ZrdtRejectReason; source: 'startup' | 'import' };
   salvage?: { kept: number; dropped: Array<string> };
   busy?: boolean;
-  /** Imported records no member has confirmed (the collapsed section). */
+  /**
+   * The collapsed section: imported records no member has confirmed, plus
+   * imported records without a message row (structure only), which have no
+   * other place to show their label (beat 5).
+   */
   unconfirmed: Array<ZrdtUnconfirmedItemType>;
 }>;
 
@@ -289,11 +296,14 @@ function refreshConversation(conversationId: string): ZrdtThunk<Promise<void>> {
       );
       const unconfirmed: Array<ZrdtUnconfirmedItemType> = [];
       for (const [hex, status] of Object.entries(statuses)) {
-        if (status.kind !== 'unconfirmed' || !imported.has(hex)) {
+        if (!imported.has(hex)) {
           continue;
         }
         // oxlint-disable-next-line no-await-in-loop
-        unconfirmed.push(await getUnconfirmedItem(conversationId, hex));
+        const item = await getUnconfirmedItem(conversationId, hex, status);
+        if (status.kind === 'unconfirmed' || !item.hasMessage) {
+          unconfirmed.push(item);
+        }
       }
       unconfirmed.sort((a, b) => (a.sentAt ?? 0) - (b.sentAt ?? 0));
       dispatch(
@@ -312,17 +322,27 @@ function refreshConversation(conversationId: string): ZrdtThunk<Promise<void>> {
   };
 }
 
+// Records are immutable, so a digest's author never changes.
+const authorByDigest = new Map<string, string>();
+
 async function getUnconfirmedItem(
   conversationId: string,
-  hex: string
+  hex: string,
+  status: ZrdtStatus
 ): Promise<ZrdtUnconfirmedItemType> {
   const item: {
     -readonly [K in keyof ZrdtUnconfirmedItemType]: ZrdtUnconfirmedItemType[K];
-  } = { digest: hex };
+  } = { digest: hex, status, hasMessage: false };
   try {
-    const parts = await zrdtService.get(conversationId, zrdtFromHex(hex));
-    if (parts != null && parts.authorAci.byteLength === 16) {
-      item.attributedToAci = bytesToUuid(new Uint8Array(parts.authorAci));
+    item.attributedToAci = authorByDigest.get(hex);
+    if (item.attributedToAci == null) {
+      const parts = await zrdtService.get(conversationId, zrdtFromHex(hex));
+      if (parts != null && parts.authorAci.byteLength === 16) {
+        item.attributedToAci = bytesToUuid(new Uint8Array(parts.authorAci));
+        if (item.attributedToAci != null) {
+          authorByDigest.set(hex, item.attributedToAci);
+        }
+      }
     }
     const rows = await DataReader.getMessageIdsByZrdtDigest(conversationId, [
       hex,
@@ -331,6 +351,7 @@ async function getUnconfirmedItem(
     const message =
       id != null ? await DataReader.getMessageById(id) : undefined;
     if (message != null) {
+      item.hasMessage = true;
       item.text = message.body;
       item.sentAt = message.sent_at;
     }

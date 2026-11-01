@@ -5,6 +5,7 @@ import { assert } from 'chai';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { MessageMetadata } from '../../components/conversation/MessageMetadata.dom.tsx';
 import type { LocalizerType } from '../../types/Util.std.ts';
+import { ZrdtUnconfirmedSection } from '../../zrdt/ui/ZrdtUnconfirmedSection.dom.tsx';
 
 const D = `9ac1${'0'.repeat(60)}`;
 const noop = (): void => undefined;
@@ -50,5 +51,31 @@ describe('zrdt UI wiring: MessageMetadata', () => {
     const html = render({ zrdtDigest: D, zrdtLabel: null });
     assert.include(html, '·9ac1');
     assert.notInclude(html, 'ZrdtLabel');
+  });
+});
+
+describe('zrdt UI wiring: unconfirmed section', () => {
+  it('takes a title and per-item labels (beat 5)', () => {
+    const html = renderToStaticMarkup(
+      <ZrdtUnconfirmedSection
+        defaultExpanded
+        title="Imported history: 2 messages"
+        items={[
+          {
+            digest: D,
+            attributedTo: 'Bob',
+            label: { kind: 'held', name: 'Alice' },
+          },
+          {
+            digest: `c7f2${'1'.repeat(60)}`,
+            attributedTo: 'Bob',
+            label: { kind: 'not-confirmed', name: 'Bob' },
+          },
+        ]}
+      />
+    );
+    assert.include(html, 'Imported history: 2 messages');
+    assert.include(html, 'held by Alice');
+    assert.include(html, 'not confirmed by Bob');
   });
 });

@@ -14,6 +14,11 @@ import { ZrdtUnavailableBanner } from '../../zrdt/ui/ZrdtUnavailableBanner.dom.t
 import { ZrdtOwnNameAlarm } from '../../zrdt/ui/ZrdtOwnNameAlarm.dom.tsx';
 import type { ZrdtUnconfirmedItem } from '../../zrdt/ui/ZrdtUnconfirmedSection.dom.tsx';
 import { ZrdtUnconfirmedSection } from '../../zrdt/ui/ZrdtUnconfirmedSection.dom.tsx';
+import {
+  chooseProvenanceLabel,
+  messagesCount,
+  unconfirmedSectionTitle,
+} from '../../zrdt/ui/labels.std.ts';
 
 /**
  * The conversation-level zrdt banner slot, under the header (APP.md §7):
@@ -63,25 +68,40 @@ export const SmartZrdtConversationBanners = memo(
       return (zrdtState?.disown ?? []).filter(d => !dismissed.has(d));
     }, [zrdtState?.alarmDismissed, zrdtState?.disown]);
 
-    const unconfirmedItems = useMemo(
-      (): Array<ZrdtUnconfirmedItem> =>
-        (zrdtState?.unconfirmed ?? []).map(item => {
-          const contact =
-            item.attributedToAci != null
-              ? conversationSelector(item.attributedToAci)
-              : undefined;
-          return {
-            digest: item.digest,
-            attributedTo:
-              contact != null
-                ? contact.firstName || contact.title
-                : 'an unknown member',
-            text: item.text,
-            sentAt: item.sentAt,
-          };
-        }),
-      [conversationSelector, zrdtState?.unconfirmed]
-    );
+    const unconfirmedItems = useMemo((): Array<ZrdtUnconfirmedItem> => {
+      const nameOf = (aci: string): string => {
+        const contact = conversationSelector(aci);
+        return contact.firstName || contact.title;
+      };
+      return (zrdtState?.unconfirmed ?? []).map(item => ({
+        digest: item.digest,
+        attributedTo:
+          item.attributedToAci != null
+            ? nameOf(item.attributedToAci)
+            : 'an unknown member',
+        text: item.text,
+        sentAt: item.sentAt,
+        // Imported records: "held by Alice", "confirmed by Bob" (it arrived
+        // indirectly), "not confirmed by Bob", or "unconfirmed".
+        label:
+          item.status.kind === 'unconfirmed'
+            ? null
+            : chooseProvenanceLabel({
+                status: item.status,
+                provenance: { kind: 'imported' },
+                authorAci: item.attributedToAci ?? '',
+                arrivedIndirectly: true,
+                nameOf,
+              }),
+      }));
+    }, [conversationSelector, zrdtState?.unconfirmed]);
+    const unconfirmedCount = (zrdtState?.unconfirmed ?? []).filter(
+      item => item.status.kind === 'unconfirmed'
+    ).length;
+    const sectionTitle =
+      unconfirmedCount > 0
+        ? unconfirmedSectionTitle(unconfirmedCount)
+        : `Imported history: ${messagesCount(unconfirmedItems.length)}`;
 
     if (!isGroup) {
       return null;
@@ -119,7 +139,7 @@ export const SmartZrdtConversationBanners = memo(
           />
         )}
         <ZrdtOwnNameAlarm digests={alarmDigests} onDismiss={onDismissAlarm} />
-        <ZrdtUnconfirmedSection items={unconfirmedItems} />
+        <ZrdtUnconfirmedSection items={unconfirmedItems} title={sectionTitle} />
       </div>
     );
   }
