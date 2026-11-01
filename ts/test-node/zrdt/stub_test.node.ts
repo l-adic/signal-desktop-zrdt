@@ -109,12 +109,24 @@ function newStub(): StubBackend {
   return new StubBackend({ env: {} });
 }
 
+/**
+ * A structure-only record (no opening): ACCEPT_RECORD, since ACCEPT always
+ * takes a live record's opening (protocol 4).
+ */
+function acceptParts(
+  stub: StubBackend,
+  chat: string,
+  parts: RecordParts
+): ReturnType<StubBackend['acceptRecord']> {
+  return stub.acceptRecord(chat, encodeRecord(makeRecord(parts)));
+}
+
 async function accepted(
   stub: StubBackend,
   parts: RecordParts,
   chat = CHAT
 ): Promise<Digest> {
-  const result = await stub.accept(chat, parts);
+  const result = await acceptParts(stub, chat, parts);
   if (result.kind !== 'accepted') {
     throw new Error(`expected accepted, got ${result.kind}`);
   }
@@ -378,7 +390,7 @@ describe('zrdt stub', () => {
       const x = filled(32, 0xee);
       const y = filled(32, 0x05);
       const before = await stub.encode(CHAT);
-      const result = await stub.accept(CHAT, rec('b', [x, a, y]));
+      const result = await acceptParts(stub, CHAT, rec('b', [x, a, y]));
       assert.strictEqual(result.kind, 'missing');
       if (result.kind === 'missing') {
         assert.deepEqual(result.digests.map(hex), [hex(y), hex(x)]);
@@ -389,7 +401,11 @@ describe('zrdt stub', () => {
     it('refuses a record of another chat', async () => {
       const stub = newStub();
       await stub.create(CHAT, GROUP);
-      const result = await stub.accept(CHAT, rec('a', [], ALICE, OTHER_GROUP));
+      const result = await acceptParts(
+        stub,
+        CHAT,
+        rec('a', [], ALICE, OTHER_GROUP)
+      );
       assert.deepEqual(result, { kind: 'wrongChat' });
       assert.deepEqual(await stub.heads(CHAT), []);
     });
@@ -401,11 +417,11 @@ describe('zrdt stub', () => {
       for (let i = 0; i <= MAX_LINKS; i += 1) {
         links.push(sha256(u32(i)));
       }
-      assert.deepEqual(await stub.accept(CHAT, rec('a', links)), {
+      assert.deepEqual(await acceptParts(stub, CHAT, rec('a', links)), {
         kind: 'tooLarge',
       });
       // At the limit, the record is judged on its links instead.
-      const result = await stub.accept(CHAT, rec('a', links.slice(1)));
+      const result = await acceptParts(stub, CHAT, rec('a', links.slice(1)));
       assert.strictEqual(result.kind, 'missing');
     });
 
@@ -418,7 +434,7 @@ describe('zrdt stub', () => {
       const a = await accepted(stub, rec('a'));
       const before = await stub.encode(CHAT);
       // Same commitment, different author: same digest under this hash.
-      const result = await stub.accept(CHAT, rec('a', [], BOB));
+      const result = await acceptParts(stub, CHAT, rec('a', [], BOB));
       assert.deepEqual(result, { kind: 'collision', digest: a });
       assert.deepEqual(await stub.encode(CHAT), before);
     });
@@ -426,7 +442,7 @@ describe('zrdt stub', () => {
     it('needs an open store', async () => {
       const stub = newStub();
       await assert.isRejected(stub.heads(CHAT), /zrdt unknownChat/);
-      await assert.isRejected(stub.accept(CHAT, rec('a')), /unknownChat/);
+      await assert.isRejected(acceptParts(stub, CHAT, rec('a')), /unknownChat/);
       await stub.create(CHAT, GROUP);
       await stub.close(CHAT);
       await assert.isRejected(stub.encode(CHAT), /unknownChat/);
@@ -907,7 +923,7 @@ describe('zrdt stub', () => {
       const stub = newStub();
       assert.strictEqual(stub.kind, 'stub');
       assert.isTrue(stub.isAvailable());
-      assert.deepEqual(await stub.version(), { protocol: 3, build: 'stub' });
+      assert.deepEqual(await stub.version(), { protocol: 4, build: 'stub' });
     });
 
     it('is refused when ZRDT_REQUIRE_LEAN=1', () => {

@@ -10,14 +10,16 @@
 // PLAN.md sections 3.3 to 3.5 only, not from the Lean code, so that a test
 // that compares the two finds mistakes in either. Keep it small and plain.
 //
-// Protocol 3 (zrdt docs/JOIN_PLAN.md sections 3.2, 5, 6.2 and 10.2): an
-// ACCEPT or ACCEPT_RECORD with an opening records the opening's audience
-// (field 201), and refuses an opening without one; AUDIENCE, SERVE and
-// ADDRESSED. A store is closed (NEW, a closed blob) or relative
-// (NEW_RELATIVE, a relative blob): a relative store holds a boundary,
-// digests with no record, each with the ACI that vouched for it; its links
-// resolve to stored records or boundary digests. ACCEPT_VIEW takes a SERVE
-// reply's entries; LINKABLE gives a new record's links. The store blob is
+// Protocol 4 (zrdt docs/JOIN_PLAN.md sections 3.2, 5, 6.2 and 10.2): ACCEPT
+// always takes the opening, and ACCEPT_RECORD may; with an opening, the
+// opening's audience (field 201) is recorded, and an opening without one is
+// refused; AUDIENCE, SERVE and ADDRESSED. A store is closed (NEW, a closed
+// blob) or relative (NEW_RELATIVE, a relative blob): a relative store holds a
+// boundary, digests with no record, each with the ACI that vouched for it;
+// its links resolve to stored records or boundary digests. ACCEPT_VIEW takes
+// a SERVE reply's entries and the host's pending records, in the request's
+// mode (per-digest: a new boundary digest no stored record links is dropped
+// again); LINKABLE gives a new record's links. The store blob is
 // `zrdtS3`: the mode, the boundary, the recorded audiences, then the records
 // as the `zrdtS2` blob of PLAN.md section 3.4.
 
@@ -56,6 +58,7 @@ import type {
   Refused,
   SalvageResult,
   ServeEntry,
+  ServeMode,
   ServeReply,
   ServeRequest,
   Status,
@@ -563,6 +566,31 @@ export class StubStore {
     });
     this.#heads.add(k);
     return true;
+  }
+
+  /** The keys of the boundary digests taken so far. */
+  boundaryKeys(): Set<string> {
+    return new Set(this.#boundary.keys());
+  }
+
+  /**
+   * Per-digest ACCEPT_VIEW (protocol 4, Lean `RelStore.prune`): drops the
+   * boundary digests not in `old` that are stored nowhere and linked by no
+   * stored record, so the view adds no head that is not a stored record.
+   */
+  prune(old: ReadonlySet<string>): void {
+    const linked = new Set<string>();
+    for (const entry of this.#entries.values()) {
+      for (const link of entry.record.links) {
+        linked.add(key(link));
+      }
+    }
+    for (const k of [...this.#boundary.keys()]) {
+      if (!old.has(k) && !this.#entries.has(k) && !linked.has(k)) {
+        this.#boundary.delete(k);
+        this.#heads.delete(k);
+      }
+    }
   }
 
   /** The boundary, sorted by digest. */
@@ -1309,14 +1337,15 @@ export class StubBackend implements ZrdtBackend {
   }
 
   /**
-   * ACCEPT. With an opening, the checks run in this order: the chat is open,
-   * the opening matches the commitment, it holds an audience, then ACCEPT's
-   * checks; an accepted record's audience is recorded.
+   * ACCEPT, always with the opening (protocol 4). The checks run in this
+   * order: the chat is open, the opening matches the commitment, it holds an
+   * audience, then ACCEPT's checks; an accepted record's audience is
+   * recorded.
    */
   async accept(
     chat: ChatKey,
     record: RecordParts,
-    opening?: Bytes
+    opening: Bytes
   ): Promise<AcceptRecordResult> {
     return acceptWithOpening(this.#store(chat), makeRecord(record), opening);
   }
@@ -1340,21 +1369,26 @@ export class StubBackend implements ZrdtBackend {
   }
 
   /**
-   * ACCEPT_VIEW (JOIN_PLAN §4.4): each entry is checked as ACCEPT_RECORD
-   * would (and, for an import, refused if ephemeral); a relative store then
-   * takes the boundary entries, vouched by `voucher`; the records that
-   * passed are accepted as one batch; the audiences of their checked
-   * openings are recorded for the stored ones. One result per entry: for a
-   * record, what ACCEPT replies for it in the final store.
+   * ACCEPT_VIEW (JOIN_PLAN §4.4): the reply's entries, then the host's
+   * pending records, each checked as ACCEPT_RECORD would (and, for an
+   * import, refused if ephemeral); a relative store then takes the boundary
+   * entries, vouched by `voucher`; the records that passed are accepted as
+   * one batch; in per-digest mode the new boundary digests no stored record
+   * links are dropped again (`prune`); the audiences of the checked openings
+   * are recorded for the stored ones. One result per entry and pending
+   * record: for a record, what ACCEPT replies for it in the final store.
    */
   async acceptView(
     chat: ChatKey,
     voucher: Bytes,
     forImport: boolean,
-    entries: ReadonlyArray<ServeEntry>
+    mode: ServeMode,
+    replyEntries: ReadonlyArray<ServeEntry>,
+    pending: ReadonlyArray<ServeEntry>
   ): Promise<Array<ViewResult>> {
     const store = this.#store(chat);
     checkSize('voucher', voucher, ACI_BYTES);
+    const entries = [...replyEntries, ...pending];
     type Item =
       | { kind: 'record'; record: StubRecord; seats?: ReadonlyArray<Seat> }
       | { kind: 'boundary'; digest: Digest }
@@ -1395,6 +1429,11 @@ export class StubBackend implements ZrdtBackend {
       next,
       items.flatMap(item => (item.kind === 'record' ? [item.record] : []))
     );
+    // Before the prune: the boundary the view took (Lean `viewAccepted`).
+    const taken = next.boundaryKeys();
+    if (mode === 'perDigest' && next.relative) {
+      next.prune(store.boundaryKeys());
+    }
     const results = items.map((item): ViewResult => {
       if (item.kind === 'refused') {
         return item.result;
@@ -1403,7 +1442,9 @@ export class StubBackend implements ZrdtBackend {
         if (next.has(item.digest) || next.inBoundary(item.digest)) {
           return { kind: 'ok', digest: new Uint8Array(item.digest) };
         }
-        return next.relative ? { kind: 'tooLarge' } : { kind: 'ignored' };
+        return taken.has(key(item.digest)) || !next.relative
+          ? { kind: 'ignored' }
+          : { kind: 'tooLarge' };
       }
       const result = next.probe(item.record);
       if (result.kind === 'accepted') {

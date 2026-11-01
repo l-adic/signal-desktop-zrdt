@@ -27,6 +27,20 @@ import {
   requestDigestsFrom,
 } from './resend.preload.ts';
 import type { ZrdtServedLogItem } from './resend.preload.ts';
+import type { MessageModel } from '../models/messages.preload.ts';
+import { enqueueReactionForSend } from '../reactions/enqueueReactionForSend.preload.ts';
+import { sleep } from '../util/sleep.std.ts';
+
+/** The message of `conversationId` sent at `sentAt`, from the cache or the DB. */
+async function findSentAt(
+  conversationId: string,
+  sentAt: number
+): Promise<MessageModel | undefined> {
+  return window.MessageCache.findBySentAt(
+    sentAt,
+    (m: MessageModel) => m.attributes.conversationId === conversationId
+  );
+}
 
 export type ZrdtCIMessageType = {
   id: string;
@@ -72,10 +86,32 @@ export type ZrdtCIHooks = {
     conversationId: string,
     path?: string
   ) => Promise<string | undefined>;
+  /** The export for another member (SERVE for it, sealed to its key). */
+  exportStoreFor: (
+    conversationId: string,
+    memberAci: string,
+    path?: string
+  ) => Promise<string | undefined>;
   importStore: (
     conversationId: string,
     path?: string
   ) => Promise<ZrdtOpenOutcome['status'] | undefined>;
+  /** Strict mode for the group (JOIN_PLAN §5); returns the saved value. */
+  setStrict: (conversationId: string, strict: boolean) => Promise<boolean>;
+  /**
+   * Reacts to the message sent at `targetSentAt` as the user would; returns
+   * the reaction's timestamp (its send's), or undefined if no such message.
+   */
+  react: (
+    conversationId: string,
+    targetSentAt: number,
+    emoji: string
+  ) => Promise<number | undefined>;
+  /** Pins the message sent at `targetSentAt`; returns the pin's timestamp. */
+  pin: (
+    conversationId: string,
+    targetSentAt: number
+  ) => Promise<number | undefined>;
   keepWhatVerifies: (conversationId: string) => Promise<unknown>;
   getInternalResult: () => string | undefined;
   /** The catch-up of a conversation (JOIN_PLAN §6.1), and whether its store is relative. */
@@ -177,6 +213,10 @@ export function installZrdtCIHooks(): void {
     closeCompare: () => window.reduxStore.dispatch(zrdtActions.closeCompare()),
     exportConversation: (id: string, path?: string) =>
       runZrdtThunk(zrdtActions.exportConversation(id, path)),
+    exportConversationFor: (id: string, aci: string, path?: string) =>
+      runZrdtThunk(zrdtActions.exportConversationFor(id, aci, path)),
+    setStrict: (id: string, strict: boolean) =>
+      runZrdtThunk(zrdtActions.setStrict(id, strict)),
     importConversation: (id: string, path?: string) =>
       runZrdtThunk(zrdtActions.importConversation(id, path)),
     keepWhatVerifies: (id: string) =>
@@ -245,8 +285,17 @@ export function installZrdtCIHooks(): void {
     },
     exportStore: async (conversationId, path) =>
       actions().exportConversation(conversationId, path),
+    exportStoreFor: async (conversationId, memberAci, path) =>
+      actions().exportConversationFor(conversationId, memberAci, path),
     importStore: async (conversationId, path) =>
       (await actions().importConversation(conversationId, path))?.status,
+    setStrict: async (conversationId, strict) => {
+      await actions().setStrict(conversationId, strict);
+      return (
+        window.ConversationController.get(conversationId)?.get('zrdtStrict') ===
+        true
+      );
+    },
     keepWhatVerifies: async conversationId => {
       await actions().keepWhatVerifies(conversationId);
       return zrdtState().byConversation[conversationId]?.salvage;
@@ -269,6 +318,46 @@ export function installZrdtCIHooks(): void {
       };
     },
     servedLog: conversationId => getServedLog(conversationId),
+    react: async (conversationId, targetSentAt, emoji) => {
+      const target = await findSentAt(conversationId, targetSentAt);
+      if (!target) {
+        return undefined;
+      }
+      await enqueueReactionForSend({
+        emoji: emoji as Parameters<typeof enqueueReactionForSend>[0]['emoji'],
+        messageId: target.id,
+        remove: false,
+      });
+      const ourId = window.ConversationController.getOurConversationId();
+      const ours = (target.get('reactions') ?? []).filter(
+        r => r.fromId === ourId
+      );
+      return ours.length > 0
+        ? Math.max(...ours.map(r => r.timestamp))
+        : undefined;
+    },
+    pin: async (conversationId, targetSentAt) => {
+      const target = await findSentAt(conversationId, targetSentAt);
+      if (!target) {
+        return undefined;
+      }
+      window.reduxActions.conversations.onPinnedMessageAdd(target.id, null);
+      // The action saves the pin; wait for its row (pinnedAt is the send's
+      // timestamp).
+      const deadline = Date.now() + 10_000;
+      while (Date.now() < deadline) {
+        // oxlint-disable-next-line no-await-in-loop
+        const pinned = (await DataReader.getAllPinnedMessages()).find(
+          p => p.messageId === target.id
+        );
+        if (pinned) {
+          return pinned.pinnedAt;
+        }
+        // oxlint-disable-next-line no-await-in-loop
+        await sleep(100);
+      }
+      return undefined;
+    },
     allMessages: async conversationId => {
       const all = await DataReader._getAllMessages();
       return all

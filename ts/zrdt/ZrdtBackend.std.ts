@@ -51,7 +51,7 @@ export const RECORD_COUNT_LIMIT = 2 ** 24;
  * author's audience (DataMessage field 201); an opening without one is
  * refused (NO_AUDIENCE).
  */
-export const PROTOCOL_VERSION = 3;
+export const PROTOCOL_VERSION = 4;
 
 /**
  * The parts of a record. `group` is the group's 32-byte id, `commit` the
@@ -125,13 +125,13 @@ export type AcceptResult =
   | { kind: 'tooLarge' };
 
 /**
- * The reply to `accept()` with an opening, and to `acceptRecord()`: as
- * `AcceptResult`, plus
+ * The reply to `accept()` (always with an opening), and to `acceptRecord()`:
+ * as `AcceptResult`, plus
  *
  * - `malformed` (`acceptRecord()` only): the bytes are not an encoded record
  *   (PLAN.md section 3.4);
- * - `badOpening`: an opening was given and its commitment is not the
- *   record's `commit`. Nothing changed.
+ * - `badOpening`: the opening's commitment is not the record's `commit`.
+ *   Nothing changed.
  * - `noAudience`: an opening was given, it matches, but its committed bytes
  *   do not hold exactly one well-formed field 201 (JOIN_PLAN §3.2). Nothing
  *   changed.
@@ -216,7 +216,10 @@ export type ServeEntry =
  * - `malformed`, `badOpening`, `noAudience`, `ephemeral`: the entry was
  *   refused before the store was touched (`ephemeral`: an import of a
  *   disappearing or view-once opening);
- * - `ignored`: a boundary entry on a closed store, which never takes one.
+ * - `ignored`: a boundary entry on a closed store, which never takes one,
+ *   or (per-digest mode) one that no stored record links, which is dropped
+ *   again (protocol 4: a per-digest reply adds no head that is not a stored
+ *   record).
  */
 export type ViewResult =
   | { kind: 'ok'; digest: Digest }
@@ -399,14 +402,16 @@ export type ZrdtBackend = {
   hash(record: RecordParts): Promise<Digest>;
 
   /**
-   * ACCEPT: add a record to the store under `chat`. With an opening, the
-   * opening must match the record (`badOpening`) and hold an audience
-   * (`noAudience`); the backend then records that audience.
+   * ACCEPT: add a live record to the store under `chat`, always with its
+   * opening (protocol 4): the opening must match the record (`badOpening`)
+   * and hold an audience (`noAudience`); the backend then records that
+   * audience, so every record ACCEPT stores has one. A record without
+   * content goes in with `acceptRecord()` or `acceptView()`.
    */
   accept(
     chat: ChatKey,
     record: RecordParts,
-    opening?: Bytes
+    opening: Bytes
   ): Promise<AcceptRecordResult>;
 
   /**
@@ -422,16 +427,23 @@ export type ZrdtBackend = {
 
   /**
    * ACCEPT_VIEW: take a SERVE reply's entries (JOIN_PLAN §4.4), from
-   * `voucher` (the responder). Only replies that passed the §4.4 checks may
-   * be passed. A relative store takes the boundary entries; a closed one
-   * ignores them. The records are accepted as one batch, and each checked
-   * opening's audience is recorded. One result per entry, in order.
+   * `voucher` (the responder), in the mode of the request that was sent.
+   * Only replies that passed the §4.4 checks may be passed. `pending` are
+   * the host's pending records (a live one as `addressed` with its opening,
+   * a relayed one as `after`): accepted in the same request, so a boundary
+   * digest they link is kept. A relative store takes the boundary entries; a
+   * closed one ignores them. The records are accepted as one batch, and each
+   * checked opening's audience is recorded. In per-digest mode a boundary
+   * digest that no stored record links is dropped again (`ignored`). One
+   * result per entry, then one per pending record, in order.
    */
   acceptView(
     chat: ChatKey,
     voucher: Bytes,
     forImport: boolean,
-    entries: ReadonlyArray<ServeEntry>
+    mode: ServeMode,
+    entries: ReadonlyArray<ServeEntry>,
+    pending: ReadonlyArray<ServeEntry>
   ): Promise<Array<ViewResult>>;
 
   /**

@@ -140,6 +140,17 @@ export class EvilServer extends Server {
     return counts;
   }
 
+  /**
+   * The accounts addressed by each send with this timestamp (one sorted list
+   * per send), as the server saw them: a group send's recipient list, or a
+   * 1:1 send's one account.
+   */
+  public addressedAt(timestamp: number): Array<Array<Name>> {
+    return [...this.#sends]
+      .filter(([id]) => id.startsWith(`${timestamp}#`))
+      .map(([, rec]) => [...rec.recipients].sort());
+  }
+
   /** The demo group's members, by short name. */
   public get members(): ReadonlyArray<Name> {
     return [...this.#group];

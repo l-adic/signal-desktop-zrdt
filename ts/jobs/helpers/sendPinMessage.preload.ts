@@ -12,6 +12,9 @@ export const sendPinMessage = createSendMessageJob<PinMessageJobData>({
   getMessageId(data) {
     return data.targetMessageId;
   },
+  getTargetMessageId(data) {
+    return data.targetMessageId;
+  },
   getMessageOptions(data) {
     return {
       timestamp: data.pinnedAt,

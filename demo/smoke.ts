@@ -23,11 +23,14 @@
 //           missing message; "Keep what verifies" reports kept and dropped,
 //           and Carol's own chat does not change (she holds every kept one).
 //   beat 5  Erin's desktop is linked (a member from the start, no store
-//           yet); Bob exports; doctor.ts appends two fakes by Bob on top of
-//           the genuine head; Erin imports: all in the collapsed section,
-//           unconfirmed. Alice writes: the genuine history is "held by
-//           Alice", Alice's own "confirmed". Bob writes: Bob's genuine ones
-//           confirmed, the fakes "not confirmed by Bob".
+//           yet): it catches up (JOIN_PLAN §6.1) into a closed store with
+//           Alice's heads. Bob exports for Erin (SERVE for Erin, sealed to
+//           her key, §4.5); doctor.ts appends two fakes by Bob on top of the
+//           genuine head, in a section sealed to her key; Erin imports: the
+//           fakes in the collapsed section, unconfirmed, without text. Alice
+//           writes: the genuine history stays vouched for, the fakes
+//           unconfirmed. Bob writes: Bob's genuine ones confirmed, the fakes
+//           "not confirmed by Bob".
 //   rules   hold(carol) / release(carol) (no zrdt needed).
 //   beat 6  JOIN (zrdt docs/JOIN_PLAN.md): Alice adds Dave to "Camping" (a
 //           real add through the mock, after everything above); Bob and
@@ -39,7 +42,11 @@
 //           table, zrdt tables, window); his heads equal Alice's. Live
 //           messages flow both ways. Dave asks Alice and Bob for a pre-join
 //           digest by itself: each reply is that digest, as a boundary
-//           digest only. Alice, Bob and Carol still hold everything.
+//           digest only, and Dave's heads still equal Alice's. Dave's import
+//           of Bob's own export is refused; Bob's export for Dave gives him
+//           no pre-join content and no pre-join record. A reaction and a pin
+//           by Bob on a pre-join message do not address Dave. Alice, Bob and
+//           Carol still hold everything.
 //
 // Each check is tagged `harness` (the mock and the villain) or `zrdt` (needs
 // the fork's zrdt lanes: digests on messages, gap rows, resend, compare
@@ -73,7 +80,8 @@ import {
 import {
   aciBytes,
   analyse,
-  appendFakes,
+  appendSealedFakes,
+  asServedExport,
   checkOpen,
   encodeBlob,
   hex,
@@ -86,6 +94,7 @@ import type { Analysed } from './doctor.ts';
 import { formatEntry } from './evil.ts';
 import { startPanel } from './panel.ts';
 import {
+  DELIVERY_MS,
   REPO,
   absent,
   addToGroup,
@@ -849,7 +858,8 @@ async function internalResult(m: Member): Promise<string> {
 async function clickInternal(
   demo: Demo,
   m: Member,
-  button: 'Export store' | 'Import file'
+  button: 'Export store' | 'Import file',
+  forAci = ''
 ): Promise<string> {
   const p = page(m);
   const before = await internalResult(m);
@@ -858,6 +868,12 @@ async function clickInternal(
   await settings
     .getByRole('button', { name: 'Internal', exact: true })
     .click({ timeout: UI_MS });
+  if (button === 'Export store') {
+    // "this account" (own export) or another member (JOIN_PLAN §4.5).
+    await settings
+      .getByLabel('Export for')
+      .selectOption(forAci, { timeout: UI_MS });
+  }
   await settings
     .getByRole('button', { name: button, exact: true })
     .click({ timeout: UI_MS });
@@ -882,28 +898,34 @@ async function clickInternal(
 
 type Via = { how: 'settings' | 'hook'; note: string };
 
-/** Export through Settings → Internal, else the hook. Returns the file. */
+/**
+ * Export through Settings → Internal, else the hook: `m`'s own export, or
+ * (with `forMember`) the export for that member, sealed to its key. Returns
+ * the file.
+ */
 async function exportVia(
   demo: Demo,
-  m: Member
+  m: Member,
+  forMember?: Member
 ): Promise<{ file: string | undefined } & Via> {
   const file = await dumpPath(demo, m);
+  // The option values are ACIs as Signal writes them (lowercase).
+  const forAci = forMember?.boot.phone.device.aci.toLowerCase() ?? '';
   try {
-    const line = await clickInternal(demo, m, 'Export store');
+    const line = await clickInternal(demo, m, 'Export store', forAci);
     if (line.startsWith('Exported')) {
       return { file, how: 'settings', note: line };
     }
     throw new Error(line);
   } catch (error) {
     const note = `Settings path failed: ${String(error).split('\n')[0]}`;
-    say(`${m.display}: ${note}; using the exportStore hook`);
-    const r = await hook<string | undefined>(
-      m,
-      'exportStore',
-      await conversationId(demo, m)
-    );
+    say(`${m.display}: ${note}; using the export hook`);
+    const conv = await conversationId(demo, m);
+    const r = forMember
+      ? await hook<string | undefined>(m, 'exportStoreFor', conv, forAci)
+      : await hook<string | undefined>(m, 'exportStore', conv);
     if (r.missing) {
-      throw new Error('no exportStore hook');
+      throw new Error('no export hook');
     }
     return { file: r.value, how: 'hook', note };
   }
@@ -1127,19 +1149,13 @@ async function beat5(demo: Demo): Promise<void> {
   );
 
   const linkedOk = await attempt(
-    "beat5 Erin's desktop links (empty store)",
+    "beat5 Erin's desktop links (no store yet)",
     'harness',
     async () => {
       await linkDesktop(demo, 'erin');
       await tile(linked(demo));
       await openGroup(erin, demo.group);
-      let heads: string;
-      try {
-        heads = await sortedHeads(demo, erin);
-      } catch (error) {
-        heads = `(heads: ${String(error).split('\n')[0]})`;
-      }
-      return { ok: true, detail: `Erin's heads: [${heads}]` };
+      return { ok: true, detail: 'linked' };
     }
   );
   if (!linkedOk) {
@@ -1147,34 +1163,88 @@ async function beat5(demo: Demo): Promise<void> {
   }
   const four = linked(demo);
 
-  // Bob exports; doctor.ts appends two fakes by Bob; Erin's import path.
+  // JOIN_PLAN §6.1: a device with no store catches up, whatever the join
+  // revision says. Erin is a member from the start: every record was sent to
+  // her, so the reply has no boundary digest and her store is closed.
+  let relayer: string | undefined;
+  await attempt(
+    "beat5 Erin catches up (no store): a closed store with Alice's heads",
+    'zrdt',
+    async () =>
+      until(CATCH_UP_MS, async () => {
+        const state = await hookValue<CatchUpView>(demo, erin, 'catchUpState');
+        const [a, e] = await Promise.all([
+          sortedHeads(demo, alice),
+          sortedHeads(demo, erin),
+        ]);
+        relayer = state.answeredBy?.toLowerCase();
+        return {
+          ok:
+            state.hasStore &&
+            !state.relative &&
+            state.replies > 0 &&
+            a === e &&
+            a.length > 0,
+          detail:
+            `reason=${state.reason} relative=${state.relative} ` +
+            `answeredBy=${state.answeredBy?.slice(0, 8)} replies=${state.replies}; ` +
+            `alice [${a.split(',').map(tag).join(' ')}] erin [${e
+              .split(',')
+              .map(tag)
+              .join(' ')}]`,
+        };
+      })
+  );
+
+  // Bob exports for Erin (SERVE for Erin, sealed to her key, JOIN_PLAN
+  // §4.5); doctor.ts appends two fakes by Bob in a sealed section. Bob's own
+  // export tells the doctor the genuine records and heads.
   let genuine: Array<Analysed> = [];
   let fakes: ReadonlyArray<string> = [];
   const vias5: Array<string> = [];
   const doctored = await attempt(
-    'beat5 Bob exports; doctor appends two fakes by Bob on the genuine head',
+    'beat5 Bob exports for Erin (sealed to her key); doctor appends two fakes by Bob on the genuine head',
     'zrdt',
     async () => {
-      const r = await exportVia(demo, bob);
-      vias5.push(`export: ${r.how}`);
-      if (r.file === undefined) {
-        return { ok: false, detail: `Bob could not export (${r.note})` };
+      const own = await exportVia(demo, bob);
+      vias5.push(`own export: ${own.how}`);
+      if (own.file === undefined) {
+        return { ok: false, detail: `Bob could not export (${own.note})` };
       }
-      const located = locateBlob(await fs.readFile(r.file));
-      genuine = analyse(parseBlob(located.blob));
-      const result = await appendFakes(located.blob, aciBytes(aciOf(bob)), {
-        daemon: process.env.ZRDT_DAEMON,
-      });
+      genuine = analyse(
+        parseBlob(locateBlob(await fs.readFile(own.file)).blob)
+      );
+      const heads = genuine
+        .filter(g => g.linkedBy.length === 0)
+        .map(g => g.digest)
+        .sort();
+      const forErin = await exportVia(demo, bob, erin);
+      vias5.push(`export for Erin: ${forErin.how}`);
+      if (forErin.file === undefined) {
+        return {
+          ok: false,
+          detail: `Bob could not export for Erin (${forErin.note})`,
+        };
+      }
+      const file = await fs.readFile(forErin.file);
+      const sealed =
+        asServedExport(file) !== undefined &&
+        !file.toString('utf8').includes("who's bringing the tent?");
+      const result = appendSealedFakes(
+        file,
+        aciBytes(aciOf(bob)),
+        heads.map(h => Buffer.from(h, 'hex'))
+      );
       fakes = result.fakes;
       const out = await dumpPath(demo, erin);
-      await fs.writeFile(out, located.replace(result.blob));
+      await fs.writeFile(out, result.file);
       const bobHeads = await sortedHeads(demo, bob);
       return {
-        ok:
-          fakes.length === 2 && [...result.heads].sort().join(',') === bobHeads,
+        ok: fakes.length === 2 && sealed && heads.join(',') === bobHeads,
         detail:
-          `${genuine.length} genuine records; fakes ${fakes.map(tag).join(' ')} ` +
-          `on ${result.heads.map(tag).join(' ')}; passes OPEN; -> ${out}`,
+          `${genuine.length} genuine records; the export for Erin is ` +
+          `${sealed ? 'sealed (no plaintext)' : 'NOT sealed'}; fakes ` +
+          `${fakes.map(tag).join(' ')} on ${heads.map(tag).join(' ')}; -> ${out}`,
       };
     }
   );
@@ -1183,38 +1253,42 @@ async function beat5(demo: Demo): Promise<void> {
   }
   const authorName = (a: Analysed) =>
     nameByAuthorHex.get(hex(a.parts.author)) ?? hex(a.parts.author).slice(0, 8);
-  const total = genuine.length + fakes.length;
+  const fakeSet = new Set(fakes);
 
   const imported = await attempt(
-    'beat5 Erin imports: everything collapsed and unconfirmed',
+    'beat5 Erin imports it: the fakes collapsed and unconfirmed',
     'zrdt',
     async () => {
       const imp = await importVia(demo, erin);
       vias5.push(`import: ${imp.how}`);
-      const r = { value: imp.status };
       const res = await until(CLASSIFY_MS, async () => {
         const state = await convState(demo, erin);
         const items = state?.unconfirmed ?? [];
+        const onlyFakes =
+          items.length === fakes.length &&
+          items.every(i => fakeSet.has(i.digest));
         const allUnconfirmed = items.every(
           i => i.status.kind === 'unconfirmed'
         );
         return {
-          ok: items.length === total && allUnconfirmed,
-          detail: `section holds ${items.length}/${total}, all unconfirmed=${allUnconfirmed}`,
+          ok: onlyFakes && allUnconfirmed,
+          detail:
+            `section holds ${items.length} (${items.filter(i => fakeSet.has(i.digest)).length} ` +
+            `fakes), all unconfirmed=${allUnconfirmed}`,
         };
       });
-      const title = unconfirmedSectionTitle(total);
+      const title = unconfirmedSectionTitle(fakes.length);
       const onScreen = await visible(page(erin), title, UI_MS);
       return {
-        ok: r.value === 'ok' && res.ok && onScreen,
-        detail: `import status=${r.value}; ${res.detail}; "${title}" ${onScreen ? 'shown' : 'NOT shown'}`,
+        ok: imp.status === 'ok' && res.ok && onScreen,
+        detail: `import status=${imp.status} (${imp.note}); ${res.detail}; "${title}" ${onScreen ? 'shown' : 'NOT shown'}`,
       };
     }
   );
   check(
     'beat5 presenter path: Settings → Internal buttons',
     'zrdt',
-    vias5.length === 2 && vias5.every(v => v.endsWith('settings')),
+    vias5.length === 3 && vias5.every(v => v.endsWith('settings')),
     vias5.join(', ') || 'not reached'
   );
   // Open the section so the labels are on screen (one click in the demo).
@@ -1227,7 +1301,7 @@ async function beat5(demo: Demo): Promise<void> {
     say('could not expand the unconfirmed section on Erin');
   }
   await attempt(
-    'beat5 imported history shows its verified text; the fakes have none',
+    "beat5 Erin's history (caught up) shows its text; the fakes have none",
     'zrdt',
     async () => {
       if (!imported) {
@@ -1235,14 +1309,13 @@ async function beat5(demo: Demo): Promise<void> {
       }
       const state = await convState(demo, erin);
       const items = state?.unconfirmed ?? [];
-      const fakeSet = new Set(fakes);
-      const withText = items.filter(i => !fakeSet.has(i.digest) && i.text);
       const fakeText = items.filter(i => fakeSet.has(i.digest) && i.text);
-      const last = items.at(-1)?.digest;
-      const fakesLast =
-        items.length >= 2 &&
-        fakeSet.has(items.at(-1)?.digest ?? '') &&
-        fakeSet.has(items.at(-2)?.digest ?? '');
+      const rows = new Set(
+        (await allMessages(demo, erin)).flatMap(m =>
+          m.zrdtDigest ? [m.zrdtDigest] : []
+        )
+      );
+      const shownGenuine = genuine.filter(g => rows.has(g.digest));
       const onScreen = await visible(
         page(erin),
         "who's bringing the tent?",
@@ -1250,18 +1323,23 @@ async function beat5(demo: Demo): Promise<void> {
       );
       return {
         ok:
-          withText.length === genuine.length &&
+          shownGenuine.length === genuine.length &&
           fakeText.length === 0 &&
           onScreen,
         detail:
-          `${withText.length}/${genuine.length} genuine with text, ` +
-          `${fakeText.length} fakes with text; fakes listed last=${fakesLast} ` +
-          `(last ${last ? tag(last) : 'none'}); ` +
+          `${shownGenuine.length}/${genuine.length} genuine as messages, ` +
+          `${fakeText.length} fakes with text; ` +
           `"who's bringing the tent?" ${onScreen ? 'shown' : 'NOT shown'}`,
       };
     }
   );
   await screenshots(demo, four, 'beat5-imported');
+
+  // Who vouches for the genuine history: its authors (author copies) or the
+  // member who answered the catch-up. Never the fakes.
+  const genuineOk = (s: { kind: string } | undefined, g: Analysed) =>
+    s?.kind === 'confirmedByAuthor' ||
+    (s?.kind === 'heldBy' && authorName(g) !== 'alice');
 
   // Alice writes.
   const fromAlice = {
@@ -1278,42 +1356,41 @@ async function beat5(demo: Demo): Promise<void> {
     `erin=${erinGotAlice}`
   );
   await attempt(
-    'beat5 Alice writes: genuine history "held by Alice", her own "confirmed"',
+    'beat5 Alice writes: the genuine history is vouched for, the fakes stay unconfirmed',
     'zrdt',
     async () => {
       if (!imported) {
         return { ok: false, detail: 'skipped: the import failed' };
       }
-      const want = [
-        ...genuine.map(g => ({
-          digest: g.digest,
-          who: authorName(g),
-          want:
-            authorName(g) === 'alice'
-              ? 'confirmedByAuthor'
-              : `heldBy(${aciOf(alice).slice(0, 4)})`,
-        })),
-        ...fakes.map(f => ({ digest: f, who: 'fake', want: 'unconfirmed' })),
-      ];
       const res = await until(CLASSIFY_MS, async () => {
         const state = await convState(demo, erin);
-        const bad = mismatches(state?.statuses ?? {}, want);
+        const statuses = state?.statuses ?? {};
+        const bad = [
+          ...genuine
+            .filter(g => !genuineOk(statuses[g.digest], g))
+            .map(
+              g =>
+                `${tag(g.digest)}(${authorName(g)}) is ${statusText(statuses[g.digest])}`
+            ),
+          ...mismatches(
+            statuses,
+            fakes.map(f => ({ digest: f, who: 'fake', want: 'unconfirmed' }))
+          ),
+        ];
         return {
           ok: bad.length === 0,
           detail:
             bad.length === 0
-              ? `${want.length} records as expected`
+              ? `${genuine.length + fakes.length} records as expected ` +
+                `(caught up from ${relayer?.slice(0, 8) ?? '?'})`
               : `${bad.length} wrong: ${bad.slice(0, 4).join('; ')}`,
         };
       });
       const title = unconfirmedSectionTitle(fakes.length);
-      const [held, titled] = await Promise.all([
-        visible(page(erin), 'held by Alice', UI_MS),
-        visible(page(erin), title, UI_MS),
-      ]);
+      const titled = await visible(page(erin), title, UI_MS);
       return {
-        ok: res.ok && held && titled,
-        detail: `${res.detail}; "held by Alice" ${held ? 'shown' : 'NOT shown'}; "${title}" ${titled ? 'shown' : 'NOT shown'}`,
+        ok: res.ok && titled,
+        detail: `${res.detail}; "${title}" ${titled ? 'shown' : 'NOT shown'}`,
       };
     }
   );
@@ -1357,17 +1434,17 @@ async function beat5(demo: Demo): Promise<void> {
         const state = await convState(demo, erin);
         const statuses = state?.statuses ?? {};
         const bad = mismatches(statuses, want);
-        // Carol's stay "held by" someone until Carol writes.
-        const notHeld = others.filter(
-          g => statuses[g.digest]?.kind !== 'heldBy'
+        // Carol's: confirmed by her author copy, or held by a member.
+        const notVouched = others.filter(
+          g => !genuineOk(statuses[g.digest], g)
         );
         return {
-          ok: bad.length === 0 && notHeld.length === 0,
+          ok: bad.length === 0 && notVouched.length === 0,
           detail:
             (bad.length === 0
               ? `${want.length} Alice/Bob/fake records as expected`
               : `${bad.length} wrong: ${bad.slice(0, 4).join('; ')}`) +
-            `; ${others.length - notHeld.length}/${others.length} others held`,
+            `; ${others.length - notVouched.length}/${others.length} others vouched for`,
         };
       });
       const notConfirmed = await visible(
@@ -1748,6 +1825,149 @@ async function beat6(demo: Demo): Promise<void> {
           };
         });
         return res;
+      }
+    );
+  }
+
+  // The per-digest replies' boundary digests must not stick as heads: a
+  // digest no record of Dave's links is not taken (JOIN_PLAN §4.4, §6.2).
+  const headsEqual = (label: string) =>
+    attempt(
+      `beat6 Dave's heads still equal Alice's ${label}`,
+      'zrdt',
+      async () =>
+        until(CLASSIFY_MS, async () => {
+          const [a, d] = await Promise.all([
+            sortedHeads(demo, alice),
+            sortedHeads(demo, dave),
+          ]);
+          return {
+            ok: a === d && a.length > 0,
+            detail: `alice [${a.split(',').map(tag).join(' ')}] dave [${d.split(',').map(tag).join(' ')}]`,
+          };
+        })
+    );
+  await headsEqual('after the per-digest asks');
+
+  // Exports (JOIN_PLAN §4.5). Bob's own export is his alone: Dave's import
+  // of it is refused. Bob's export for Dave is SERVE for Dave, sealed to his
+  // key: only what Dave was sent.
+  const davePath = await dumpPath(demo, dave);
+  await attempt(
+    "beat6 Dave imports Bob's own export: refused (another account's store)",
+    'zrdt',
+    async () => {
+      const own = await hook<string | undefined>(
+        bob,
+        'exportStore',
+        await conversationId(demo, bob)
+      );
+      if (own.missing || own.value === undefined) {
+        return { ok: false, detail: 'Bob could not export' };
+      }
+      await fs.copyFile(own.value, davePath);
+      const status = await hookValue<string | undefined>(
+        demo,
+        dave,
+        'importStore'
+      );
+      const line = await internalResult(dave);
+      const tables = await hookValue<TablesView>(demo, dave, 'tables');
+      const stored = tables.records.filter(d => preDigests.has(d));
+      return {
+        ok:
+          status === undefined &&
+          line.includes('refused') &&
+          stored.length === 0,
+        detail: `status=${String(status)}; "${line}"; pre-join records stored ${stored.length}`,
+      };
+    }
+  );
+  await attempt(
+    "beat6 Dave imports Bob's export for Dave: no pre-join content, no pre-join record",
+    'zrdt',
+    async () => {
+      const exp = await exportVia(demo, bob, dave);
+      if (exp.file === undefined) {
+        return {
+          ok: false,
+          detail: `Bob could not export for Dave (${exp.note})`,
+        };
+      }
+      const bytes = await fs.readFile(exp.file);
+      // Texts long enough not to occur by chance (Bob's "me" would).
+      const plain = preTexts.filter(
+        t => t.length >= 8 && bytes.toString('utf8').includes(t)
+      );
+      await fs.writeFile(davePath, bytes);
+      const imp = await importVia(demo, dave);
+      const tables = await hookValue<TablesView>(demo, dave, 'tables');
+      const stored = tables.records.filter(d => preDigests.has(d));
+      const pending = tables.pending.filter(d => preDigests.has(d));
+      const state = await convState(demo, dave);
+      const items = state?.unconfirmed ?? [];
+      const preItems = items.filter(
+        i => preDigests.has(i.digest) || (i.text && preTexts.includes(i.text))
+      );
+      return {
+        ok:
+          asServedExport(bytes) !== undefined &&
+          plain.length === 0 &&
+          imp.status === 'ok' &&
+          stored.length === 0 &&
+          pending.length === 0 &&
+          preItems.length === 0,
+        detail:
+          `export: ${exp.how}, ${plain.length} pre-join texts in the clear` +
+          `${plain.length ? ` (${plain.join(', ')})` : ''}; ` +
+          `import: ${imp.how} status=${imp.status} (${imp.note}); ` +
+          `pre-join records ${stored.length}, pending ${pending.length}; ` +
+          `unconfirmed section ${items.length} (pre-join ${preItems.length})`,
+      };
+    }
+  );
+  await headsEqual('after the import');
+
+  // The target rule (JOIN_PLAN §8.3): a reaction or a pin names its target's
+  // author and sent time, so one aimed at a pre-join message goes only to
+  // that message's audience. The villain's server sees whom each send
+  // addresses.
+  const preSentAt = (await allMessages(demo, bob)).find(
+    m => m.zrdtDigest === preDigest
+  )?.sent_at;
+  for (const [what, name, args] of [
+    ['reacts to', 'react', ['👍']],
+    ['pins', 'pin', []],
+  ] as const) {
+    // oxlint-disable-next-line no-await-in-loop
+    await attempt(
+      `beat6 Bob ${what} a pre-join message after the add: Dave is not addressed`,
+      'zrdt',
+      async () => {
+        if (preSentAt === undefined) {
+          return { ok: false, detail: 'no pre-join message at Bob' };
+        }
+        const r = await hook<number | undefined>(
+          bob,
+          name,
+          await conversationId(demo, bob),
+          preSentAt,
+          ...args
+        );
+        if (r.missing || r.value === undefined) {
+          return { ok: false, detail: `no ${name}` };
+        }
+        const ts = r.value;
+        return until(DELIVERY_MS, async () => {
+          const sends = demo.server.addressedAt(ts);
+          const all = new Set(sends.flat());
+          return {
+            ok: all.has('alice') && all.has('carol') && !all.has('dave'),
+            detail: `${sends.length} send(s) at ${ts}: [${sends
+              .map(s => s.join(','))
+              .join('] [')}]`,
+          };
+        });
       }
     );
   }

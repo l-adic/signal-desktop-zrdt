@@ -78,11 +78,13 @@ const core = new ZrdtServiceCore({
   },
   groupIdOf,
   ourAci: () => itemStorage.user.getAci(),
-  heldOpenings: async conversationId => {
-    const rows = await DataReader.getZrdtRecords(conversationId);
+  heldOpenings: async (conversationId, digests) => {
+    const wanted =
+      digests ??
+      (await DataReader.getZrdtRecords(conversationId)).map(row => row.digest);
     const ids = await DataReader.getMessageIdsByZrdtDigest(
       conversationId,
-      rows.map(row => toHex(row.digest))
+      wanted.map(digest => toHex(digest))
     );
     const held = new Array<{
       digest: Uint8Array<ArrayBuffer>;

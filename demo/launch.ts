@@ -174,7 +174,8 @@ function startAutoDoctor(demo: Demo): () => void {
         const summary = await doctorAppend(
           bobFile,
           bob.boot.phone.device.aci,
-          out
+          out,
+          { links: await bobHeads(demo) }
         );
         say(`auto-doctor, beat 5 (Bob's export -> Dave): ${summary}`);
       }
@@ -192,6 +193,20 @@ function startAutoDoctor(demo: Demo): () => void {
       "gains two fakes by Bob, written to Dave's import path"
   );
   return () => clearInterval(timer);
+}
+
+/**
+ * Bob's heads (hex): an export for another member is sealed to that member's
+ * key, so the doctor cannot read its records and puts the fakes on these.
+ */
+async function bobHeads(demo: Demo): Promise<Array<string>> {
+  const { bob } = demo.byName;
+  const r = await hook<Array<string>>(
+    bob,
+    'heads',
+    await conversationId(demo, bob)
+  );
+  return r.missing ? [] : r.value;
 }
 
 function actions(demo: Demo, quit: () => void): Record<string, PanelAction> {
@@ -264,7 +279,9 @@ function actions(demo: Demo, quit: () => void): Record<string, PanelAction> {
         const out = byName.dave.app
           ? await dumpPath(demo, byName.dave)
           : doctoredPath(file);
-        return doctorAppend(file, byName.bob.boot.phone.device.aci, out);
+        return doctorAppend(file, byName.bob.boot.phone.device.aci, out, {
+          links: await bobHeads(demo),
+        });
       },
     },
     send: {

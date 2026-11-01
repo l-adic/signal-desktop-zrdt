@@ -41,6 +41,7 @@ import { send, sendSyncMessageOnly } from '../../messages/send.preload.ts';
 import { itemStorage } from '../../textsecure/Storage.preload.ts';
 import { getSendRecipientLists } from './getSendRecipientLists.dom.ts';
 import { shouldSendToDirectConversation } from './shouldSendToConversation.preload.ts';
+import { splitZrdtTargetConversationIds } from '../../zrdt/quote.preload.ts';
 
 const { isNumber } = lodash;
 
@@ -121,9 +122,20 @@ export async function sendReaction(
     }
 
     const expireTimer = messageConversation.get('expireTimer');
-    const unsentConversationIds = Array.from(
-      reactionUtil.getUnsentConversationIds(pendingReaction)
-    );
+    // zrdt target rule (JOIN_PLAN §8.3): only the target's seats get the
+    // reaction (it names the target's author and sent timestamp). The rest
+    // are done by design.
+    const { allowed: unsentConversationIds, excluded: leftOutByZrdt } =
+      splitZrdtTargetConversationIds(
+        message.attributes,
+        reactionUtil.getUnsentConversationIds(pendingReaction)
+      );
+    if (leftOutByZrdt.length > 0) {
+      log.info(
+        `zrdt target rule: ${leftOutByZrdt.length} recipient(s) are not in ` +
+          "the target's audience; not sending to them"
+      );
+    }
     const {
       allRecipientServiceIds,
       recipientServiceIdsWithoutMe,
@@ -177,7 +189,9 @@ export async function sendReaction(
       received_at_ms: pendingReaction.timestamp,
       timestamp: pendingReaction.timestamp,
       sendStateByConversationId: zipObject(
-        Object.keys(pendingReaction.isSentByConversationId || {}),
+        Object.keys(pendingReaction.isSentByConversationId || {}).filter(
+          id => !leftOutByZrdt.includes(id)
+        ),
         repeat({
           status: SendStatus.Pending,
           updatedAt: Date.now(),
@@ -192,7 +206,7 @@ export async function sendReaction(
     window.MessageCache.register(ephemeralMessageForReactionSend);
 
     let didFullySend: boolean;
-    const successfulConversationIds = new Set<string>();
+    const successfulConversationIds = new Set<string>(leftOutByZrdt);
 
     if (recipientServiceIdsWithoutMe.length === 0) {
       if (!window.ConversationController.doWeHaveOtherDevices()) {

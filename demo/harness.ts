@@ -97,7 +97,8 @@ export function configureEnv(): string {
   }
   const daemon = process.env.ZRDT_DAEMON ?? defaultDaemonPath();
   // The demo must run on the verified Lean core: never fall back to the TS stub silently.
-  // Set ZRDT_REQUIRE_LEAN=0 explicitly to run the harness on the stub.
+  // Set ZRDT_REQUIRE_LEAN=0 explicitly to run the harness on the stub (the
+  // app then needs ZRDT_ALLOW_STUB=1: it runs the stub only in tests).
   process.env.ZRDT_REQUIRE_LEAN ??= '1';
   if (existsSync(daemon)) {
     process.env.ZRDT_DAEMON = daemon;
@@ -107,6 +108,7 @@ export function configureEnv(): string {
         'or set ZRDT_REQUIRE_LEAN=0 to run on the stub'
     );
   } else {
+    process.env.ZRDT_ALLOW_STUB = '1';
     say(
       `no zrdtd at ${daemon}: running on the TypeScript stub (ZRDT_REQUIRE_LEAN=0)`
     );

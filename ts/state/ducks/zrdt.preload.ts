@@ -43,8 +43,26 @@ import {
   loadHeldOpenings,
   loadServeHostState,
   requestMissing,
+  setZrdtStrict,
 } from '../../zrdt/resend.preload.ts';
-import { isEphemeralOpening } from '../../zrdt/audience.std.ts';
+import {
+  aciHex,
+  aciStringHex,
+  audienceOfDataMessage,
+  isEphemeralOpening,
+  seatsUnderTag,
+} from '../../zrdt/audience.std.ts';
+import {
+  decodeServeHeader,
+  keyTag,
+  openServeReply,
+  sealServeReply,
+} from '../../zrdt/seal.node.ts';
+import { decodeServeEntries } from '../../zrdt/backends/codec.std.ts';
+import type { ServeEntry } from '../../zrdt/ZrdtBackend.std.ts';
+import { catchUpStoreMode } from '../../zrdt/catchUp.std.ts';
+import { isZrdtStrict, ownSinceFor } from '../../zrdt/serveArgs.std.ts';
+import { isAciString } from '../../util/isAciString.std.ts';
 import { signalProtocolStore } from '../../SignalProtocolStore.preload.ts';
 import { itemStorage } from '../../textsecure/Storage.preload.ts';
 import { drop } from '../../util/drop.std.ts';
@@ -129,45 +147,113 @@ export function getZrdtDumpPath(conversationId: string): string {
   );
 }
 
-// --- Dump file (RESTORE_PLAN.md §3) --------------------------------------------
+// --- Export files (RESTORE_PLAN.md §3, JOIN_PLAN §4.5) ---------------------------
 //
-// JSON: { "zrdtDump": 1, "blob": base64 store blob,
-//         "content": { <hex digest>: base64 opening } }.
-// An opening is `nonce(32) ‖ DataMessage bytes without fields 15 and 200`
-// (message attribute zrdtOpening), so the file never holds the group master
-// key. A raw store blob (older exports) is read too. doctor.ts edits the
-// blob inside the JSON (its `locateBlob`).
+// Two kinds, both JSON:
+//
+// - An export to your own account (§4.5 "to your own account"):
+//     { "zrdtDump": 1, "account": <the exporter's ACI>, "blob": base64 store
+//       blob, "content": { <hex digest>: base64 opening } }.
+//   An opening is `nonce(32) ‖ DataMessage bytes without fields 15 and 200`
+//   (message attribute zrdtOpening), so the file never holds the group master
+//   key. Only the account it names imports it (MERGE, then each opening
+//   checked): another account's own export is refused, so a member's store
+//   never reaches someone else by MERGE. doctor.ts edits the blob inside the
+//   JSON (its `locateBlob`).
+// - An export for another member X (§4.5 "to another account X"):
+//     { "zrdtExport": 2, "from": the giver's ACI, "to": X's ACI, "group":
+//       base64 group id, "key": base64 X's identity key, "sections": [ {
+//       "header", "ephemeralKey", "sealed" } ] }.
+//   Each section is a SERVE reply for X (catch-up, empty `since`, the export
+//   flag, X's identity key as the giver's device holds it), sealed to that key
+//   exactly as a reply over Signal (seal.node.ts). Only X can open it, and it
+//   holds only what SERVE gives X: content X was sent, `after` structures,
+//   boundary digests. X imports it with ACCEPT_VIEW in import mode, the giver
+//   as voucher; its records start `imported` (A9).
 
-type ZrdtDumpType = ReadonlyDeep<{
+type ZrdtOwnDumpType = ReadonlyDeep<{
+  kind: 'own';
+  account: string | undefined;
   blob: Uint8Array<ArrayBuffer>;
   content: ReadonlyMap<string, Uint8Array<ArrayBuffer>>;
 }>;
 
+type ZrdtExportSectionType = ReadonlyDeep<{
+  header: Uint8Array<ArrayBuffer>;
+  ephemeralKey: Uint8Array<ArrayBuffer>;
+  sealed: Uint8Array<ArrayBuffer>;
+}>;
+
+type ZrdtServedExportType = ReadonlyDeep<{
+  kind: 'served';
+  from: string;
+  to: string;
+  group: Uint8Array<ArrayBuffer>;
+  key: Uint8Array<ArrayBuffer>;
+  sections: ReadonlyArray<ZrdtExportSectionType>;
+}>;
+
+type ZrdtExportFileType = ReadonlyDeep<ZrdtOwnDumpType | ZrdtServedExportType>;
+
 const NONCE_BYTES = 32;
 const HEX_DIGEST = /^[0-9a-f]{64}$/;
+const EXPORT_WARNING =
+  "Do not share: this file is outside Signal's encryption. It holds " +
+  'message text and who linked what.';
 
-function zrdtParseDump(bytes: Uint8Array<ArrayBuffer>): ZrdtDumpType {
+function base64Field(value: unknown, what: string): Uint8Array<ArrayBuffer> {
+  if (typeof value !== 'string') {
+    throw new Error(`not a zrdt export (no "${what}")`);
+  }
+  return Bytes.fromBase64(value);
+}
+
+/** Parses an export file of either kind (JSON only: greenfield). */
+function zrdtParseExport(bytes: Uint8Array<ArrayBuffer>): ZrdtExportFileType {
   // 0x7b is "{"
   if (bytes[0] !== 0x7b) {
-    return { blob: bytes, content: new Map() };
+    throw new Error('not a zrdt export (not JSON)');
   }
-  const doc = JSON.parse(Bytes.toString(bytes)) as {
-    blob?: unknown;
-    content?: Record<string, unknown>;
-  };
-  if (typeof doc.blob !== 'string') {
-    throw new Error('not a zrdt dump (no "blob")');
+  const doc = JSON.parse(Bytes.toString(bytes)) as Record<string, unknown>;
+  if (doc.zrdtExport === 2) {
+    const sections = Array.isArray(doc.sections) ? doc.sections : [];
+    if (typeof doc.from !== 'string' || typeof doc.to !== 'string') {
+      throw new Error('not a zrdt export (no "from" or "to")');
+    }
+    return {
+      kind: 'served',
+      from: doc.from,
+      to: doc.to,
+      group: base64Field(doc.group, 'group'),
+      key: base64Field(doc.key, 'key'),
+      sections: sections.map((section: Record<string, unknown>) => ({
+        header: base64Field(section?.header, 'header'),
+        ephemeralKey: base64Field(section?.ephemeralKey, 'ephemeralKey'),
+        sealed: base64Field(section?.sealed, 'sealed'),
+      })),
+    };
+  }
+  if (doc.zrdtDump !== 1) {
+    throw new Error('not a zrdt export (no "zrdtDump" or "zrdtExport")');
   }
   const content = new Map<string, Uint8Array<ArrayBuffer>>();
-  for (const [hex, opening] of Object.entries(doc.content ?? {})) {
+  const docContent = (doc.content ?? {}) as Record<string, unknown>;
+  for (const [hex, opening] of Object.entries(docContent)) {
     if (HEX_DIGEST.test(hex) && typeof opening === 'string') {
       content.set(hex, Bytes.fromBase64(opening));
     }
   }
-  return { blob: Bytes.fromBase64(doc.blob), content };
+  return {
+    kind: 'own',
+    account: typeof doc.account === 'string' ? doc.account : undefined,
+    blob: base64Field(doc.blob, 'blob'),
+    content,
+  };
 }
 
-function zrdtEncodeDump(dump: ZrdtDumpType): Uint8Array<ArrayBuffer> {
+function zrdtEncodeDump(
+  dump: Omit<ZrdtOwnDumpType, 'kind'>
+): Uint8Array<ArrayBuffer> {
   const content: Record<string, string> = {};
   for (const [hex, opening] of dump.content) {
     content[hex] = Bytes.toBase64(opening);
@@ -175,12 +261,78 @@ function zrdtEncodeDump(dump: ZrdtDumpType): Uint8Array<ArrayBuffer> {
   return Bytes.fromString(
     `${JSON.stringify({
       zrdtDump: 1,
-      warning:
-        "Do not share: this file is outside Signal's encryption. It holds " +
-        'message text and who linked what.',
+      account: dump.account,
+      warning: EXPORT_WARNING,
       blob: Bytes.toBase64(dump.blob),
       content,
     })}\n`
+  );
+}
+
+function zrdtEncodeServedExport(
+  file: Omit<ZrdtServedExportType, 'kind'>
+): Uint8Array<ArrayBuffer> {
+  return Bytes.fromString(
+    `${JSON.stringify({
+      zrdtExport: 2,
+      warning:
+        `For ${file.to} only: sealed to that account's identity key. ` +
+        EXPORT_WARNING,
+      from: file.from,
+      to: file.to,
+      group: Bytes.toBase64(file.group),
+      key: Bytes.toBase64(file.key),
+      sections: file.sections.map(section => ({
+        header: Bytes.toBase64(section.header),
+        ephemeralKey: Bytes.toBase64(section.ephemeralKey),
+        sealed: Bytes.toBase64(section.sealed),
+      })),
+    })}\n`
+  );
+}
+
+function getGroupIdBytes(
+  conversationId: string
+): Uint8Array<ArrayBuffer> | undefined {
+  const groupId =
+    window.ConversationController.get(conversationId)?.get('groupId');
+  return groupId ? Bytes.fromBase64(groupId) : undefined;
+}
+
+/** Our identity key pair and the tag of its public key (JOIN_PLAN §4.3). */
+function getOurKeys(): {
+  aci: string;
+  keys: NonNullable<ReturnType<typeof signalProtocolStore.getIdentityKeyPair>>;
+  tag: Uint8Array<ArrayBuffer>;
+} {
+  const aci = itemStorage.user.getCheckedAci();
+  const keys = signalProtocolStore.getIdentityKeyPair(aci);
+  if (!keys) {
+    throw new Error('no identity key pair of our own');
+  }
+  return {
+    aci,
+    keys,
+    tag: keyTag(new Uint8Array(keys.publicKey.serialize())),
+  };
+}
+
+/**
+ * Whether an opening's own committed audience seats this account under its
+ * own identity key (the importer-side `seats`, as SERVE checks for a
+ * requester): imported content is kept only then, whoever made the file.
+ */
+function openingSeatsUs(
+  opening: Uint8Array<ArrayBuffer>,
+  ourAci: string,
+  ourTag: Uint8Array<ArrayBuffer>
+): boolean {
+  const seats =
+    opening.byteLength > NONCE_BYTES
+      ? audienceOfDataMessage(opening.subarray(NONCE_BYTES))
+      : undefined;
+  return (
+    seats !== undefined && seatsUnderTag(seats, uuidToBytes(ourAci), ourTag)
   );
 }
 
@@ -214,11 +366,7 @@ function isExcludedContent(decoded: Proto.DataMessage): boolean {
 async function getExportContent(
   conversationId: string
 ): Promise<Map<string, Uint8Array<ArrayBuffer>>> {
-  const ourAci = itemStorage.user.getCheckedAci();
-  const ourKeys = signalProtocolStore.getIdentityKeyPair(ourAci);
-  if (!ourKeys) {
-    throw new Error('no identity key pair of our own');
-  }
+  const { aci: ourAci, keys: ourKeys } = getOurKeys();
   const [held, hostState] = await Promise.all([
     loadHeldOpenings(conversationId, undefined),
     loadServeHostState(conversationId),
@@ -275,13 +423,16 @@ async function verifyImportedContent(
 ): Promise<{ kept: number; refused: number }> {
   let kept = 0;
   let refused = 0;
-  let byDigest = importedContent.get(conversationId);
-  if (byDigest == null) {
-    byDigest = new Map();
-    importedContent.set(conversationId, byDigest);
-  }
+  const byDigest = getImportedContent(conversationId);
+  const { aci: ourAci, tag: ourTag } = getOurKeys();
   for (const [hex, opening] of content) {
     try {
+      // Kept only if its own committed audience seats this account under
+      // its own key: an export never shows us content not sent to us.
+      if (!openingSeatsUs(opening, ourAci, ourTag)) {
+        refused += 1;
+        continue;
+      }
       const decoded = decodeOpening(opening);
       // oxlint-disable-next-line no-await-in-loop
       const held = await zrdtService.get(conversationId, zrdtFromHex(hex));
@@ -320,9 +471,209 @@ async function verifyImportedContent(
   return { kept, refused };
 }
 
+function getImportedContent(
+  conversationId: string
+): Map<string, { text: string; sentAt?: number }> {
+  let byDigest = importedContent.get(conversationId);
+  if (byDigest == null) {
+    byDigest = new Map();
+    importedContent.set(conversationId, byDigest);
+  }
+  return byDigest;
+}
+
+/**
+ * The export for another member X (JOIN_PLAN §4.5): SERVE for X (X's ACI and
+ * the identity key this device holds for X, catch-up, an empty `since`
+ * joined with our own `since` for X, the export flag, the group's strict
+ * setting), sealed to that key. Refused unless X is a current member.
+ */
+async function buildServedExport(
+  conversationId: string,
+  memberAci: string
+): Promise<{ file: Uint8Array<ArrayBuffer>; entries: number }> {
+  const conversation = window.ConversationController.get(conversationId);
+  const groupId = getGroupIdBytes(conversationId);
+  if (!conversation || !groupId) {
+    throw new Error('not a group');
+  }
+  const ourAci = itemStorage.user.getCheckedAci();
+  if (
+    !isAciString(memberAci) ||
+    memberAci === ourAci ||
+    !conversation.hasMember(memberAci)
+  ) {
+    throw new Error(`${memberAci} is not another member of this group`);
+  }
+  const key = await signalProtocolStore.loadIdentityKey(memberAci);
+  if (!key) {
+    throw new Error(`no identity key for ${memberAci}`);
+  }
+  const [held, hostState] = await Promise.all([
+    loadHeldOpenings(conversationId, undefined),
+    loadServeHostState(conversationId),
+  ]);
+  const reply = await zrdtService.serve(conversationId, {
+    ownAci: uuidToBytes(ourAci),
+    requesterAci: uuidToBytes(memberAci),
+    key,
+    requestId: globalThis.crypto.getRandomValues(new Uint8Array(16)),
+    since: [],
+    ownSince: ownSinceFor(conversation.attributes, memberAci),
+    mode: 'catchup',
+    wanted: [],
+    forExport: true,
+    strict: isZrdtStrict(conversation.attributes),
+    live: hostState.live,
+    disown: hostState.disown,
+    held,
+  });
+  // Seals to exactly the key SERVE checked (sealServeReply refuses another).
+  const { ephemeralKey, sealed } = sealServeReply({
+    group: groupId,
+    headerBytes: reply.headerBytes,
+    entriesBytes: reply.entriesBytes,
+    recipientKey: key,
+  });
+  return {
+    file: zrdtEncodeServedExport({
+      from: ourAci,
+      to: memberAci,
+      group: groupId,
+      key,
+      sections: [{ header: reply.headerBytes, ephemeralKey, sealed }],
+    }),
+    entries: reply.entries.length,
+  };
+}
+
+type ServedImportResult = ReadonlyDeep<
+  | {
+      ok: true;
+      records: number;
+      boundary: number;
+      kept: number;
+      refused: number;
+    }
+  | { ok: false; reason: string }
+>;
+
+/**
+ * Imports an export made for this account (JOIN_PLAN §4.5): every section
+ * must name our ACI and the tag of our key, and open under our identity key
+ * (seal.node.ts). Its entries go through ACCEPT_VIEW in import mode with the
+ * giver as voucher (records `imported`; ephemeral openings refused), into a
+ * store opened as a catch-up's first reply would open it. Content is kept
+ * only for records ACCEPT_VIEW stored whose opening seats us.
+ */
+async function importServedExport(
+  conversationId: string,
+  file: ZrdtServedExportType
+): Promise<ServedImportResult> {
+  const { aci: ourAci, keys: ourKeys, tag: ourTag } = getOurKeys();
+  if (file.to !== ourAci) {
+    return {
+      ok: false,
+      reason: `it was made for another account (${file.to})`,
+    };
+  }
+  if (!isAciString(file.from)) {
+    return { ok: false, reason: 'it names no giver' };
+  }
+  const conversation = window.ConversationController.get(conversationId);
+  const groupId = getGroupIdBytes(conversationId);
+  if (!conversation || !groupId || !conversation.areWeAGroupMember()) {
+    return { ok: false, reason: 'not a group we are a member of' };
+  }
+  if (Bytes.toHex(groupId) !== Bytes.toHex(file.group)) {
+    return { ok: false, reason: 'it is for another chat' };
+  }
+  const entries = new Array<ServeEntry>();
+  for (const section of file.sections) {
+    const header = decodeServeHeader(section.header);
+    if (
+      !header ||
+      aciHex(header.requesterAci) !== aciStringHex(ourAci) ||
+      aciHex(header.keyTag) !== aciHex(ourTag)
+    ) {
+      return {
+        ok: false,
+        reason: "it is not sealed to this account's identity key",
+      };
+    }
+    const entriesBytes = openServeReply({
+      group: groupId,
+      headerBytes: section.header,
+      ephemeralKey: section.ephemeralKey,
+      sealed: section.sealed,
+      ourPrivateKey: ourKeys.privateKey,
+      ourPublicKey: ourKeys.publicKey,
+    });
+    const decoded = entriesBytes ? decodeServeEntries(entriesBytes) : undefined;
+    if (!decoded) {
+      return { ok: false, reason: 'a section does not open under our key' };
+    }
+    entries.push(...decoded);
+  }
+  if (
+    !(await zrdtService.hasStore(conversationId)) &&
+    catchUpStoreMode(entries.map(entry => entry.kind)) === 'relative'
+  ) {
+    await zrdtService.startRelative(conversationId, groupId);
+  }
+  await zrdtService.ensureConversation(conversationId, groupId);
+  // A SERVE catch-up reply for us: catch-up mode keeps its boundary (the
+  // giver's frontier, as a catch-up from the giver would).
+  const outcomes = await zrdtService.acceptView(conversationId, {
+    voucherAci: file.from,
+    forImport: true,
+    mode: 'catchup',
+    items: entries.map(entry => ({
+      entry,
+      provenance: { kind: 'imported' },
+    })),
+  });
+  let records = 0;
+  let boundary = 0;
+  let kept = 0;
+  let refused = 0;
+  const byDigest = getImportedContent(conversationId);
+  for (const [i, entry] of entries.entries()) {
+    const result = outcomes[i]?.result;
+    if (entry.kind === 'boundary') {
+      boundary += result?.kind === 'ok' ? 1 : 0;
+      continue;
+    }
+    if (result?.kind === 'ok') {
+      records += 1;
+    }
+    if (entry.kind !== 'addressed' || entry.opening === undefined) {
+      continue;
+    }
+    const decoded = decodeOpening(entry.opening);
+    if (
+      result?.kind !== 'ok' ||
+      decoded == null ||
+      !openingSeatsUs(entry.opening, ourAci, ourTag) ||
+      isEphemeralOpening(entry.opening) ||
+      isExcludedContent(decoded)
+    ) {
+      refused += 1;
+      continue;
+    }
+    const timestamp = Number(decoded.timestamp ?? 0);
+    byDigest.set(zrdtHex(result.digest), {
+      text: decoded.body ?? '',
+      sentAt: timestamp > 0 ? timestamp : undefined,
+    });
+    kept += 1;
+  }
+  return { ok: true, records, boundary, kept, refused };
+}
+
 // Import dumps that failed MERGE, kept for "Keep what verifies". Not in
 // Redux: bytes do not belong in the store.
-const failedImportBlobs = new Map<string, ZrdtDumpType>();
+const failedImportBlobs = new Map<string, ZrdtOwnDumpType>();
 
 // --- State ----------------------------------------------------------------------
 
@@ -775,7 +1126,11 @@ function exportConversation(
     try {
       const blob = await zrdtService.exportBlob(conversationId);
       const content = await getExportContent(conversationId);
-      const file = zrdtEncodeDump({ blob, content });
+      const file = zrdtEncodeDump({
+        account: itemStorage.user.getCheckedAci(),
+        blob,
+        content,
+      });
       await writeFile(target, file);
       const count = zrdtBlobRecordCount(blob);
       dispatch(
@@ -793,15 +1148,104 @@ function exportConversation(
   };
 }
 
-/** Import (MERGE). On failure the conversation shows the rejected banner. */
+/**
+ * The export for another member (JOIN_PLAN §4.5): SERVE for that member,
+ * sealed to its identity key (buildServedExport).
+ */
+function exportConversationFor(
+  conversationId: string,
+  memberAci: string,
+  path?: string
+): ZrdtThunk<Promise<string | undefined>> {
+  return async (dispatch, getState) => {
+    const target = path || getZrdtDumpPath(conversationId);
+    try {
+      const { file, entries } = await buildServedExport(
+        conversationId,
+        memberAci
+      );
+      await writeFile(target, file);
+      dispatch(
+        setInternalResult(
+          `Exported for ${nameOf(getState(), memberAci)}: ${entries} entries, ` +
+            `sealed to their key (${file.byteLength} bytes) to ${target}`
+        )
+      );
+      return target;
+    } catch (error) {
+      log.error('exportConversationFor failed', Errors.toLogFormat(error));
+      dispatch(setInternalResult(`Export failed: ${errorText(error)}`));
+      return undefined;
+    }
+  };
+}
+
+/** Strict mode for a group (JOIN_PLAN §5): on or off, saved per group. */
+function setStrict(
+  conversationId: string,
+  strict: boolean
+): ZrdtThunk<Promise<void>> {
+  return async dispatch => {
+    try {
+      const now = await setZrdtStrict(conversationId, strict);
+      dispatch(
+        setInternalResult(
+          `Strict mode ${now ? 'on' : 'off'}: replies carry content only ` +
+            (now ? 'in author copies' : 'as SERVE allows')
+        )
+      );
+    } catch (error) {
+      log.error('setStrict failed', Errors.toLogFormat(error));
+      dispatch(setInternalResult(`Strict mode failed: ${errorText(error)}`));
+    }
+  };
+}
+
+/**
+ * Import. An export for this account (from another member) goes through
+ * ACCEPT_VIEW; this account's own export through MERGE (on failure the
+ * conversation shows the rejected banner). Another account's own export is
+ * refused: it would MERGE that member's store into ours.
+ */
 function importConversation(
   conversationId: string,
   path?: string
 ): ZrdtThunk<Promise<ZrdtOpenOutcome | undefined>> {
-  return async dispatch => {
+  return async (dispatch, getState) => {
     const source = path || getZrdtDumpPath(conversationId);
     try {
-      const dump = zrdtParseDump(new Uint8Array(await readFile(source)));
+      const file = zrdtParseExport(new Uint8Array(await readFile(source)));
+      if (file.kind === 'served') {
+        const result = await importServedExport(conversationId, file);
+        if (!result.ok) {
+          dispatch(
+            setInternalResult(`Import of ${source} refused: ${result.reason}`)
+          );
+          return undefined;
+        }
+        dispatch(patchConversation(conversationId, {}, ['rejected']));
+        dispatch(
+          setInternalResult(
+            `Import of ${source}: ok (from ${nameOf(getState(), file.from)}: ` +
+              `${result.records} records, ${result.boundary} boundary; ` +
+              `content: ${result.kept} kept, ${result.refused} refused)`
+          )
+        );
+        await dispatch(refreshConversation(conversationId));
+        return { status: 'ok' };
+      }
+      const ourAci = itemStorage.user.getCheckedAci();
+      if (file.account !== ourAci) {
+        dispatch(
+          setInternalResult(
+            `Import of ${source} refused: it is the own export of another ` +
+              `account (${file.account ?? 'unnamed'}); ask that member for ` +
+              'an export for you'
+          )
+        );
+        return undefined;
+      }
+      const dump = file;
       const outcome = await zrdtService.importBlob(conversationId, dump.blob);
       if (outcome.status === 'ok') {
         failedImportBlobs.delete(conversationId);
@@ -843,10 +1287,14 @@ function salvageFile(
   return async dispatch => {
     const source = path || getZrdtDumpPath(conversationId);
     try {
-      failedImportBlobs.set(
-        conversationId,
-        zrdtParseDump(new Uint8Array(await readFile(source)))
-      );
+      const file = zrdtParseExport(new Uint8Array(await readFile(source)));
+      if (
+        file.kind !== 'own' ||
+        file.account !== itemStorage.user.getCheckedAci()
+      ) {
+        throw new Error("only this account's own export can be salvaged");
+      }
+      failedImportBlobs.set(conversationId, file);
     } catch (error) {
       dispatch(setInternalResult(`Salvage failed: ${errorText(error)}`));
       return;
@@ -1109,7 +1557,9 @@ export const actions = {
   restartBackend,
   dismissSalvageReport,
   exportConversation,
+  exportConversationFor,
   importConversation,
+  setStrict,
   salvageFile,
   openCompare,
   closeCompare,

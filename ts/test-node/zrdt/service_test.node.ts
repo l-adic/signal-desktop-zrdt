@@ -271,7 +271,14 @@ function newService(
     storage,
     groupIdOf: id => (id === CHAT ? GROUP : undefined),
     ourAci: () => me,
-    heldOpenings: async id => (id === CHAT ? storage.held : []),
+    heldOpenings: async (id, digests) =>
+      id === CHAT
+        ? storage.held.filter(
+            h =>
+              digests === undefined ||
+              digests.some(d => toHex(d) === toHex(h.digest))
+          )
+        : [],
   });
 }
 
@@ -313,16 +320,28 @@ describe('zrdt service', function (this: Mocha.Suite) {
   this.timeout(30_000);
 
   describe('backend factory', () => {
-    it('picks the daemon, the stub, or refuses the stub', () => {
-      assert.strictEqual(intendedBackendKind({}), 'stub');
+    it('picks the daemon; the stub only in tests; else refuses', () => {
+      // The app (no NODE_ENV=test): the Lean daemon or nothing.
+      assert.strictEqual(intendedBackendKind({}), 'lean');
+      assert.throws(() => createZrdtBackend({}), /needs the Lean daemon/);
       assert.strictEqual(
-        intendedBackendKind({ ZRDT_REQUIRE_LEAN: '1' }),
+        intendedBackendKind({ ZRDT_DAEMON: '/path/to/zrdtd' }),
         'lean'
       );
-      assert.strictEqual(createZrdtBackend({}).kind, 'stub');
+      // Tests may run the stub, unless ZRDT_REQUIRE_LEAN=1.
+      assert.strictEqual(intendedBackendKind({ NODE_ENV: 'test' }), 'stub');
+      assert.strictEqual(createZrdtBackend({ NODE_ENV: 'test' }).kind, 'stub');
+      assert.strictEqual(
+        createZrdtBackend({ ZRDT_ALLOW_STUB: '1' }).kind,
+        'stub'
+      );
+      assert.strictEqual(
+        intendedBackendKind({ NODE_ENV: 'test', ZRDT_REQUIRE_LEAN: '1' }),
+        'lean'
+      );
       assert.throws(
-        () => createZrdtBackend({ ZRDT_REQUIRE_LEAN: '1' }),
-        /ZRDT_REQUIRE_LEAN/
+        () => createZrdtBackend({ NODE_ENV: 'test', ZRDT_REQUIRE_LEAN: '1' }),
+        /needs the Lean daemon/
       );
     });
 
@@ -758,6 +777,7 @@ describe('zrdt service', function (this: Mocha.Suite) {
         const outcomes = await dave.acceptView(CHAT, {
           voucherAci: BOB,
           forImport: false,
+          mode: 'catchup',
           items: [
             {
               entry: { kind: 'after', record: await recordOf(b2) },
@@ -799,12 +819,76 @@ describe('zrdt service', function (this: Mocha.Suite) {
         // LINKABLE: only heads held live (c0 is Alice's live record).
         assert.deepEqual((await dave.linkable(CHAT)).map(toHex), [toHex(c0)]);
 
-        // Re-open after a restart: the same store, still relative.
+        // Protocol 4, per-digest mode: a boundary digest no stored record
+        // links is not kept, so it adds no head (the round-2 stray head).
+        const stray = new Uint8Array(32).fill(0x5a);
+        const headsBefore = (await dave.heads(CHAT)).map(toHex);
+        const perDigest = await dave.acceptView(CHAT, {
+          voucherAci: BOB,
+          forImport: false,
+          mode: 'perDigest',
+          items: [
+            {
+              entry: { kind: 'boundary', digest: stray },
+              provenance: { kind: 'relayed', byAci: BOB },
+            },
+            {
+              entry: { kind: 'boundary', digest: a1 },
+              provenance: { kind: 'relayed', byAci: BOB },
+            },
+          ],
+        });
+        assert.deepEqual(
+          perDigest.map(o => o.result.kind),
+          ['ignored', 'ok'],
+          'the stray digest is dropped; a1 was taken before'
+        );
+        assert.deepEqual((await dave.heads(CHAT)).map(toHex), headsBefore);
+        assert.isFalse(
+          storage.boundary.some(r => toHex(r.digest) === toHex(stray))
+        );
+
+        // A pending record resolves through a per-digest boundary digest:
+        // the host passes it in the same request, so the digest is kept.
+        const deep = new Uint8Array(32).fill(0x6b);
+        const late = await incoming(dave, CAROL, 'c1', [c0, deep]);
+        assert.strictEqual(late.status, 'missing');
+        const resolved = await dave.acceptView(CHAT, {
+          voucherAci: BOB,
+          forImport: false,
+          mode: 'perDigest',
+          items: [
+            {
+              entry: { kind: 'boundary', digest: deep },
+              provenance: { kind: 'relayed', byAci: BOB },
+            },
+          ],
+        });
+        assert.deepEqual(
+          resolved.map(o => o.result.kind),
+          ['ok']
+        );
+        const c1 = late.digest;
+        if (c1 === undefined) {
+          throw new Error('no digest for the second pending record');
+        }
+        assert.isTrue(await dave.has(CHAT, c1), 'the pending record is stored');
+        assert.deepEqual(storage.pending, []);
+        assert.deepEqual((await dave.heads(CHAT)).map(toHex), [toHex(c1)]);
+
+        // Re-open after a restart: the same store, still relative, and the
+        // audiences of the live records (the host re-sends the openings its
+        // message rows hold).
+        for (const o of [early, late]) {
+          if (o.status === 'missing' && o.digest && o.opening) {
+            storage.held.push({ digest: o.digest, opening: o.opening });
+          }
+        }
         const exported = toHex(await dave.exportBlob(CHAT));
         const again = fresh(storage, DAVE);
         await again.init();
         assert.isTrue(await again.isRelative(CHAT));
-        assert.deepEqual((await again.heads(CHAT)).map(toHex), [toHex(c0)]);
+        assert.deepEqual((await again.heads(CHAT)).map(toHex), [toHex(c1)]);
         assert.strictEqual(toHex(await again.exportBlob(CHAT)), exported);
 
         // A closed store ignores boundary entries.
@@ -813,6 +897,7 @@ describe('zrdt service', function (this: Mocha.Suite) {
         const ignored = await carol.acceptView(CHAT, {
           voucherAci: BOB,
           forImport: false,
+          mode: 'catchup',
           items: [
             {
               entry: { kind: 'boundary', digest: a1 },

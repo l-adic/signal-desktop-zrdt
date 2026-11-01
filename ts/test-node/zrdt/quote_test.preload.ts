@@ -19,7 +19,9 @@ import {
   applyZrdtQuoteRule,
   getCommittedAudience,
   getZrdtEditRecipients,
+  splitZrdtTargetConversationIds,
 } from '../../zrdt/quote.preload.ts';
+import type { ZrdtTargetMemberType } from '../../zrdt/quote.preload.ts';
 
 const log = createLogger('zrdt/quote_test');
 
@@ -197,5 +199,66 @@ describe('zrdt quote and edit rules (JOIN_PLAN §8.3)', () => {
     // A target that is no record (no audience) is edited the stock way.
     const plain = quotedMessage(undefined);
     assert.deepEqual(getZrdtEditRecipients(plain, [BOB, FRANK]), [BOB, FRANK]);
+  });
+
+  describe('the target rule (reactions, pins, deletes, poll votes)', () => {
+    // Conversation ids of the group's members, as Reactions and Polls keep
+    // them; Dave was added after the target was sent.
+    const byId = new Map<string, ZrdtTargetMemberType>([
+      ['c-alice', 'me'],
+      ['c-bob', { aci: BOB }],
+      ['c-carol', { aci: CAROL }],
+      ['c-dave', { aci: DAVE }],
+      ['c-gone', undefined],
+    ]);
+    const memberOf = (id: string) => byId.get(id);
+    const ids = ['c-alice', 'c-bob', 'c-carol', 'c-dave', 'c-gone'];
+
+    it('a reaction to a pre-join record goes to its seats and us only', () => {
+      const target = quotedMessage(openingFor([ALICE, BOB, CAROL]));
+      assert.deepEqual(splitZrdtTargetConversationIds(target, ids, memberOf), {
+        allowed: ['c-alice', 'c-bob', 'c-carol'],
+        excluded: ['c-dave', 'c-gone'],
+      });
+    });
+
+    it('a member listed with a zero tag (not sent the target) is left out', () => {
+      const target = quotedMessage(openingFor([ALICE, BOB], [CAROL]));
+      assert.deepEqual(
+        splitZrdtTargetConversationIds(target, ids, memberOf).allowed,
+        ['c-alice', 'c-bob']
+      );
+    });
+
+    it('a target with no committed audience (not a record, e.g. a poll) goes the stock way', () => {
+      const plain = quotedMessage(undefined);
+      assert.deepEqual(splitZrdtTargetConversationIds(plain, ids, memberOf), {
+        allowed: ids,
+        excluded: [],
+      });
+    });
+
+    it('pins, unpins, deletes and poll terminates: service ids, seats ∩ recipients', () => {
+      const target = quotedMessage(openingFor([ALICE, BOB, CAROL]));
+      assert.deepEqual(getZrdtEditRecipients(target, [BOB, CAROL, DAVE]), [
+        BOB,
+        CAROL,
+      ]);
+      assert.deepEqual(
+        getZrdtEditRecipients(quotedMessage(undefined), [BOB, DAVE]),
+        [BOB, DAVE]
+      );
+    });
+
+    it('an outgoing target (our own record) is ruled the same way', () => {
+      const target = {
+        ...quotedMessage(openingFor([ALICE, CAROL])),
+        type: 'outgoing',
+      } as ReadonlyMessageAttributesType;
+      assert.deepEqual(
+        splitZrdtTargetConversationIds(target, ids, memberOf).allowed,
+        ['c-alice', 'c-carol']
+      );
+    });
   });
 });

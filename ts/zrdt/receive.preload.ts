@@ -64,6 +64,7 @@ import {
   startCatchUp,
   zrdtResendScheduler,
 } from './resend.preload.ts';
+import { catchUpStoreMode } from './catchUp.std.ts';
 
 const { isEqual } = lodash;
 
@@ -831,11 +832,24 @@ export async function takeServedReply({
     log.warn('served: not a group we share with the responder; ignored');
     return [];
   }
+  // No store yet (a catch-up, JOIN_PLAN §6.1): this reply opens it, relative
+  // only if it carries a boundary digest (catchUp.std.ts).
+  if (
+    catchUp &&
+    !(await zrdtService.hasStore(conversationId)) &&
+    catchUpStoreMode(entries.map(entry => entry.kind)) === 'relative'
+  ) {
+    await zrdtService.startRelative(conversationId, groupId);
+  }
   await zrdtService.ensureConversation(conversationId, groupId);
   const items = entries.map(entry => viewItem(entry, responderAci));
+  // The request's mode (protocol 4): a per-digest reply's boundary digests
+  // stay only if a stored record (ours, or a pending one taken with them)
+  // links them, so a digest asked for by name adds no head.
   const outcomes = await zrdtService.acceptView(conversationId, {
     voucherAci: responderAci,
     forImport: false,
+    mode: catchUp ? 'catchup' : 'perDigest',
     items,
   });
   const summary = entries.map((entry, i) => summarize(entry, outcomes[i]));

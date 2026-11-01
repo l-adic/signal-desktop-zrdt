@@ -26,6 +26,7 @@ import {
   maybeExpandErrors,
 } from './handleMultipleSendErrors.std.ts';
 import { getRecipients } from '../../util/getRecipients.dom.ts';
+import { getZrdtEditRecipients } from '../../zrdt/quote.preload.ts';
 import type { MessageModel } from '../../models/messages.preload.ts';
 import type { LoggerType } from '../../types/Logging.std.ts';
 import { strictAssert } from '../../util/assert.std.ts';
@@ -74,7 +75,12 @@ export async function sendPollTerminate(
     return;
   }
 
-  const recipients = getRecipients(conversation.attributes);
+  // zrdt target rule (JOIN_PLAN §8.3): only the poll's seats, if it has a
+  // committed audience (a poll is not a record yet: then everyone).
+  const recipients = getZrdtEditRecipients(
+    pollMessage.attributes,
+    getRecipients(conversation.attributes)
+  );
 
   const profileKey = conversation.get('profileSharing')
     ? await ourProfileKeyService.get()

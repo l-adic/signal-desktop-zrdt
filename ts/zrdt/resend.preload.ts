@@ -15,9 +15,10 @@
 //
 // Catch-up (JOIN_PLAN §6.1, §6.5; decisions in catchUp.std.ts): a device with
 // no store for a group it is a member of asks the adder, then two more
-// members, for the whole view it was sent (SERVE in catch-up mode) into a
-// relative store. Every reply goes through ACCEPT_VIEW
-// (receive.preload.ts, takeServedReply).
+// members, for the whole view it was sent (SERVE in catch-up mode). The first
+// reply opens the store: relative if it carries a boundary digest, closed
+// otherwise. Every reply goes through ACCEPT_VIEW (receive.preload.ts,
+// takeServedReply).
 
 import { ContentHint } from '@signalapp/libsignal-client';
 
@@ -47,6 +48,7 @@ import {
 import type { ServeHeld, ServeMode, ServeReply } from './ZrdtBackend.std.ts';
 import { decodeServeEntries } from './backends/codec.std.ts';
 import { ServeRequestBook, checkServedReply } from './serveRequests.std.ts';
+import { isZrdtStrict, serveRequestFor } from './serveArgs.std.ts';
 import { decodeServeHeader, keyTag, openServeReply } from './seal.node.ts';
 import { sendZrdtServed } from './served.preload.ts';
 import { zrdtEvents, zrdtService } from './service.preload.ts';
@@ -59,7 +61,7 @@ import {
   catchUpSince,
   catchUpTargets,
   joinRemovedSince,
-  joinedAfterCreation,
+  needsCatchUp,
 } from './catchUp.std.ts';
 
 const log = createLogger('zrdt/resend');
@@ -426,24 +428,25 @@ async function onServeRequest(
       ),
       loadServeHostState(conversationId),
     ]);
-    const reply: ServeReply = await zrdtService.serve(conversationId, {
-      ownAci: uuidToBytes(ourAci),
-      requesterAci: uuidToBytes(requesterAci),
-      key,
-      requestId: new Uint8Array(requestId),
-      since: digestsOf(request.since),
-      // Our own heads when we saw this account removed (JOIN_PLAN §6.5).
-      ownSince: (conversation.get('zrdtRemovedSince')?.[requesterAci] ?? [])
-        .filter(hex => /^[0-9a-f]{64}$/.test(hex))
-        .map(hex => Bytes.fromHex(hex)),
-      mode,
-      wanted,
-      forExport: false,
-      strict: conversation.get('zrdtStrict') === true,
-      live: hostState.live,
-      disown: hostState.disown,
-      held,
-    });
+    // The group's strict setting and our own `since` for this account
+    // (JOIN_PLAN §5, §6.5) come from the conversation (serveArgs.std.ts).
+    const reply: ServeReply = await zrdtService.serve(
+      conversationId,
+      serveRequestFor({
+        conversation: conversation.attributes,
+        ownAci: uuidToBytes(ourAci),
+        requesterAci,
+        requesterAciBytes: uuidToBytes(requesterAci),
+        key,
+        requestId: new Uint8Array(requestId),
+        since: digestsOf(request.since),
+        mode,
+        wanted,
+        live: hostState.live,
+        disown: hostState.disown,
+        held,
+      })
+    );
     await sendZrdtServed({ groupId: new Uint8Array(groupId), reply, key });
 
     // Wanted digests that got no record (not stored here, or a bare digest):
@@ -473,6 +476,27 @@ async function onServeRequest(
   } catch (error) {
     log.error('answering serve request failed', Errors.toLogFormat(error));
   }
+}
+
+/**
+ * Strict mode for a group (JOIN_PLAN §5, user decision 3: off by default,
+ * opt-in per group): this device's SERVE replies then carry content only in
+ * author copies. Saved on the conversation; read by every later reply.
+ */
+export async function setZrdtStrict(
+  conversationId: string,
+  strict: boolean
+): Promise<boolean> {
+  const conversation = window.ConversationController.get(conversationId);
+  if (!conversation) {
+    throw new Error(`setZrdtStrict: no conversation ${conversationId}`);
+  }
+  conversation.set({ zrdtStrict: strict ? true : undefined });
+  await DataWriter.updateConversation(conversation.attributes);
+  log.info(
+    `strict mode ${strict ? 'on' : 'off'} for ${conversation.idForLogging()}`
+  );
+  return isZrdtStrict(conversation.attributes);
 }
 
 // --- requester (JOIN_PLAN §4.4) ---------------------------------------------------
@@ -648,17 +672,23 @@ function catchUpTimeoutMs(): number {
 
 /**
  * Starts a catch-up for `conversation` (once per conversation and run): a
- * relative store if it has none, a catch-up request to the adder (or the
- * first other member), and after a timeout to two more members if nobody
- * answered. `since` is the old store's heads ∪ pending ∪ missing on a re-add,
- * empty otherwise.
+ * catch-up request to the adder (or the first other member), and after a
+ * timeout to two more members if nobody answered. `since` is the old store's
+ * heads ∪ pending ∪ missing on a re-add, empty otherwise. With `relative`
+ * (a re-add) a relative store is opened now; otherwise the first reply opens
+ * the store (takeServedReply).
  */
 export async function startCatchUp(
   conversation: ConversationModel,
   {
     reason,
     since = [],
-  }: Readonly<{ reason: string; since?: ReadonlyArray<string> }>
+    relative = false,
+  }: Readonly<{
+    reason: string;
+    since?: ReadonlyArray<string>;
+    relative?: boolean;
+  }>
 ): Promise<void> {
   const conversationId = conversation.id;
   if (catchUps.has(conversationId)) {
@@ -682,7 +712,14 @@ export async function startCatchUp(
       catchUps.delete(conversationId);
       return;
     }
-    const mode = await zrdtService.startRelative(conversationId, groupId);
+    let mode = 'no';
+    if (relative) {
+      mode = await zrdtService.startRelative(conversationId, groupId);
+    } else if (await zrdtService.hasStore(conversationId)) {
+      mode = (await zrdtService.isRelative(conversationId))
+        ? 'relative'
+        : 'closed';
+    }
     const ourAci = itemStorage.user.getCheckedAci();
     const members = (conversation.get('membersV2') ?? []).map(m => m.aci);
     const targets = catchUpTargets({
@@ -725,8 +762,8 @@ export async function startCatchUp(
 }
 
 /**
- * After the app started: catch up every group this device has no store for
- * whose member list says we joined after it was created.
+ * After the app started: catch up every group this device is a member of and
+ * has no store for (JOIN_PLAN §6.1; no join revision is read).
  */
 export async function zrdtCatchUpAtStartup(): Promise<void> {
   try {
@@ -738,10 +775,11 @@ export async function zrdtCatchUpAtStartup(): Promise<void> {
     for (const conversation of window.ConversationController.getAll()) {
       if (
         conversation.get('groupVersion') === 2 &&
-        conversation.areWeAGroupMember() &&
-        joinedAfterCreation(ourAci, conversation.get('membersV2') ?? []) &&
-        // oxlint-disable-next-line no-await-in-loop
-        !(await zrdtService.hasStore(conversation.id))
+        needsCatchUp({
+          isMember: conversation.areWeAGroupMember(),
+          // oxlint-disable-next-line no-await-in-loop
+          hasStore: await zrdtService.hasStore(conversation.id),
+        })
       ) {
         // oxlint-disable-next-line no-await-in-loop
         await startCatchUp(conversation, { reason: 'startup' });
@@ -759,7 +797,7 @@ export async function zrdtCatchUpAtStartup(): Promise<void> {
  *   (JOIN_PLAN §6.5);
  * - a re-add of ours: `since` = the old store's heads ∪ pending ∪ missing,
  *   the old store is archived, and a catch-up starts into a new one;
- * - no store and we joined after creation: a catch-up starts.
+ * - no store (a member whose device has none): a catch-up starts.
  */
 async function zrdtAfterGroupUpdate({
   conversation,
@@ -815,14 +853,15 @@ async function zrdtAfterGroupUpdate({
       );
       await zrdtService.archive(conversationId);
       catchUps.delete(conversationId);
-      await startCatchUp(conversation, { reason: 're-add', since });
+      await startCatchUp(conversation, {
+        reason: 're-add',
+        since,
+        relative: true,
+      });
       return;
     }
-    if (
-      !hasStore &&
-      joinedAfterCreation(ourAci, conversation.get('membersV2') ?? [])
-    ) {
-      await startCatchUp(conversation, { reason: 'joined' });
+    if (needsCatchUp({ isMember: true, hasStore })) {
+      await startCatchUp(conversation, { reason: 'no store' });
     }
   } catch (error) {
     log.error('zrdtAfterGroupUpdate failed', Errors.toLogFormat(error));

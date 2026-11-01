@@ -8,15 +8,20 @@
 //            fix the count. OPEN of the result fails: the records that link
 //            the removed one cannot be accepted, and `missing` names it.
 //   append   (beat 5) add two fake records attributed to `--author` (Bob) on
-//            top of the genuine head. zrdtd builds them: OPEN the blob under a
-//            scratch chat key, ACCEPT two records whose links are the current
-//            heads (random commits), ENCODE. The result passes OPEN; only live
-//            messages expose the fakes.
+//            top of the genuine head. In an own export, zrdtd builds them:
+//            OPEN the blob under a scratch chat key, ACCEPT_RECORD two
+//            structure-only records whose links are the current heads
+//            (random commits), ENCODE. The result passes OPEN. In an export
+//            for another member (sealed to that member's key, JOIN_PLAN
+//            §4.5), the doctor cannot read the sealed part; like any giver,
+//            it can seal more: it appends a section of two `after` entries
+//            on `--links` (the giver's heads), sealed to the key the file
+//            names. Either way only live messages expose the fakes.
 //
 // Run from the repository root:
 //   node --import tsx demo/doctor.ts remove <export> [<out>] [--digest <hex>]
 //   node --import tsx demo/doctor.ts append <export> [<out>] --author <aci>
-//        [--count 2] [--daemon <zrdtd>]
+//        [--count 2] [--daemon <zrdtd>] [--links <hex,hex>]
 //   node --import tsx demo/doctor.ts show <export>
 // <out> defaults to <export> with ".doctored" before the extension.
 //
@@ -42,6 +47,9 @@ import { createHash, randomBytes } from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 
+import { encodeServeEntries } from '../ts/zrdt/backends/codec.std.ts';
+import { keyTag, sealServeReply } from '../ts/zrdt/seal.node.ts';
+
 export const BLOB_MAGIC = Buffer.from('zrdtS2', 'ascii');
 export const BLOB3_MAGIC = Buffer.from('zrdtS3', 'ascii');
 export const RECORD_MAGIC = Buffer.from('zrdt2', 'ascii');
@@ -59,7 +67,7 @@ export type StoreBlob = Readonly<{
   // Encoded records, in file order.
   records: ReadonlyArray<Bytes>;
   // The zrdtS3 header before the records part (mode, boundary, audiences).
-  header?: Bytes;
+  header: Bytes;
 }>;
 
 /** The zrdtS3 header of a closed store with no recorded audiences. */
@@ -104,25 +112,34 @@ function blob3HeaderLength(buf: Bytes, offset: number): number {
   return at - offset;
 }
 
-/** Parses the store blob that starts at `offset`; returns it and its length. */
+/**
+ * Parses the store blob that starts at `offset`; returns it and its length.
+ * Only a zrdtS3 blob is read (greenfield): a bare zrdtS2 records part is not
+ * a store blob.
+ */
 export function parseBlobPrefix(
   buf: Bytes,
   offset: number
 ): { blob: StoreBlob; length: number } {
-  if (buf.subarray(offset, offset + BLOB3_MAGIC.length).equals(BLOB3_MAGIC)) {
-    const headerLength = blob3HeaderLength(buf, offset);
-    const inner = parseBlobPrefix(buf, offset + headerLength);
-    if (inner.blob.header !== undefined) {
-      throw new Error('a zrdtS3 blob inside a zrdtS3 blob');
-    }
-    return {
-      blob: {
-        ...inner.blob,
-        header: Buffer.from(buf.subarray(offset, offset + headerLength)),
-      },
-      length: headerLength + inner.length,
-    };
+  if (!buf.subarray(offset, offset + BLOB3_MAGIC.length).equals(BLOB3_MAGIC)) {
+    throw new Error('not a zrdt store blob (no "zrdtS3" magic)');
   }
+  const headerLength = blob3HeaderLength(buf, offset);
+  const inner = parseRecordsPart(buf, offset + headerLength);
+  return {
+    blob: {
+      ...inner.blob,
+      header: Buffer.from(buf.subarray(offset, offset + headerLength)),
+    },
+    length: headerLength + inner.length,
+  };
+}
+
+/** The records part of a zrdtS3 blob ("zrdtS2" ‖ group ‖ count ‖ records). */
+function parseRecordsPart(
+  buf: Bytes,
+  offset: number
+): { blob: Omit<StoreBlob, 'header'>; length: number } {
   let at = offset;
   const need = (n: number, what: string) => {
     if (at + n > buf.length) {
@@ -131,7 +148,7 @@ export function parseBlobPrefix(
   };
   need(BLOB_MAGIC.length + DIGEST + 4, 'its header');
   if (!buf.subarray(at, at + BLOB_MAGIC.length).equals(BLOB_MAGIC)) {
-    throw new Error('not a zrdt store blob (no "zrdtS3" or "zrdtS2" magic)');
+    throw new Error('the zrdtS3 blob has no "zrdtS2" records part');
   }
   at += BLOB_MAGIC.length;
   const group = Buffer.from(buf.subarray(at, at + DIGEST));
@@ -157,12 +174,7 @@ export function parseBlobPrefix(
 export function encodeBlob(blob: StoreBlob): Bytes {
   const head = Buffer.alloc(4);
   head.writeUInt32BE(blob.records.length);
-  const parts: Array<Bytes> = [
-    ...(blob.header ? [blob.header] : []),
-    BLOB_MAGIC,
-    blob.group,
-    head,
-  ];
+  const parts: Array<Bytes> = [blob.header, BLOB_MAGIC, blob.group, head];
   for (const r of blob.records) {
     const len = Buffer.alloc(4);
     len.writeUInt32BE(r.length);
@@ -375,10 +387,7 @@ export type Located = Readonly<{
 }>;
 
 export function locateBlob(file: Bytes): Located {
-  if (
-    file.subarray(0, BLOB_MAGIC.length).equals(BLOB_MAGIC) ||
-    file.subarray(0, BLOB3_MAGIC.length).equals(BLOB3_MAGIC)
-  ) {
+  if (file.subarray(0, BLOB3_MAGIC.length).equals(BLOB3_MAGIC)) {
     const { length } = parseBlobPrefix(file, 0);
     if (length === file.length) {
       return { blob: file, kind: 'raw', replace: next => next };
@@ -387,10 +396,8 @@ export function locateBlob(file: Bytes): Located {
   const text = file.toString('utf8').trimStart();
   if (text.startsWith('{')) {
     const doc = JSON.parse(text) as unknown;
-    // "enJkdFMz" (zrdtS3), "enJkdFMy" (zrdtS2).
-    const b64Magics = [BLOB3_MAGIC, BLOB_MAGIC].map(m =>
-      m.toString('base64').slice(0, 8)
-    );
+    // "enJkdFMz" (zrdtS3).
+    const b64Magics = [BLOB3_MAGIC.toString('base64').slice(0, 8)];
     const paths: Array<Array<string | number>> = [];
     const walk = (v: unknown, at: Array<string | number>) => {
       if (
@@ -432,8 +439,7 @@ export function locateBlob(file: Bytes): Located {
       },
     };
   }
-  const at3 = file.indexOf(BLOB3_MAGIC);
-  const at = at3 >= 0 ? at3 : file.indexOf(BLOB_MAGIC);
+  const at = file.indexOf(BLOB3_MAGIC);
   if (at < 0) {
     throw new Error('no zrdt store blob in this file');
   }
@@ -456,10 +462,10 @@ export function locateBlob(file: Bytes): Located {
 
 export const Op = {
   OPEN: 0x03,
-  ACCEPT: 0x07,
   HEADS: 0x08,
   ENCODE: 0x0e,
   CLOSE: 0x0f,
+  ACCEPT_RECORD: 0x10,
 } as const;
 
 export const Status = {
@@ -599,21 +605,21 @@ export class Zrdtd {
     return readDigests(r.body);
   }
 
-  async accept(chat: string, parts: RecordParts): Promise<Bytes> {
+  /**
+   * ACCEPT_RECORD of a structure-only record (no opening): a fake opens to
+   * nothing, so zrdtd records no audience for it. (ACCEPT always takes the
+   * opening of a live record; a fake has none.)
+   */
+  async acceptRecord(chat: string, parts: RecordParts): Promise<Bytes> {
     const r = await this.call(
-      Op.ACCEPT,
+      Op.ACCEPT_RECORD,
       Buffer.concat([
         str(chat),
-        parts.group,
-        parts.commit,
-        digests(parts.links),
-        parts.author,
-        // Protocol 3: the opening flag. A fake has no opening, so zrdtd
-        // records no audience for it.
+        lenBytes(encodeRecord(parts)),
         Buffer.from([0]),
       ])
     );
-    expectOk('ACCEPT', r);
+    expectOk('ACCEPT_RECORD', r);
     // The digest, then the record's encoding.
     return Buffer.from(r.body.subarray(0, DIGEST));
   }
@@ -722,7 +728,7 @@ export async function appendFakes(
       // oxlint-disable-next-line no-await-in-loop
       const links = await zrdtd.heads(chat);
       // oxlint-disable-next-line no-await-in-loop
-      const d = await zrdtd.accept(chat, {
+      const d = await zrdtd.acceptRecord(chat, {
         group,
         commit: randomBytes(DIGEST),
         links,
@@ -745,6 +751,84 @@ export async function appendFakes(
   } finally {
     await zrdtd.close();
   }
+}
+
+/** An export for another member (ducks/zrdt `zrdtExport: 2`), as JSON. */
+type ServedExportDoc = {
+  zrdtExport: 2;
+  to: string;
+  group: string;
+  key: string;
+  sections: Array<{ header: string; ephemeralKey: string; sealed: string }>;
+};
+
+/** The parsed JSON if `file` is an export for another member. */
+export function asServedExport(file: Bytes): ServedExportDoc | undefined {
+  const text = file.toString('utf8').trimStart();
+  if (!text.startsWith('{')) {
+    return undefined;
+  }
+  const doc = JSON.parse(text) as Partial<ServedExportDoc>;
+  return doc.zrdtExport === 2 ? (doc as ServedExportDoc) : undefined;
+}
+
+export type AppendSealedResult = Readonly<{
+  file: Bytes;
+  fakes: ReadonlyArray<string>;
+}>;
+
+/**
+ * Beat 5 on an export for another member: `count` fake records by `author`,
+ * the first on `links`, each next on the one before, as `after` entries in a
+ * new section sealed to the key the file names (seal.node.ts, as the app
+ * seals a SERVE reply). Needs no zrdtd: a fake's digest is SHA-256 of its
+ * encoding.
+ */
+export function appendSealedFakes(
+  file: Bytes,
+  author: Bytes,
+  links: ReadonlyArray<Bytes>,
+  count = 2
+): AppendSealedResult {
+  const doc = asServedExport(file);
+  if (!doc) {
+    throw new Error('not an export for another member');
+  }
+  const group = Buffer.from(doc.group, 'base64');
+  const key = new Uint8Array(Buffer.from(doc.key, 'base64'));
+  const records: Array<Bytes> = [];
+  let on = [...links];
+  for (let i = 0; i < count; i += 1) {
+    const rec = encodeRecord({
+      group,
+      commit: randomBytes(DIGEST),
+      links: on,
+      author,
+    });
+    records.push(rec);
+    on = [digestOf(rec)];
+  }
+  const headerBytes = new Uint8Array(
+    Buffer.concat([aciBytes(doc.to), keyTag(key), randomBytes(16)])
+  );
+  const entriesBytes = encodeServeEntries(
+    records.map(record => ({ kind: 'after', record: new Uint8Array(record) }))
+  );
+  const { ephemeralKey, sealed } = sealServeReply({
+    group: new Uint8Array(group),
+    headerBytes,
+    entriesBytes,
+    recipientKey: key,
+  });
+  doc.sections.push({
+    header: Buffer.from(headerBytes).toString('base64'),
+    ephemeralKey: Buffer.from(ephemeralKey).toString('base64'),
+    sealed: Buffer.from(sealed).toString('base64'),
+  });
+  return {
+    file: Buffer.from(`${JSON.stringify(doc, null, 2)}\n`),
+    fakes: records.map(r => hex(digestOf(r))),
+  };
 }
 
 /** Runs OPEN on a blob in a scratch chat; returns the reply described. */
@@ -813,9 +897,31 @@ export async function doctorAppend(
   file: string,
   authorAci: string,
   out = doctoredPath(file),
-  options: { count?: number; daemon?: string } = {}
+  options: {
+    count?: number;
+    daemon?: string;
+    links?: ReadonlyArray<string>;
+  } = {}
 ): Promise<string> {
-  const located = locateBlob(await fs.readFile(file));
+  const bytes = await fs.readFile(file);
+  if (asServedExport(bytes)) {
+    const links = (options.links ?? []).map(l => Buffer.from(l, 'hex'));
+    if (links.length === 0 || links.some(l => l.length !== DIGEST)) {
+      throw new Error('an export for another member needs --links <hex,...>');
+    }
+    const result = appendSealedFakes(
+      bytes,
+      aciBytes(authorAci),
+      links,
+      options.count
+    );
+    await fs.writeFile(out, result.file);
+    return (
+      `appended ${result.fakes.map(tag).join(' ')} by ${authorAci} on top of ` +
+      `${links.map(l => tag(hex(l))).join(' ')} in a sealed section; wrote ${out}`
+    );
+  }
+  const located = locateBlob(bytes);
   const result = await appendFakes(located.blob, aciBytes(authorAci), options);
   await fs.writeFile(out, located.replace(result.blob));
   return (
@@ -832,7 +938,7 @@ function usage(): never {
   console.error(
     'usage:\n' +
       '  doctor.ts remove <export> [<out>] [--digest <hex prefix>]\n' +
-      '  doctor.ts append <export> [<out>] --author <aci> [--count 2] [--daemon <zrdtd>]\n' +
+      '  doctor.ts append <export> [<out>] --author <aci> [--count 2] [--daemon <zrdtd>] [--links <hex,...>]\n' +
       '  doctor.ts show <export> [--daemon <zrdtd>]'
   );
   process.exit(2);
@@ -867,6 +973,7 @@ async function main(argv: ReadonlyArray<string>): Promise<void> {
       summary = await doctorAppend(file, flags.author, out, {
         count: flags.count ? Number(flags.count) : undefined,
         daemon: flags.daemon,
+        links: flags.links ? flags.links.split(',') : undefined,
       });
       break;
     case 'show': {

@@ -51,6 +51,7 @@ import { maybeNotify } from '../messages/maybeNotify.preload.ts';
 import { itemStorage } from '../textsecure/Storage.preload.ts';
 import type { Emoji } from '../axo/emoji.std.ts';
 import { isValidSenderAciForConversation } from './helpers/isValidSenderAciForConversation.preload.ts';
+import { splitZrdtTargetConversationIds } from '../zrdt/quote.preload.ts';
 
 const { maxBy } = lodash;
 
@@ -375,8 +376,16 @@ export async function handleReaction(
     fromId: reaction.fromId,
     targetTimestamp: reaction.targetTimestamp,
     timestamp: reaction.timestamp,
+    // zrdt target rule (JOIN_PLAN §8.3): a reaction names its target's
+    // author and sent timestamp, so it goes only to the target's seats.
     isSentByConversationId: isFromThisDevice
-      ? zipObject(conversation.getMemberConversationIds(), repeat(false))
+      ? zipObject(
+          splitZrdtTargetConversationIds(
+            message.attributes,
+            conversation.getMemberConversationIds()
+          ).allowed,
+          repeat(false)
+        )
       : undefined,
   };
 

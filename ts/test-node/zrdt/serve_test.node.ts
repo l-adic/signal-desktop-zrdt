@@ -35,6 +35,7 @@ import {
   isEphemeralOpening,
   parseAudience,
 } from '../../zrdt/audience.std.ts';
+import { serveRequestFor } from '../../zrdt/serveArgs.std.ts';
 
 const CHAT = 'camping';
 const GROUP = new Uint8Array(32).fill(0x67);
@@ -686,22 +687,11 @@ describe('zrdt protocol 3 on the stub (JOIN_PLAN §3.2, §5)', () => {
         parts,
         opening,
       });
-      // Protocol 3 only: ACCEPT without the opening flag is cut short, and
-      // the flag is 0 or 1.
-      const bare = encodeRequestBody({ op: Op.ACCEPT, chat: CHAT, parts });
-      assert.strictEqual(bare.at(-1), 0);
-      assert.deepEqual(
-        decodeRequest(concat([Uint8Array.of(Op.ACCEPT), bare])),
-        { op: Op.ACCEPT, chat: CHAT, parts }
-      );
+      // Protocol 4: ACCEPT always carries the opening; a body without it is
+      // cut short.
+      const noOpening = acc.slice(0, acc.length - 4 - opening.length);
       assert.strictEqual(
-        decodeRequest(concat([Uint8Array.of(Op.ACCEPT), bare.slice(0, -1)])),
-        Code.BAD_REQUEST
-      );
-      const flag2 = bare.slice();
-      flag2[flag2.length - 1] = 2;
-      assert.strictEqual(
-        decodeRequest(concat([Uint8Array.of(Op.ACCEPT), flag2])),
+        decodeRequest(concat([Uint8Array.of(Op.ACCEPT), noOpening])),
         Code.BAD_REQUEST
       );
       // The ACCEPT reply holds the record bytes, the COMMIT reply the opening:
@@ -716,6 +706,96 @@ describe('zrdt protocol 3 on the stub (JOIN_PLAN §3.2, §5)', () => {
         decodeReply(Op.ACCEPT, Code.NO_AUDIENCE, new Uint8Array(0)),
         { kind: 'noAudience' }
       );
+    });
+  });
+
+  describe('the strict flag reaches SERVE (host, JOIN_PLAN §5)', () => {
+    const CAROL_ACI = 'c0c0c0c0-c0c0-4c0c-80c0-c0c0c0c0c0c0';
+
+    function hostRequest(
+      s: Scene,
+      conversation: Parameters<typeof serveRequestFor>[0]['conversation']
+    ): ServeRequest {
+      const base = request(s, { requesterAci: CAROL });
+      return {
+        chat: CHAT,
+        ...serveRequestFor({
+          conversation,
+          ownAci: ALICE,
+          requesterAci: CAROL_ACI,
+          requesterAciBytes: CAROL,
+          key: key(CAROL),
+          requestId: base.requestId,
+          since: [],
+          mode: 'catchup',
+          wanted: [],
+          live: base.live,
+          disown: base.disown,
+          held: base.held,
+        }),
+      };
+    }
+
+    it("takes the group's strict setting and our own since for that account", () => {
+      const args = serveRequestFor({
+        conversation: {
+          zrdtStrict: true,
+          zrdtRemovedSince: { [CAROL_ACI]: ['ab'.repeat(32), 'not hex'] },
+        },
+        ownAci: ALICE,
+        requesterAci: CAROL_ACI,
+        requesterAciBytes: CAROL,
+        key: key(CAROL),
+        requestId: fill(1, 16),
+        since: [],
+        mode: 'perDigest',
+        wanted: [fill(2, 32)],
+        live: [],
+        disown: [],
+        held: [],
+      });
+      assert.isTrue(args.strict);
+      assert.isFalse(args.forExport);
+      assert.deepEqual(args.ownSince.map(hex), ['ab'.repeat(32)]);
+      assert.deepEqual(args.wanted.map(hex), [hex(fill(2, 32))]);
+      const off = serveRequestFor({
+        conversation: {},
+        ownAci: ALICE,
+        requesterAci: CAROL_ACI,
+        requesterAciBytes: CAROL,
+        key: key(CAROL),
+        requestId: fill(1, 16),
+        since: [],
+        mode: 'catchup',
+        wanted: [fill(2, 32)],
+        live: [],
+        disown: [],
+        held: [],
+      });
+      assert.isFalse(off.strict, 'off by default');
+      assert.deepEqual(off.wanted, [], 'a catch-up names no digests');
+    });
+
+    it("a strict group's reply carries content only in the responder's author copies", async () => {
+      const s = await scene();
+      // Alice responds to Carol, who is seated in all four records.
+      const open = await s.backend.serve(hostRequest(s, {}));
+      assert.lengthOf(contentOf(open.entries), 4);
+      const strict = await s.backend.serve(
+        hostRequest(s, { zrdtStrict: true })
+      );
+      const withContent = strict.entries.flatMap(e =>
+        e.kind === 'addressed' && e.opening ? [e] : []
+      );
+      assert.deepEqual(
+        withContent.map(e => e.authorCopy),
+        [true, true],
+        "only Alice's own live records (r1, r4) carry content"
+      );
+      assert.sameMembers(describeEntries(s, withContent), [
+        'r1:addressed+content+authorCopy',
+        'r4:addressed+content+authorCopy',
+      ]);
     });
   });
 });

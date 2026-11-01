@@ -238,7 +238,7 @@ export function makeZrdtUnavailableMessageAttributes({
   };
 }
 
-/** @testexport */
+/** A gap row: the digests a received record links that this device lacks. */
 export function makeZrdtGapMessageAttributes({
   id,
   conversationId,

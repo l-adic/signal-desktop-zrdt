@@ -11,8 +11,13 @@ import { existsSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import { test } from 'node:test';
 
+import { PrivateKey } from '@signalapp/libsignal-client';
+
+import { decodeServeEntries } from '../ts/zrdt/backends/codec.std.ts';
+import { openServeReply } from '../ts/zrdt/seal.node.ts';
 import {
   analyse,
+  appendSealedFakes,
   dropContentEntry,
   appendFakes,
   checkOpen,
@@ -106,6 +111,89 @@ void test('blob framing: a relative header with a boundary and audiences', () =>
   const back = parseBlob(bytes);
   assert.deepEqual(back.header, header);
   assert.deepEqual(back.records, blob.records);
+});
+
+void test('only zrdtS3 is a store blob: a bare zrdtS2 part is refused', () => {
+  const bytes = encodeBlob(chain().blob);
+  const bare = Buffer.from(bytes.subarray(INNER));
+  assert.equal(bare.subarray(0, 6).toString(), 'zrdtS2');
+  assert.throws(() => parseBlob(bare), /zrdtS3/);
+  assert.throws(() => locateBlob(bare), /no zrdt store blob/);
+  assert.throws(
+    () =>
+      locateBlob(
+        Buffer.from(JSON.stringify({ blob: bare.toString('base64') }))
+      ),
+    /holds 0 store blobs/
+  );
+});
+
+void test('append on an export for another member: a sealed section of two after entries', () => {
+  const erin = PrivateKey.generate();
+  const erinAci = randomBytes(16);
+  const head = randomBytes(32);
+  const doc = {
+    zrdtExport: 2,
+    from: 'b0b0b0b0-0000-4000-8000-000000000002',
+    to: hex(erinAci),
+    group: group.toString('base64'),
+    key: Buffer.from(erin.getPublicKey().serialize()).toString('base64'),
+    sections: [],
+  };
+  const { file, fakes } = appendSealedFakes(
+    Buffer.from(JSON.stringify(doc)),
+    bob,
+    [head]
+  );
+  assert.equal(fakes.length, 2);
+  const out = JSON.parse(file.toString()) as {
+    sections: Array<{ header: string; ephemeralKey: string; sealed: string }>;
+  };
+  assert.equal(out.sections.length, 1);
+  const [section] = out.sections;
+  assert.ok(section);
+  const header = new Uint8Array(Buffer.from(section.header, 'base64'));
+  assert.deepEqual(Buffer.from(header.subarray(0, 16)), erinAci);
+  const opened = openServeReply({
+    group: new Uint8Array(group),
+    headerBytes: header,
+    ephemeralKey: new Uint8Array(Buffer.from(section.ephemeralKey, 'base64')),
+    sealed: new Uint8Array(Buffer.from(section.sealed, 'base64')),
+    ourPrivateKey: erin,
+    ourPublicKey: erin.getPublicKey(),
+  });
+  assert.ok(opened, 'opens under the key the file names');
+  const entries = decodeServeEntries(opened);
+  assert.ok(entries);
+  assert.deepEqual(
+    entries.map(e => e.kind),
+    ['after', 'after']
+  );
+  const [first, second] = entries.map(e =>
+    e.kind === 'after' ? parseRecord(Buffer.from(e.record)) : undefined
+  );
+  assert.deepEqual(
+    first?.links.map(l => hex(Buffer.from(l))),
+    [hex(head)]
+  );
+  assert.deepEqual(
+    second?.links.map(l => hex(Buffer.from(l))),
+    [fakes[0]]
+  );
+  assert.deepEqual(Buffer.from(first?.author ?? []), bob);
+  // Another key does not open it.
+  const other = PrivateKey.generate();
+  assert.equal(
+    openServeReply({
+      group: new Uint8Array(group),
+      headerBytes: header,
+      ephemeralKey: new Uint8Array(Buffer.from(section.ephemeralKey, 'base64')),
+      sealed: new Uint8Array(Buffer.from(section.sealed, 'base64')),
+      ourPrivateKey: other,
+      ourPublicKey: other.getPublicKey(),
+    }),
+    undefined
+  );
 });
 
 void test('parseBlob rejects trailing bytes, truncation and huge counts', () => {

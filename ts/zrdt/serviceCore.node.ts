@@ -38,6 +38,7 @@ import type {
   RecordParts,
   SalvageResult,
   ServeEntry,
+  ServeMode,
   ServeReply,
   ServeRequest,
   Status,
@@ -227,6 +228,7 @@ export type ZrdtServiceType = {
     a: Readonly<{
       voucherAci: string;
       forImport: boolean;
+      mode: ServeMode;
       items: ReadonlyArray<ZrdtViewItem>;
     }>
   ): Promise<Array<ZrdtViewOutcome>>;
@@ -290,13 +292,16 @@ export type ZrdtServiceDeps = Readonly<{
   /** Our ACI (uuid string), if registered. */
   ourAci: () => string | undefined;
   /**
-   * The openings the host holds for a conversation's records. zrdtd keeps
-   * the audiences it recorded only while a store is open (Proto.lean, "The
+   * The openings the host holds for a conversation's records (all stored
+   * ones, or the given digests: pending records too). zrdtd keeps the
+   * audiences it recorded only while a store is open (Proto.lean, "The
    * table of open stores"), so after OPEN they are re-sent with
-   * ACCEPT_RECORD (JOIN_PLAN §4.2).
+   * ACCEPT_RECORD (JOIN_PLAN §4.2); a pending record is accepted with its
+   * opening, so its audience is recorded too.
    */
   heldOpenings?: (
-    conversationId: string
+    conversationId: string,
+    digests?: ReadonlyArray<Uint8Array<ArrayBuffer>>
   ) => Promise<
     Array<{ digest: Uint8Array<ArrayBuffer>; opening: Uint8Array<ArrayBuffer> }>
   >;
@@ -412,6 +417,11 @@ export class ZrdtServiceCore implements ZrdtServiceType {
   readonly #state = new Map<string, ConversationState>();
   readonly #locks = new Map<string, Promise<unknown>>();
   #scratchCounter = 0;
+  // The openings of records waiting in zrdt_pending (`<chat>:<hex digest>`),
+  // so the record goes in with its opening and its audience is recorded
+  // (protocol 4: every live record has its audience). After a restart the
+  // host's held openings fill in (heldOpenings).
+  readonly #pendingOpenings = new Map<string, B>();
 
   constructor(deps: ZrdtServiceDeps) {
     this.#deps = deps;
@@ -661,7 +671,11 @@ export class ZrdtServiceCore implements ZrdtServiceType {
         conversationId,
         voucherBytes,
         false,
-        digests.map(digest => ({ kind: 'boundary', digest }))
+        // A stored boundary came from catch-up replies (or was linked):
+        // catch-up mode keeps every digest.
+        'catchup',
+        digests.map(digest => ({ kind: 'boundary', digest })),
+        []
       );
     }
     if (rows.length > 0) {
@@ -669,7 +683,9 @@ export class ZrdtServiceCore implements ZrdtServiceType {
         conversationId,
         new Uint8Array(16),
         false,
-        rows.map(row => ({ kind: 'after', record: own(row.record) }))
+        'catchup',
+        rows.map(row => ({ kind: 'after', record: own(row.record) })),
+        []
       );
       const bad = rows.filter((_row, i) => results[i]?.kind !== 'ok');
       if (bad.length > 0) {
@@ -896,13 +912,20 @@ export class ZrdtServiceCore implements ZrdtServiceType {
   async #pending(
     conversationId: string,
     record: Uint8Array<ArrayBuffer>,
-    provenance: ZrdtProvenance
+    provenance: ZrdtProvenance,
+    opening?: Uint8Array<ArrayBuffer>
   ): Promise<B | undefined> {
     const parts = decodeRecord(own(record));
     if (parts === undefined) {
       return undefined;
     }
     const digest = await this.#ready().hash(parts);
+    if (opening !== undefined) {
+      this.#pendingOpenings.set(
+        `${conversationId}:${toHex(digest)}`,
+        own(opening)
+      );
+    }
     await this.#deps.storage.insertZrdtPending({
       conversationId,
       digest,
@@ -918,8 +941,46 @@ export class ZrdtServiceCore implements ZrdtServiceType {
   }
 
   /**
+   * The openings of these pending records, where the host holds one: kept
+   * since the record went pending, else from the message rows.
+   */
+  async #pendingOpeningsOf(
+    conversationId: string,
+    rows: ReadonlyArray<ZrdtPendingRowType>
+  ): Promise<Map<string, B>> {
+    const out = new Map<string, B>();
+    const unknown = new Array<B>();
+    for (const row of rows) {
+      const hex = toHex(row.digest);
+      const known = this.#pendingOpenings.get(`${conversationId}:${hex}`);
+      if (known !== undefined) {
+        out.set(hex, known);
+      } else {
+        unknown.push(own(row.digest));
+      }
+    }
+    if (unknown.length > 0 && this.#deps.heldOpenings) {
+      for (const { digest, opening } of await this.#deps.heldOpenings(
+        conversationId,
+        unknown
+      )) {
+        out.set(toHex(digest), own(opening));
+      }
+    }
+    return out;
+  }
+
+  /** A pending record left zrdt_pending (stored, or refused for good). */
+  async #unpend(conversationId: string, digest: B): Promise<void> {
+    this.#pendingOpenings.delete(`${conversationId}:${toHex(digest)}`);
+    await this.#deps.storage.deleteZrdtPending(conversationId, [digest]);
+  }
+
+  /**
    * Retries every pending record until no more can be accepted (APP.md
-   * section 5 step 2). Records the backend refuses for good are dropped.
+   * section 5 step 2), with its opening when the host holds one (its
+   * audience is then recorded). Records the backend refuses for good are
+   * dropped.
    */
   async #drain(conversationId: string): Promise<void> {
     const backend = this.#ready();
@@ -929,12 +990,15 @@ export class ZrdtServiceCore implements ZrdtServiceType {
       if (rows.length === 0) {
         return;
       }
+      // oxlint-disable-next-line no-await-in-loop
+      const openings = await this.#pendingOpeningsOf(conversationId, rows);
       let progress = false;
       for (const row of rows) {
         // oxlint-disable-next-line no-await-in-loop
         const result = await backend.acceptRecord(
           conversationId,
-          own(row.record)
+          own(row.record),
+          openings.get(toHex(row.digest))
         );
         if (result.kind === 'missing') {
           continue;
@@ -950,9 +1014,7 @@ export class ZrdtServiceCore implements ZrdtServiceType {
           log.warn(`zrdt: pending record dropped: ${result.kind}`);
         }
         // oxlint-disable-next-line no-await-in-loop
-        await this.#deps.storage.deleteZrdtPending(conversationId, [
-          own(row.digest),
-        ]);
+        await this.#unpend(conversationId, own(row.digest));
       }
       if (!progress) {
         return;
@@ -1057,7 +1119,8 @@ export class ZrdtServiceCore implements ZrdtServiceType {
         const digest = await this.#pending(
           conversationId,
           record,
-          a.provenance
+          a.provenance,
+          committed.opening
         );
         return {
           status: 'missing',
@@ -1101,7 +1164,8 @@ export class ZrdtServiceCore implements ZrdtServiceType {
         const digest = await this.#pending(
           conversationId,
           a.record,
-          a.provenance
+          a.provenance,
+          a.opening
         );
         return {
           status: 'missing',
@@ -1236,21 +1300,45 @@ export class ZrdtServiceCore implements ZrdtServiceType {
     a: Readonly<{
       voucherAci: string;
       forImport: boolean;
+      mode: ServeMode;
       items: ReadonlyArray<ZrdtViewItem>;
     }>
   ): Promise<Array<ZrdtViewOutcome>> {
     return this.#enter(conversationId, async backend => {
       await this.#ensureKnown(conversationId);
+      // Protocol 4: our pending records go in the same request (with their
+      // openings where we hold them), so a boundary digest they link is
+      // kept and they are accepted with it.
+      const pendingRows =
+        await this.#deps.storage.getZrdtPending(conversationId);
+      const pendingOpenings = await this.#pendingOpeningsOf(
+        conversationId,
+        pendingRows
+      );
+      const pending = pendingRows.map((row): ServeEntry => {
+        const opening = pendingOpenings.get(toHex(row.digest));
+        return opening !== undefined
+          ? {
+              kind: 'addressed',
+              record: own(row.record),
+              authorCopy: false,
+              opening,
+            }
+          : { kind: 'after', record: own(row.record) };
+      });
       const results = await backend.acceptView(
         conversationId,
         aciStringToBytes(a.voucherAci),
         a.forImport,
-        a.items.map(item => item.entry)
+        a.mode,
+        a.items.map(item => item.entry),
+        pending
       );
-      if (results.length !== a.items.length) {
+      if (results.length !== a.items.length + pending.length) {
         throw new ZrdtServiceError(
           'notAccepted',
-          `ACCEPT_VIEW gave ${results.length} results for ${a.items.length} entries`
+          `ACCEPT_VIEW gave ${results.length} results for ` +
+            `${a.items.length} entries and ${pending.length} pending`
         );
       }
       const out = new Array<ZrdtViewOutcome>();
@@ -1286,6 +1374,27 @@ export class ZrdtServiceCore implements ZrdtServiceType {
           newRecords.push({ digest: own(result.digest), record: entry.record });
         }
         out.push({ result, isNew: inserted > 0 });
+      }
+      // Pending records the view accepted: stored now (their provenance was
+      // written when they went pending).
+      for (const [j, row] of pendingRows.entries()) {
+        const result = results[a.items.length + j];
+        if (result?.kind !== 'ok') {
+          continue;
+        }
+        // oxlint-disable-next-line no-await-in-loop
+        const inserted = await this.#deps.storage.insertZrdtRecords([
+          {
+            conversationId,
+            digest: own(result.digest),
+            record: own(row.record),
+          },
+        ]);
+        if (inserted > 0) {
+          newRecords.push({ digest: own(result.digest), record: row.record });
+        }
+        // oxlint-disable-next-line no-await-in-loop
+        await this.#unpend(conversationId, own(row.digest));
       }
       await this.#deps.storage.upsertZrdtProvenance(provenanceRows);
       const newBoundary =
@@ -1348,6 +1457,11 @@ export class ZrdtServiceCore implements ZrdtServiceType {
       const archiveId = `${conversationId}:archived:${Date.now()}`;
       await backend.close(conversationId);
       this.#state.delete(conversationId);
+      for (const k of [...this.#pendingOpenings.keys()]) {
+        if (k.startsWith(`${conversationId}:`)) {
+          this.#pendingOpenings.delete(k);
+        }
+      }
       await this.#deps.storage.archiveZrdtConversation(
         conversationId,
         archiveId

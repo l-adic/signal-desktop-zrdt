@@ -3120,6 +3120,34 @@ CREATE INDEX unprocessed_byReceivedAtDate ON unprocessed (receivedAtDate)
 </details>
 
 <details>
+<summary>Table: zrdt_boundary</summary>
+
+```sql
+CREATE TABLE zrdt_boundary (
+  conversationId TEXT NOT NULL,
+  digest BLOB NOT NULL,
+  voucherAci TEXT NOT NULL,
+  PRIMARY KEY (
+    conversationId,
+    digest
+  )
+) STRICT
+```
+
+<details>
+<summary>Index: zrdt_boundary → sqlite_autoindex_zrdt_boundary_1</summary>
+
+```text
+(404: SQL Not Found)
+```
+
+</details>
+
+---
+
+</details>
+
+<details>
 <summary>Table: zrdt_pending</summary>
 
 ```sql
@@ -3195,6 +3223,29 @@ CREATE TABLE zrdt_records (
 
 <details>
 <summary>Index: zrdt_records → sqlite_autoindex_zrdt_records_1</summary>
+
+```text
+(404: SQL Not Found)
+```
+
+</details>
+
+---
+
+</details>
+
+<details>
+<summary>Table: zrdt_stores</summary>
+
+```sql
+CREATE TABLE zrdt_stores (
+  conversationId TEXT NOT NULL PRIMARY KEY,
+  mode TEXT NOT NULL
+) STRICT
+```
+
+<details>
+<summary>Index: zrdt_stores → sqlite_autoindex_zrdt_stores_1</summary>
 
 ```text
 (404: SQL Not Found)

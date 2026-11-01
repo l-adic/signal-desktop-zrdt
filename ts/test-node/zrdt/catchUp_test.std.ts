@@ -10,8 +10,9 @@ import {
   CATCH_UP_MORE,
   catchUpSince,
   catchUpTargets,
+  catchUpStoreMode,
   joinRemovedSince,
-  joinedAfterCreation,
+  needsCatchUp,
 } from '../../zrdt/catchUp.std.ts';
 
 const US = 'd0d0d0d0-0000-4000-8000-000000000004';
@@ -23,17 +24,18 @@ const ERIN = 'e0e0e0e0-0000-4000-8000-000000000005';
 const d = (byte: string) => byte.repeat(32);
 
 describe('zrdt catch-up decisions', () => {
-  it('joinedAfterCreation: only our own entry, and only a later revision', () => {
-    const members = [
-      { aci: ALICE, joinedAtVersion: 0 },
-      { aci: US, joinedAtVersion: 3 },
-    ];
-    assert.isTrue(joinedAfterCreation(US, members));
-    assert.isFalse(joinedAfterCreation(ALICE, members));
-    assert.isFalse(joinedAfterCreation(BOB, members), 'not a member');
-    assert.isFalse(
-      joinedAfterCreation(US, [{ aci: US }]),
-      'no join revision: a member from the start'
+  it('catches up whenever a member device has no store (no join revision read)', () => {
+    assert.isTrue(needsCatchUp({ isMember: true, hasStore: false }));
+    assert.isFalse(needsCatchUp({ isMember: true, hasStore: true }));
+    assert.isFalse(needsCatchUp({ isMember: false, hasStore: false }));
+  });
+
+  it('the first catch-up reply decides the store: relative only with a boundary', () => {
+    assert.strictEqual(catchUpStoreMode([]), 'closed');
+    assert.strictEqual(catchUpStoreMode(['addressed', 'after']), 'closed');
+    assert.strictEqual(
+      catchUpStoreMode(['addressed', 'boundary', 'after']),
+      'relative'
     );
   });
 

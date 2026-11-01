@@ -24,6 +24,10 @@ import { areWeAdmin } from './areWeAdmin.preload.ts';
 import { isAciString } from './isAciString.std.ts';
 import { itemStorage } from '../textsecure/Storage.preload.ts';
 import { strictAssert } from './assert.std.ts';
+import {
+  getZrdtEditRecipients,
+  splitZrdtTargetConversationIds,
+} from '../zrdt/quote.preload.ts';
 
 const log = createLogger('sendDeleteForEveryoneMessage');
 
@@ -65,9 +69,16 @@ export async function sendDeleteForEveryoneMessage(
 
   const { needsAdminDelete: isAdminDelete } = result;
 
+  // zrdt target rule (JOIN_PLAN §8.3): a delete names its target's author
+  // and sent timestamp, so it goes only to the target's seats. Decided now,
+  // while the target still holds its opening (the delete erases it); the
+  // job and its retries send to these recipients only.
   message.set({
     deletedForEveryoneSendStatus: zipObject(
-      getRecipientConversationIds(conversationAttributes),
+      splitZrdtTargetConversationIds(
+        message.attributes,
+        getRecipientConversationIds(conversationAttributes)
+      ).allowed,
       repeat(false)
     ),
   });
@@ -87,7 +98,10 @@ export async function sendDeleteForEveryoneMessage(
       conversationId: conversationAttributes.id,
       isAdminDelete,
       targetMessageId: messageId,
-      recipients: getRecipients(conversationAttributes),
+      recipients: getZrdtEditRecipients(
+        message.attributes,
+        getRecipients(conversationAttributes)
+      ),
       revision: conversationAttributes.revision,
     };
     await conversationJobQueue.add(jobData, async jobToInsert => {

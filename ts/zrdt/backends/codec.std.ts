@@ -2,21 +2,22 @@
 // SPDX-License-Identifier: AGPL-3.0-only
 // oxlint-disable max-classes-per-file
 
-// The bytes of every zrdtd request and reply, protocol 3 (zrdt
+// The bytes of every zrdtd request and reply, protocol 4 (zrdt
 // core/Zrdt/Proto.lean, the module header). Both directions are here: the
 // daemon backend encodes requests and decodes replies; the rung-7
 // differential test decodes the vector requests, runs them on a backend, and
 // encodes the replies again.
 //
-// Greenfield: protocol 3 only, no older layout is read. The ACCEPT and
+// Greenfield: protocol 4 only, no older layout is read. The ACCEPT and
 // ACCEPT_RECORD replies carry the record bytes, the COMMIT reply carries the
-// opening; ACCEPT takes `u8 flag ‖ opening?` after the parts; the status
+// opening; ACCEPT always takes the opening (`bytes`) after the parts; the status
 // NO_AUDIENCE (0x09); the ops AUDIENCE (0x11), SERVE (0x12) and ADDRESSED
 // (0x13). A SERVE `held` item is `digest ‖ opening` (always an opening); an
 // addressed entry is `record ‖ authorCopy flag ‖ opening?`. The relative
-// store (JOIN_PLAN §6.2): ACCEPT_VIEW (0x14) takes a SERVE reply's entries
-// and replies one result per entry, with the statuses EPHEMERAL (0x0A) and
-// IGNORED (0x0B); LINKABLE (0x15); NEW_RELATIVE (0x16).
+// store (JOIN_PLAN §6.2): ACCEPT_VIEW (0x14) takes the request's mode, a
+// SERVE reply's entries and the host's pending records, and replies one
+// result per entry and then per pending record, with the statuses EPHEMERAL
+// (0x0A) and IGNORED (0x0B); LINKABLE (0x15); NEW_RELATIVE (0x16).
 
 import type {
   AcceptRecordResult,
@@ -457,7 +458,7 @@ export type Request =
       dataMessage: Bytes;
     }
   | { op: Op.HASH; parts: RecordParts }
-  | { op: Op.ACCEPT; chat: ChatKey; parts: RecordParts; opening?: Bytes }
+  | { op: Op.ACCEPT; chat: ChatKey; parts: RecordParts; opening: Bytes }
   | { op: Op.HEADS | Op.ENCODE | Op.CLOSE; chat: ChatKey }
   | { op: Op.HAS | Op.GET; chat: ChatKey; digest: Digest }
   | { op: Op.REACH_SET; chat: ChatKey; from: ReadonlyArray<Digest> }
@@ -472,7 +473,9 @@ export type Request =
       chat: ChatKey;
       voucher: Bytes;
       forImport: boolean;
+      mode: ServeMode;
       entries: ReadonlyArray<ServeEntry>;
+      pending: ReadonlyArray<ServeEntry>;
     }
   | { op: Op.LINKABLE; chat: ChatKey; live: ReadonlyArray<Digest> }
   | { op: Op.NEW_RELATIVE; chat: ChatKey; group: Bytes };
@@ -500,7 +503,7 @@ export function encodeRequestBody(req: Request): Bytes {
       return concatBytes([
         wStr(req.chat),
         wParts(req.parts),
-        wOptionalBytes(req.opening),
+        wBytes(req.opening),
       ]);
     case Op.HEADS:
     case Op.ENCODE:
@@ -558,7 +561,9 @@ export function encodeRequestBody(req: Request): Bytes {
         wStr(req.chat),
         req.voucher,
         u8(req.forImport ? 1 : 0),
+        u8(req.mode === 'perDigest' ? 1 : 0),
         encodeServeEntries(req.entries),
+        encodeServeEntries(req.pending),
       ]);
     case Op.LINKABLE:
       return concatBytes([wStr(req.chat), wDigests(req.live)]);
@@ -613,14 +618,12 @@ export function decodeRequest(
       req = readAll(body, r => ({ op, parts: r.parts() }));
       break;
     case Op.ACCEPT:
-      req = readAll(body, r => {
-        const chat = r.str();
-        const parts = r.parts();
-        const opening = r.optionalBytes();
-        return opening === undefined
-          ? { op, chat, parts }
-          : { op, chat, parts, opening };
-      });
+      req = readAll(body, r => ({
+        op,
+        chat: r.str(),
+        parts: r.parts(),
+        opening: r.bytes(),
+      }));
       break;
     case Op.HEADS:
     case Op.ENCODE:
@@ -669,7 +672,9 @@ export function decodeRequest(
         chat: r.str(),
         voucher: r.take(16),
         forImport: r.flag(),
+        mode: r.flag() ? 'perDigest' : 'catchup',
         entries: r.entries(),
+        pending: r.entries(),
       }));
       break;
     case Op.LINKABLE:

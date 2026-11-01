@@ -21,7 +21,7 @@
 // core/Zrdt/Proto.lean, and pinned by vectors/vectors.json (rung 7 test:
 // ts/test-node/zrdt/vectors_test.node.ts).
 //
-// The host speaks protocol 3 only (zrdt docs/JOIN_PLAN.md section 10.2;
+// The host speaks protocol 4 only (zrdt docs/JOIN_PLAN.md section 10.2;
 // greenfield, no older zrdtd is in use): the protocol 1 fallbacks are gone.
 
 import { spawn } from 'node:child_process';
@@ -45,6 +45,7 @@ import type {
   RecordStatus,
   SalvageResult,
   ServeEntry,
+  ServeMode,
   ServeReply,
   ServeRequest,
   VersionInfo,
@@ -471,7 +472,7 @@ export class DaemonBackend implements ZrdtBackend {
   async accept(
     chat: ChatKey,
     record: RecordParts,
-    opening?: Bytes
+    opening: Bytes
   ): Promise<AcceptRecordResult> {
     return this.#request({ op: Op.ACCEPT, chat, parts: record, opening });
   }
@@ -488,14 +489,18 @@ export class DaemonBackend implements ZrdtBackend {
     chat: ChatKey,
     voucher: Bytes,
     forImport: boolean,
-    entries: ReadonlyArray<ServeEntry>
+    mode: ServeMode,
+    entries: ReadonlyArray<ServeEntry>,
+    pending: ReadonlyArray<ServeEntry>
   ): Promise<Array<ViewResult>> {
     return this.#request({
       op: Op.ACCEPT_VIEW,
       chat,
       voucher,
       forImport,
+      mode,
       entries,
+      pending,
     });
   }
 

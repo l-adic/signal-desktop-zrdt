@@ -17,7 +17,7 @@
 // 3. Randomized differentials: the same random op sequence on the stub and
 //    on zrdtd, replies compared byte for byte.
 //
-// Protocol 3 only (greenfield): no step may differ, and vectors of another
+// Protocol 4 only (greenfield): no step may differ, and vectors of another
 // protocol fail the run.
 //
 // zrdtd: $ZRDTD, else zrdt/core/.lake/build/bin/zrdtd (cd zrdt/core && lake
@@ -197,7 +197,9 @@ async function runTyped(
         req.chat,
         req.voucher,
         req.forImport,
-        req.entries
+        req.mode,
+        req.entries,
+        req.pending
       );
     case Op.LINKABLE:
       return backend.linkable(req.chat, req.live);
@@ -286,7 +288,7 @@ describe('zrdt rung 7: stub vs Lean (vectors.json, zrdtd)', function (this: Moch
 
   const vectors = loadVectors();
 
-  it('vectors.json is protocol 3, the protocol the host speaks', () => {
+  it('vectors.json is protocol 4, the protocol the host speaks', () => {
     assert.strictEqual(vectors.protocol, PROTOCOL_VERSION);
   });
 
@@ -587,12 +589,23 @@ describe('zrdt rung 7: stub vs Lean (vectors.json, zrdtd)', function (this: Moch
             for (let j = 0; j < n; j += 1) {
               entries.push(viewEntry());
             }
+            // Protocol 4: the request's mode and the host's pending records.
+            const pending = new Array<ServeEntry>();
+            const np = Math.floor(random() * 3);
+            for (let j = 0; j < np; j += 1) {
+              const entry = viewEntry();
+              if (entry.kind !== 'boundary') {
+                pending.push(entry);
+              }
+            }
             req = {
               op: Op.ACCEPT_VIEW,
               chat,
               voucher: pick(authors),
               forImport: random() < 0.3,
+              mode: random() < 0.5 ? 'perDigest' : 'catchup',
               entries,
+              pending,
             };
           } else if (special < 0.12) {
             req = {
@@ -614,7 +627,22 @@ describe('zrdt rung 7: stub vs Lean (vectors.json, zrdtd)', function (this: Moch
               links,
               author: pick(authors),
             };
-            req = { op: Op.ACCEPT, chat, parts };
+            // Protocol 4: ACCEPT always takes an opening (a random one here
+            // never matches: BAD_OPENING); structure goes in with
+            // ACCEPT_RECORD.
+            req =
+              random() < 0.1
+                ? {
+                    op: Op.ACCEPT,
+                    chat,
+                    parts,
+                    opening: bytes(32 + Math.floor(random() * 6)),
+                  }
+                : {
+                    op: Op.ACCEPT_RECORD,
+                    chat,
+                    record: encodeRecord(makeRecord(parts)),
+                  };
           } else if (roll < 0.45) {
             req = { op: Op.HEADS, chat };
           } else if (roll < 0.5) {
@@ -934,7 +962,9 @@ describe('zrdt rung 7: stub vs Lean (vectors.json, zrdtd)', function (this: Moch
             author,
           };
 
-          // ACCEPT with its opening, none, another one's; or ACCEPT_RECORD.
+          // ACCEPT with its opening or another one's; ACCEPT_RECORD with
+          // one, or none (structure only: ACCEPT always takes an opening,
+          // protocol 4).
           const how = random();
           let opening: Bytes | undefined;
           if (how < 0.08) {
@@ -944,10 +974,10 @@ describe('zrdt rung 7: stub vs Lean (vectors.json, zrdtd)', function (this: Moch
           } else {
             opening = committed.opening;
           }
-          const asRecord = random() < 0.15;
+          const asRecord = opening === undefined || random() < 0.15;
           // oxlint-disable-next-line no-await-in-loop
           let accepted = await both(
-            asRecord
+            asRecord || opening === undefined
               ? {
                   op: Op.ACCEPT_RECORD,
                   chat,
@@ -958,12 +988,16 @@ describe('zrdt rung 7: stub vs Lean (vectors.json, zrdtd)', function (this: Moch
             `step ${i} ${asRecord ? 'ACCEPT_RECORD' : 'ACCEPT'}`
           );
           if (accepted[0] === Code.NO_AUDIENCE && random() < 0.5) {
-            // Stored without an opening: nothing is recorded for it, and
-            // the host may still hold the opening.
+            // Stored without an opening (structure, ACCEPT_RECORD): nothing
+            // is recorded for it, and the host may still hold the opening.
             // oxlint-disable-next-line no-await-in-loop
             accepted = await both(
-              { op: Op.ACCEPT, chat, parts },
-              `step ${i} ACCEPT without the opening`
+              {
+                op: Op.ACCEPT_RECORD,
+                chat,
+                record: encodeRecord(makeRecord(parts)),
+              },
+              `step ${i} ACCEPT_RECORD without the opening`
             );
             opening = committed.opening;
           }
