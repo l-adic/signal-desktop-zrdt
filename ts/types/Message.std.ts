@@ -67,6 +67,10 @@ const messageAttributesEraseBehavior: Record<
   storyId: 'preserve',
   synced: 'preserve',
   unidentifiedDeliveries: 'preserve',
+  // zrdt structure: the digest and links stay in zrdt_records anyway
+  zrdtDigest: 'preserve',
+  zrdtProvenance: 'preserve',
+  zrdtStatus: 'preserve',
 
   attachments: 'erase',
   body: 'erase',
@@ -117,6 +121,10 @@ const messageAttributesEraseBehavior: Record<
   titleTransition: 'erase',
   verified: 'erase',
   verifiedChanged: 'erase',
+  // zrdt plaintext: frozen Content bytes and the opening (APP.md §4, §6)
+  zrdt: 'erase',
+  zrdtOpening: 'erase',
+  zrdtGap: 'erase',
 
   reactions: reason => (VIEW_ONCE_REASONS.has(reason) ? 'preserve' : 'erase'),
 };

@@ -23,6 +23,7 @@ import {
   isUniversalTimerNotification,
   isUnsupportedMessage,
   isVerifiedChange,
+  isZrdtGap,
 } from '../state/selectors/message.preload.ts';
 
 export function isMessageEmpty(attributes: MessageAttributesType): boolean {
@@ -62,6 +63,7 @@ export function isMessageEmpty(attributes: MessageAttributesType): boolean {
     isTitleTransitionNotification(attributes);
   const isPinnedMessageNotificationValue =
     isPinnedMessageNotification(attributes);
+  const isZrdtGapValue = isZrdtGap(attributes);
 
   const isPayment = messageHasPaymentEvent(attributes);
 
@@ -97,7 +99,8 @@ export function isMessageEmpty(attributes: MessageAttributesType): boolean {
     isConversationMergeValue ||
     isPhoneNumberDiscoveryValue ||
     isTitleTransitionNotificationValue ||
-    isPinnedMessageNotificationValue;
+    isPinnedMessageNotificationValue ||
+    isZrdtGapValue;
 
   return !hasSomethingToDisplay;
 }
