@@ -10,8 +10,9 @@
 // request with one frame, in request order. Reads can be short, so frames are
 // reassembled from whatever chunks arrive.
 //
-// Fail closed: if zrdtd exits, cannot be started, closes a pipe or sends a
-// frame the host cannot read, every pending call is rejected with an
+// Fail closed: if zrdtd exits, cannot be started, closes a pipe, sends a
+// frame the host cannot read, or does not answer within
+// ZRDT_DAEMON_TIMEOUT_MS (default 10 s), every pending call is rejected with an
 // `unavailable` error, the backend is marked unavailable for good, and
 // nothing is accepted until the host starts a new backend and re-opens every
 // chat from its SQL rows.
@@ -68,6 +69,23 @@ import {
 export { Op } from './codec.std.ts';
 
 const log = createLogger('zrdt/daemon');
+
+/** How long zrdtd may take to answer before it counts as gone (ms). */
+export const DEFAULT_DAEMON_TIMEOUT_MS = 10_000;
+
+/**
+ * ZRDT_DAEMON_TIMEOUT_MS: a non-negative number of ms; 0 turns the timeout
+ * off. Anything else gives the default.
+ */
+export function readDaemonTimeoutMs(
+  env: Readonly<Record<string, string | undefined>> = process.env
+): number {
+  const raw = env.ZRDT_DAEMON_TIMEOUT_MS;
+  const value = raw == null || raw === '' ? NaN : Number(raw);
+  return Number.isFinite(value) && value >= 0
+    ? value
+    : DEFAULT_DAEMON_TIMEOUT_MS;
+}
 
 /** The largest frame either side may send (tag and body), in bytes. */
 export const MAX_FRAME_BYTES = 256 * 1024 * 1024;
@@ -165,6 +183,11 @@ export type DaemonBackendOptions = Readonly<{
   args?: ReadonlyArray<string>;
   /** Extra environment; LEAN_ABORT_ON_PANIC=1 is always set. */
   env?: Readonly<Record<string, string | undefined>>;
+  /**
+   * Fail closed if a request waits this long (ms) with no reply from zrdtd;
+   * 0 turns it off. Defaults to $ZRDT_DAEMON_TIMEOUT_MS, else 10 s.
+   */
+  timeoutMs?: number;
 }>;
 
 type Pending = Readonly<{
@@ -181,9 +204,17 @@ export class DaemonBackend implements ZrdtBackend {
   readonly #reader = new FrameReader();
   readonly #pending = new Array<Pending>();
   readonly #listeners = new Set<(error: ZrdtBackendError) => void>();
+  readonly #timeoutMs: number;
+  #watchdog: ReturnType<typeof setTimeout> | undefined;
   #failure: ZrdtBackendError | undefined;
 
-  constructor({ path, args = [], env = {} }: DaemonBackendOptions = {}) {
+  constructor({
+    path,
+    args = [],
+    env = {},
+    timeoutMs = readDaemonTimeoutMs(),
+  }: DaemonBackendOptions = {}) {
+    this.#timeoutMs = timeoutMs;
     const binary = path ?? process.env.ZRDT_DAEMON;
     if (binary === undefined || binary === '') {
       throw new ZrdtBackendError('unavailable', 'ZRDT_DAEMON is not set');
@@ -239,6 +270,7 @@ export class DaemonBackend implements ZrdtBackend {
     const frame = encodeFrame(op, body);
     return new Promise<Frame>((resolve, reject) => {
       this.#pending.push({ op, resolve, reject });
+      this.#startWatchdog();
       this.#child.stdin.write(frame);
     });
   }
@@ -256,8 +288,47 @@ export class DaemonBackend implements ZrdtBackend {
     frame.set(payload, 4);
     return new Promise<Frame>((resolve, reject) => {
       this.#pending.push({ op: payload[0] ?? 0, resolve, reject });
+      this.#startWatchdog();
       this.#child.stdin.write(frame);
     });
+  }
+
+  // The timeout runs while a call waits: from the oldest call's request if
+  // zrdtd was idle, restarted on every reply. zrdtd answers in order, so this
+  // bounds how long the oldest call waits once zrdtd got to it.
+  #startWatchdog(): void {
+    if (this.#watchdog === undefined) {
+      this.#restartWatchdog();
+    }
+  }
+
+  #restartWatchdog(): void {
+    this.#stopWatchdog();
+    if (
+      this.#timeoutMs <= 0 ||
+      this.#failure !== undefined ||
+      this.#pending.length === 0
+    ) {
+      return;
+    }
+    this.#watchdog = setTimeout(() => {
+      this.#watchdog = undefined;
+      const oldest = this.#pending[0];
+      if (oldest === undefined) {
+        return;
+      }
+      this.#fail(
+        `zrdtd did not answer ${Op[oldest.op] ?? `op ${oldest.op}`} ` +
+          `within ${this.#timeoutMs} ms`
+      );
+    }, this.#timeoutMs);
+  }
+
+  #stopWatchdog(): void {
+    if (this.#watchdog !== undefined) {
+      clearTimeout(this.#watchdog);
+      this.#watchdog = undefined;
+    }
   }
 
   #onData(chunk: Bytes): void {
@@ -279,6 +350,9 @@ export class DaemonBackend implements ZrdtBackend {
       }
       pending.resolve(frame);
     }
+    if (frames.length > 0) {
+      this.#restartWatchdog();
+    }
   }
 
   #fail(reason: string): void {
@@ -287,6 +361,7 @@ export class DaemonBackend implements ZrdtBackend {
     }
     const failure = new ZrdtBackendError('unavailable', reason);
     this.#failure = failure;
+    this.#stopWatchdog();
     log.error(`zrdt backend unavailable: ${reason}`);
 
     if (this.#child.exitCode == null && this.#child.signalCode == null) {
