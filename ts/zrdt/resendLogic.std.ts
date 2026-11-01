@@ -365,3 +365,63 @@ export function decideRelayAction({
   }
   return hasOpening ? 'show' : 'structureOnly';
 }
+
+// --- timeline placement (APP.md §6) ---------------------------------------------
+
+export type Placement = Readonly<{
+  // The message's received_at (and _ms).
+  receivedAtCounter: number;
+  receivedAtDate: number;
+  // Where a new gap row for its missing links goes (only if some are missing).
+  gapReceivedAt?: number;
+  gapReceivedAtMs?: number;
+  // Gap rows the message answers.
+  resolvesGapIds: ReadonlyArray<string>;
+}>;
+
+// A message M whose own digest some gap rows were waiting for takes the first
+// one's place; a new gap for M's missing links shares that received_at and
+// sorts above M by sent_at (M.sent_at - 1). Otherwise, if links are missing,
+// the gap row takes M's counter and M is restamped with a new one, so
+// recovered messages land between them.
+export function planPlacement({
+  gaps,
+  missingCount,
+  receivedAtCounter,
+  receivedAtDate,
+  nextCounter,
+}: Readonly<{
+  gaps: ReadonlyArray<{
+    id: string;
+    receivedAt: number;
+    receivedAtMs?: number;
+  }>;
+  missingCount: number;
+  receivedAtCounter: number;
+  receivedAtDate: number;
+  nextCounter: () => number;
+}>): Placement {
+  const place = gaps[0];
+  const resolvesGapIds = gaps.map(gap => gap.id);
+  if (place) {
+    const date = place.receivedAtMs ?? receivedAtDate;
+    return {
+      receivedAtCounter: place.receivedAt,
+      receivedAtDate: date,
+      ...(missingCount > 0
+        ? { gapReceivedAt: place.receivedAt, gapReceivedAtMs: date }
+        : {}),
+      resolvesGapIds,
+    };
+  }
+  if (missingCount > 0) {
+    return {
+      receivedAtCounter: nextCounter(),
+      receivedAtDate,
+      gapReceivedAt: receivedAtCounter,
+      gapReceivedAtMs: receivedAtDate,
+      resolvesGapIds,
+    };
+  }
+  return { receivedAtCounter, receivedAtDate, resolvesGapIds };
+}

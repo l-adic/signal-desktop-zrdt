@@ -43,7 +43,11 @@ import type {
 } from '../types/Zrdt.std.ts';
 import { isZrdtRecordMessage } from './scope.std.ts';
 import type { ZrdtReceiveInfo } from './receiveInfo.std.ts';
-import { decideRelayAction, relayProvenance } from './resendLogic.std.ts';
+import {
+  decideRelayAction,
+  planPlacement,
+  relayProvenance,
+} from './resendLogic.std.ts';
 import { zrdtEvents, zrdtService } from './service.preload.ts';
 import type { ZrdtProvenance } from './service.preload.ts';
 import { requestAuthorCopy, zrdtResendScheduler } from './resend.preload.ts';
@@ -257,32 +261,29 @@ export async function zrdtReceiveLive({
     // A gap row waiting for this digest: the message takes its place (and a
     // new gap for its own missing links goes right above it).
     const gaps = digest ? await findGapsFor(conversationId, digest) : [];
-    const place = gaps[0];
-    let counter = receivedAtCounter;
-    let date = receivedAtDate;
-    let gapReceivedAt: number | undefined;
-    if (place) {
-      counter = place.get('received_at');
-      date = place.get('received_at_ms') ?? receivedAtDate;
-      gapReceivedAt = counter;
-    } else if (missing.length > 0) {
-      // Restamp: the gap row takes the old counter, so the message sorts
-      // below it and recovered messages land in between.
-      gapReceivedAt = receivedAtCounter;
-      counter = incrementMessageCounter();
-    }
+    const placement = planPlacement({
+      gaps: gaps.map(gap => ({
+        id: gap.id,
+        receivedAt: gap.get('received_at'),
+        receivedAtMs: gap.get('received_at_ms'),
+      })),
+      missingCount: missing.length,
+      receivedAtCounter,
+      receivedAtDate,
+      nextCounter: incrementMessageCounter,
+    });
     return {
       info: {
         conversationId,
         digest,
         opening,
         missing: missing.length > 0 ? missing : undefined,
-        gapReceivedAt: missing.length > 0 ? gapReceivedAt : undefined,
-        gapReceivedAtMs: missing.length > 0 ? date : undefined,
-        resolvesGapIds: gaps.map(gap => gap.id),
+        gapReceivedAt: placement.gapReceivedAt,
+        gapReceivedAtMs: placement.gapReceivedAtMs,
+        resolvesGapIds: placement.resolvesGapIds,
       },
-      receivedAtCounter: counter,
-      receivedAtDate: date,
+      receivedAtCounter: placement.receivedAtCounter,
+      receivedAtDate: placement.receivedAtDate,
     };
   } catch (error) {
     log.error(`${logId}: zrdt step failed`, Errors.toLogFormat(error));

@@ -12,6 +12,7 @@ import type {
 import {
   ResendScheduler,
   decideRelayAction,
+  planPlacement,
   planResendResponse,
   readResendOptions,
   relayProvenance,
@@ -292,5 +293,80 @@ describe('zrdt relay acceptance', () => {
       'ownNameAlarm'
     );
     assert.strictEqual(decideRelayAction({ ...base, ownLive: true }), 'none');
+  });
+});
+
+describe('zrdt timeline placement', () => {
+  let counter = 100;
+  const nextCounter = () => {
+    counter += 1;
+    return counter;
+  };
+
+  it('nothing missing, no gap waiting: unchanged', () => {
+    assert.deepEqual(
+      planPlacement({
+        gaps: [],
+        missingCount: 0,
+        receivedAtCounter: 7,
+        receivedAtDate: 70,
+        nextCounter,
+      }),
+      { receivedAtCounter: 7, receivedAtDate: 70, resolvesGapIds: [] }
+    );
+  });
+
+  it('links missing: the gap takes the old counter, the message a new one', () => {
+    counter = 100;
+    assert.deepEqual(
+      planPlacement({
+        gaps: [],
+        missingCount: 1,
+        receivedAtCounter: 7,
+        receivedAtDate: 70,
+        nextCounter,
+      }),
+      {
+        receivedAtCounter: 101,
+        receivedAtDate: 70,
+        gapReceivedAt: 7,
+        gapReceivedAtMs: 70,
+        resolvesGapIds: [],
+      }
+    );
+  });
+
+  it('a gap was waiting for it: the message takes the place of the gap', () => {
+    const gaps = [
+      { id: 'g1', receivedAt: 3, receivedAtMs: 30 },
+      { id: 'g2', receivedAt: 5 },
+    ];
+    assert.deepEqual(
+      planPlacement({
+        gaps,
+        missingCount: 0,
+        receivedAtCounter: 7,
+        receivedAtDate: 70,
+        nextCounter,
+      }),
+      { receivedAtCounter: 3, receivedAtDate: 30, resolvesGapIds: ['g1', 'g2'] }
+    );
+    // ...and its own missing links get a gap at the same place, no restamp
+    assert.deepEqual(
+      planPlacement({
+        gaps,
+        missingCount: 2,
+        receivedAtCounter: 7,
+        receivedAtDate: 70,
+        nextCounter: () => assert.fail('no restamp'),
+      }),
+      {
+        receivedAtCounter: 3,
+        receivedAtDate: 30,
+        gapReceivedAt: 3,
+        gapReceivedAtMs: 30,
+        resolvesGapIds: ['g1', 'g2'],
+      }
+    );
   });
 });
