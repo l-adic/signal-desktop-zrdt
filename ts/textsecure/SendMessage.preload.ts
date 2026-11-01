@@ -206,6 +206,15 @@ export type SendDeleteForEveryoneType = Readonly<{
   targetAuthorAci: AciString;
 }>;
 
+// zrdt: DataMessage.zrdt for an in-scope group message (zrdt APP.md §4).
+// Set only by ts/zrdt/send.preload.ts when it freezes a send.
+export type ZrdtMetaSendType = Readonly<{
+  links: ReadonlyArray<Uint8Array<ArrayBuffer>>;
+  nonce: Uint8Array<ArrayBuffer>;
+  version: number;
+  disown: ReadonlyArray<Uint8Array<ArrayBuffer>>;
+}>;
+
 export type SharedMessageOptionsType = Readonly<{
   // required
   timestamp: number;
@@ -230,6 +239,7 @@ export type SharedMessageOptionsType = Readonly<{
   storyContext?: StoryContextType;
   targetTimestampForEdit?: number;
   unpinMessage?: SendUnpinMessageType;
+  zrdt?: ZrdtMetaSendType;
 }>;
 
 export type MessageOptionsType = Readonly<
@@ -318,6 +328,8 @@ class Message {
 
   pollVote?: OutgoingPollVote;
 
+  zrdt?: ZrdtMetaSendType;
+
   constructor(options: MessageOptionsType) {
     this.attachments = options.attachments || [];
     this.body = options.body;
@@ -335,6 +347,7 @@ class Message {
     this.sticker = options.sticker;
     this.reaction = options.reaction;
     this.pollCreate = options.pollCreate;
+    this.zrdt = options.zrdt;
     this.timestamp = options.timestamp;
     this.deleteForEveryone = options.deleteForEveryone;
     this.groupCallUpdate = options.groupCallUpdate;
@@ -715,10 +728,19 @@ class Message {
       pinMessage,
       unpinMessage,
 
+      // zrdt: present (even with no links) on in-scope group sends only
+      zrdt: this.zrdt
+        ? {
+            links: this.zrdt.links.slice(),
+            nonce: this.zrdt.nonce,
+            version: this.zrdt.version,
+            disown: this.zrdt.disown.slice(),
+          }
+        : null,
+
       // Handled separately
       pollVote: null,
       pollTerminate: null,
-      zrdt: null,
 
       expireTimer: this.expireTimer ?? null,
       expireTimerVersion: this.expireTimerVersion ?? null,
@@ -1208,6 +1230,7 @@ export class MessageSender {
       pinMessage,
       unpinMessage,
       pollCreate,
+      zrdt,
     } = options;
 
     if (!groupV2) {
@@ -1259,6 +1282,7 @@ export class MessageSender {
       pinMessage,
       unpinMessage,
       pollCreate,
+      zrdt,
     };
   }
 

@@ -31,6 +31,7 @@ import type { CallbackResultType } from '../../textsecure/Types.d.ts';
 import { isSent } from '../../messages/MessageSendState.std.ts';
 import { isOutgoing, canReact } from '../../state/selectors/message.preload.ts';
 import type {
+  GroupMessageOptionsType,
   ReactionType,
   OutgoingQuoteType,
   OutgoingQuoteAttachmentType,
@@ -56,7 +57,14 @@ import type { QuotedMessageType } from '../../model-types.d.ts';
 
 import { handleMultipleSendErrors } from './handleMultipleSendErrors.std.ts';
 import { ourProfileKeyService } from '../../services/ourProfileKey.std.ts';
-import { sendToGroup } from '../../util/sendToGroup.preload.ts';
+import {
+  sendContentMessageToGroup,
+  sendToGroup,
+} from '../../util/sendToGroup.preload.ts';
+import {
+  getZrdtGroupSendContent,
+  isZrdtGroupSend,
+} from '../../zrdt/send.preload.ts';
 import type { DurationInSeconds } from '../../util/durations/index.std.ts';
 import type { ServiceIdString } from '../../types/ServiceId.std.ts';
 import { normalizeAci } from '../../util/normalizeAci.std.ts';
@@ -302,6 +310,9 @@ export async function sendNormalMessage(
       // or sending a story to a group where all other users don't have the stories
       // capabilities (effectively a 'lonely group' in the context of stories)
       log.info('sending sync message only');
+      // TODO(zrdt): for a frozen group message (message.zrdt), sync the frozen
+      // DataMessage bytes instead, so our other zrdt devices get the links.
+      // The demo has one zrdt device per account.
       const dataMessage = await messaging.getDataOrEditMessage({
         attachments,
         body,
@@ -353,29 +364,64 @@ export async function sendNormalMessage(
           'conversationQueue/sendNormalMessage/group',
           async abortSignal => {
             const sendOptions = await getSendOptions(conversation.attributes);
+            const groupSendOptions: GroupMessageOptionsType = {
+              attachments,
+              bodyRanges,
+              contact,
+              expireTimer,
+              groupV2: groupV2Info,
+              isViewOnce,
+              body,
+              preview,
+              profileKey,
+              quote,
+              sticker,
+              storyContext,
+              reaction,
+              pollCreate: poll,
+              targetTimestampForEdit: editedMessageTimestamp
+                ? targetOfThisEditTimestamp
+                : undefined,
+              timestamp: targetTimestamp,
+            };
+
+            // zrdt (APP.md §4): freeze once, then send the frozen Content on
+            // this attempt and every later one.
+            if (
+              isZrdtGroupSend({
+                isGroupV2: isGroupV2(conversation.attributes),
+                editedMessageTimestamp,
+                groupSendOptions,
+              })
+            ) {
+              const contentMessage = await getZrdtGroupSendContent({
+                conversation,
+                message,
+                groupSendOptions,
+                messaging,
+                log,
+              });
+              if (abortSignal?.aborted) {
+                throw new Error('sendToGroup was aborted');
+              }
+              return sendContentMessageToGroup({
+                contentHint: ContentHint.Resendable,
+                contentMessage,
+                messageId,
+                recipients: groupV2Info.members,
+                sendOptions,
+                sendTarget: conversation.toSenderKeyTarget(),
+                sendType: 'message',
+                story: false,
+                timestamp: targetTimestamp,
+                urgent: true,
+              });
+            }
+
             return sendToGroup({
               abortSignal,
               contentHint: ContentHint.Resendable,
-              groupSendOptions: {
-                attachments,
-                bodyRanges,
-                contact,
-                expireTimer,
-                groupV2: groupV2Info,
-                isViewOnce,
-                body,
-                preview,
-                profileKey,
-                quote,
-                sticker,
-                storyContext,
-                reaction,
-                pollCreate: poll,
-                targetTimestampForEdit: editedMessageTimestamp
-                  ? targetOfThisEditTimestamp
-                  : undefined,
-                timestamp: targetTimestamp,
-              },
+              groupSendOptions,
               messageId,
               sendOptions,
               sendTarget: conversation.toSenderKeyTarget(),

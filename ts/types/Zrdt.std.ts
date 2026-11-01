@@ -66,7 +66,9 @@ export type UpsertZrdtProvenanceOptionsType = Readonly<{
 export type ZrdtSendAttributesType = Readonly<{
   links: ReadonlyArray<string>; // hex digests, strictly sorted
   nonce: string; // hex, 32 bytes
-  digest: string; // hex, 32 bytes
+  // hex, 32 bytes; '' while frozen but not yet accepted (the next send
+  // attempt re-accepts the same bytes; ts/zrdt/send.preload.ts)
+  digest: string;
   contentBytes: string; // base64, the frozen Content bytes sent on every attempt
 }>;
 
