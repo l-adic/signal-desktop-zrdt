@@ -29,7 +29,7 @@ import {
   planResendResponse,
   readResendOptions,
 } from './resendLogic.std.ts';
-import { zrdtService } from './service.preload.ts';
+import { zrdtEvents, zrdtService } from './service.preload.ts';
 import { acceptRelayedRecord, setGapState, toHex } from './receive.preload.ts';
 import type { ZrdtBytes } from './receive.preload.ts';
 
@@ -38,6 +38,10 @@ const log = createLogger('zrdt/resend');
 // Own messages older than this are not looked up in the sendLog (Desktop
 // prunes it after a day; APP.md §5 step 9).
 const SEND_LOG_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+// zrdtEvents: (conversationId, hexDigests, 'requested' | 'still-missing').
+// The compare screen uses it for "Asked; no answer." (no gap row there).
+export const ZRDT_RESEND_STATE_EVENT = 'resendState';
 
 export const zrdtResendScheduler = new ResendScheduler(
   {
@@ -49,8 +53,15 @@ export const zrdtResendScheduler = new ResendScheduler(
       zrdtService.has(conversationId, Bytes.fromHex(digest)),
     sendRequest: (conversationId, target, digests) =>
       sendResendRequest(conversationId, target, digests),
-    setGapState: (conversationId, digests, state) =>
-      setGapState(conversationId, digests, state),
+    setGapState: async (conversationId, digests, state) => {
+      zrdtEvents.emit(
+        ZRDT_RESEND_STATE_EVENT,
+        conversationId,
+        [...digests],
+        state
+      );
+      await setGapState(conversationId, digests, state);
+    },
     onError: error => log.error('resend scheduler', Errors.toLogFormat(error)),
   },
   readResendOptions(process.env)
