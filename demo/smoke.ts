@@ -1,10 +1,10 @@
 // Copyright 2026 zrdt contributors
 // SPDX-License-Identifier: AGPL-3.0-only
 
-// smoke.ts: the F2 go/no-go test (PLAN.md §4 Phase E/F, APP.md §9 beats 1–3).
+// smoke.ts: the F2 go/no-go test (PLAN.md §4 Phase E/F, APP.md §9 beats 1–5).
 //
 // Brings up the demo world (demo/harness.ts), links Alice, Bob and Carol,
-// warms up, then drives beats 1–3 the way the presenter would, with the
+// warms up, then drives beats 1–5 the way the presenter would, with the
 // villain armed through the panel's HTTP API (so the panel is tested too):
 //
 //   beat 1  three messages; every desktop shows each one with the SAME
@@ -15,6 +15,15 @@
 //   beat 3  blackhole(carol); Alice sends; nobody replies. Bob's compare code
 //           at Carol: "Bob has 1 message you don't … Asked; no answer."
 //           Clear; "Ask again" recovers it.
+//   beat 4  Carol exports her store; doctor.ts removes one linked, non-head
+//           record; Carol imports it: OPEN fails, the red banner names the
+//           missing message; "Keep what verifies" reports kept and dropped,
+//           and Carol's own chat does not change (she holds every kept one).
+//   beat 5  Dave's desktop is linked; Bob exports; doctor.ts appends two
+//           fakes by Bob on top of the genuine head; Dave imports: all in
+//           the collapsed section, unconfirmed. Alice writes: the genuine
+//           history is "held by Alice", Alice's own "confirmed". Bob writes:
+//           Bob's genuine ones confirmed, the fakes "not confirmed by Bob".
 //   rules   hold(carol) / release(carol) (no zrdt needed).
 //
 // Each check is tagged `harness` (the mock and the villain) or `zrdt` (needs
@@ -37,10 +46,26 @@ import { sleep } from '../ts/util/sleep.std.ts';
 import {
   ASK_AGAIN,
   COPY_COMPARE_CODE,
+  KEEP_WHAT_VERIFIES,
   PASTE_COMPARE_CODE,
   gapTitle,
   identicalText,
+  rejectedText,
+  unconfirmedSectionTitle,
 } from '../ts/zrdt/ui/labels.std.ts';
+import {
+  aciBytes,
+  analyse,
+  appendFakes,
+  checkOpen,
+  encodeBlob,
+  hex,
+  locateBlob,
+  parseBlob,
+  removeLinkedRecord,
+  tag,
+} from './doctor.ts';
+import type { Analysed } from './doctor.ts';
 import { formatEntry } from './evil.ts';
 import { startPanel } from './panel.ts';
 import {
@@ -49,8 +74,10 @@ import {
   app,
   configureEnv,
   conversationId,
+  dumpPath,
   hook,
   linkDesktop,
+  linked,
   openGroup,
   page,
   say,
@@ -74,15 +101,38 @@ const RECOVER_MS = 45_000;
 const COMPARE_MS = 60_000;
 // How long to look for a zrdt control before calling it missing.
 const UI_MS = 5_000;
+// CLASSIFY after a live message, or an import, reaching the UI slice.
+const CLASSIFY_MS = 20_000;
+// How often the relayed state is sampled in beat 2 (it lasts
+// ZRDT_AUTHOR_FASTPATH_DELAY_MS, 3 s).
+const RELAY_POLL_MS = 100;
 
 type Kind = 'harness' | 'zrdt';
-type Check = { id: string; kind: Kind; ok: boolean; detail: string };
+type Check = {
+  id: string;
+  kind: Kind;
+  ok: boolean;
+  detail: string;
+  // Since the start of the run, when the check finished.
+  atMs: number;
+  // How long the check itself took (attempt() only).
+  ms?: number;
+};
 
 const checks: Array<Check> = [];
+const runStart = Date.now();
 
-function check(id: string, kind: Kind, ok: boolean, detail: string): boolean {
-  checks.push({ id, kind, ok, detail });
-  say(`${ok ? 'PASS' : 'FAIL'} [${kind}] ${id}: ${detail}`);
+function check(
+  id: string,
+  kind: Kind,
+  ok: boolean,
+  detail: string,
+  ms?: number
+): boolean {
+  const atMs = Date.now() - runStart;
+  checks.push({ id, kind, ok, detail, atMs, ms });
+  const took = ms !== undefined ? ` (${(ms / 1000).toFixed(1)} s)` : '';
+  say(`${ok ? 'PASS' : 'FAIL'} [${kind}] ${id}${took}: ${detail}`);
   return ok;
 }
 
@@ -91,12 +141,33 @@ async function attempt(
   kind: Kind,
   body: () => Promise<{ ok: boolean; detail: string }>
 ): Promise<boolean> {
+  const start = Date.now();
   try {
     const { ok, detail } = await body();
-    return check(id, kind, ok, detail);
+    return check(id, kind, ok, detail, Date.now() - start);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    return check(id, kind, false, `threw: ${message.split('\n')[0]}`);
+    return check(
+      id,
+      kind,
+      false,
+      `threw: ${message.split('\n')[0]}`,
+      Date.now() - start
+    );
+  }
+}
+
+type BeatTiming = { beat: string; ms: number };
+const beatTimings: Array<BeatTiming> = [];
+
+async function timed(beat: string, body: () => Promise<void>): Promise<void> {
+  const start = Date.now();
+  try {
+    await body();
+  } finally {
+    const ms = Date.now() - start;
+    beatTimings.push({ beat, ms });
+    say(`${beat}: ${(ms / 1000).toFixed(1)} s`);
   }
 }
 
@@ -362,40 +433,76 @@ async function beat2(
   });
   await screenshots(demo, trio, 'beat2-gap');
 
-  // Recovery: relayed by Bob, then confirmed by Alice.
+  // Recovery: relayed by Bob, then confirmed by Alice. The relayed state
+  // lasts ZRDT_AUTHOR_FASTPATH_DELAY_MS (3 s): sample it every 100 ms, in the
+  // message attributes, in the label the UI computes, and on screen.
+  const relayStart = Date.now();
+  const events: Array<string> = [];
+  let lastState = '';
   let sawRelayed = false;
+  let relayedEvidence = '';
+  let wasRelayed = false;
+  const note = (state: string) => {
+    if (state !== lastState) {
+      lastState = state;
+      events.push(
+        `+${((Date.now() - relayStart) / 1000).toFixed(1)}s ${state}`
+      );
+    }
+  };
   const recovered = await attempt(
     'beat2 Carol recovers the dropped message',
     'zrdt',
     async () => {
       const deadline = Date.now() + RECOVER_MS;
+      let inTimelineAt: number | undefined;
       while (Date.now() < deadline) {
         // oxlint-disable-next-line no-await-in-loop
-        const msg = await messageAt(carol, lost);
-        if (
-          msg?.zrdtProvenance?.kind === 'relayed' ||
-          msg?.label === 'relayed by Bob'
-        ) {
-          sawRelayed = true;
-        }
-        if (
-          // oxlint-disable-next-line no-await-in-loop
-          (await page(carol).getByText('relayed by Bob').count()) > 0
-        ) {
-          sawRelayed = true;
-        }
+        const [msg, relayedCount] = await Promise.all([
+          messageAt(carol, lost),
+          page(carol).getByText('relayed by Bob').count(),
+        ]);
+        const relayedOnScreen = relayedCount > 0;
         if (msg) {
-          // oxlint-disable-next-line no-await-in-loop
-          const onScreen = await getTimelineMessageWithText(
-            page(carol),
-            lost.text
-          ).count();
-          if (onScreen > 0) {
-            return { ok: true, detail: `in DB and timeline` };
+          note(
+            `provenance=${msg.zrdtProvenance?.kind ?? '?'} ` +
+              `label=${msg.label ?? 'none'} ` +
+              `wasRelayed=${msg.zrdtStatus?.wasRelayed === true}` +
+              (relayedOnScreen ? ' on-screen="relayed by Bob"' : '')
+          );
+          wasRelayed ||= msg.zrdtStatus?.wasRelayed === true;
+          if (!sawRelayed) {
+            if (relayedOnScreen) {
+              sawRelayed = true;
+              relayedEvidence = 'on screen';
+            } else if (msg.label === 'relayed by Bob') {
+              sawRelayed = true;
+              relayedEvidence = 'label';
+            } else if (msg.zrdtProvenance?.kind === 'relayed') {
+              sawRelayed = true;
+              relayedEvidence = 'provenance';
+            }
+          }
+          if (inTimelineAt === undefined) {
+            // oxlint-disable-next-line no-await-in-loop
+            const onScreen = await getTimelineMessageWithText(
+              page(carol),
+              lost.text
+            ).count();
+            if (onScreen > 0) {
+              inTimelineAt = Date.now();
+            }
+          }
+          // Keep sampling briefly after it shows, to catch the relayed state.
+          if (
+            inTimelineAt !== undefined &&
+            (sawRelayed || Date.now() - inTimelineAt > 1_000)
+          ) {
+            return { ok: true, detail: 'in DB and timeline' };
           }
         }
         // oxlint-disable-next-line no-await-in-loop
-        await sleep(250);
+        await sleep(RELAY_POLL_MS);
       }
       return { ok: false, detail: `not in Carol's DB within ${RECOVER_MS} ms` };
     }
@@ -404,17 +511,32 @@ async function beat2(
     'beat2 recovered copy was "relayed by Bob" first',
     'zrdt',
     sawRelayed,
-    sawRelayed ? 'seen' : 'never saw provenance relayed / "relayed by Bob"'
+    sawRelayed
+      ? `seen (${relayedEvidence})`
+      : `never saw provenance relayed / "relayed by Bob" ` +
+          `(wasRelayed=${wasRelayed}; ZRDT_AUTHOR_FASTPATH_DELAY_MS=` +
+          `${process.env.ZRDT_AUTHOR_FASTPATH_DELAY_MS ?? 'unset'})`
   );
+  if (sawRelayed) {
+    await screenshots(demo, trio, 'beat2-relayed');
+  }
   await attempt('beat2 then "confirmed by Alice"', 'zrdt', async () => {
     if (!recovered) {
       return { ok: false, detail: 'not recovered' };
     }
     const ok = await visible(page(carol), 'confirmed by Alice', RECOVER_MS);
     const msg = await messageAt(carol, lost);
+    if (msg) {
+      note(
+        `provenance=${msg.zrdtProvenance?.kind ?? '?'} label=${msg.label ?? 'none'} ` +
+          `wasRelayed=${msg.zrdtStatus?.wasRelayed === true}`
+      );
+    }
     return {
       ok: ok || msg?.label === 'confirmed by Alice',
-      detail: `on screen=${ok} label=${msg?.label} zrdtStatus=${JSON.stringify(msg?.zrdtStatus)} provenance=${JSON.stringify(msg?.zrdtProvenance)}`,
+      detail:
+        `on screen=${ok} label=${msg?.label} zrdtStatus=${JSON.stringify(msg?.zrdtStatus)} ` +
+        `provenance=${JSON.stringify(msg?.zrdtProvenance)}; events: ${events.join(' | ')}`,
     };
   });
   await attempt('beat2 gap row gone after recovery', 'zrdt', async () => {
@@ -502,6 +624,465 @@ async function beat3(
   await screenshots(demo, trio, 'beat3-recovered');
 }
 
+type ZrdtConvState = {
+  statuses: Record<string, { kind: string; aci?: string }>;
+  rejected?: { reason: { kind: string; missing?: Array<string> } };
+  salvage?: { kept: number; dropped: Array<string> };
+  unconfirmed: Array<{
+    digest: string;
+    status: { kind: string; aci?: string };
+    hasMessage: boolean;
+  }>;
+};
+
+async function convState(
+  demo: Demo,
+  m: Member
+): Promise<ZrdtConvState | undefined> {
+  const r = await hook<ZrdtConvState | undefined>(
+    m,
+    'getConversationState',
+    await conversationId(demo, m)
+  );
+  if (r.missing) {
+    throw new Error('no getConversationState hook');
+  }
+  return r.value;
+}
+
+/** Polls `probe` until it returns ok or `timeout` passes; the last result. */
+async function until(
+  timeout: number,
+  probe: () => Promise<{ ok: boolean; detail: string }>
+): Promise<{ ok: boolean; detail: string }> {
+  const deadline = Date.now() + timeout;
+  let last = await probe();
+  while (!last.ok && Date.now() < deadline) {
+    // oxlint-disable-next-line no-await-in-loop
+    await sleep(250);
+    // oxlint-disable-next-line no-await-in-loop
+    last = await probe();
+  }
+  return last;
+}
+
+async function sortedHeads(demo: Demo, m: Member): Promise<string> {
+  const r = await hook<Array<string>>(
+    m,
+    'heads',
+    await conversationId(demo, m)
+  );
+  if (r.missing) {
+    throw new Error('no heads hook');
+  }
+  return [...r.value].sort().join(',');
+}
+
+async function beat4(demo: Demo, trio: ReadonlyArray<Member>): Promise<void> {
+  const { carol } = demo.byName;
+  const conv = await conversationId(demo, carol);
+  const headsBefore = await sortedHeads(demo, carol);
+  let file: string | undefined;
+  let count = 0;
+  let removed: string | undefined;
+  let unverifiable: ReadonlyArray<string> = [];
+
+  const exported = await attempt(
+    'beat4 Carol exports her store',
+    'zrdt',
+    async () => {
+      const r = await hook<string | undefined>(carol, 'exportStore', conv);
+      if (r.missing) {
+        throw new Error('no exportStore hook');
+      }
+      file = r.value;
+      if (file === undefined) {
+        return { ok: false, detail: 'export failed (see internalResult)' };
+      }
+      count = parseBlob(locateBlob(await fs.readFile(file)).blob).records
+        .length;
+      return { ok: count >= 2, detail: `${count} records -> ${file}` };
+    }
+  );
+  const doctored =
+    exported &&
+    (await attempt(
+      'beat4 doctor removes a linked, non-head record',
+      'zrdt',
+      async () => {
+        if (file === undefined) {
+          return { ok: false, detail: 'no export' };
+        }
+        const located = locateBlob(await fs.readFile(file));
+        const result = removeLinkedRecord(parseBlob(located.blob));
+        const blob = encodeBlob(result.blob);
+        await fs.copyFile(file, `${file}.orig`);
+        await fs.writeFile(file, located.replace(blob));
+        removed = result.removed;
+        unverifiable = result.unverifiable;
+        const open = await checkOpen(blob, process.env.ZRDT_DAEMON);
+        return {
+          ok: open.startsWith('UNVERIFIABLE') && open.includes(tag(removed)),
+          detail:
+            `removed ${tag(removed)} (linked by ${result.linkedBy.map(tag).join(' ')}); ` +
+            `zrdtd OPEN: ${open}`,
+        };
+      }
+    ));
+
+  const rejected =
+    doctored &&
+    (await attempt(
+      'beat4 import: OPEN fails, red banner names the missing message',
+      'zrdt',
+      async () => {
+        if (removed === undefined) {
+          return { ok: false, detail: 'nothing removed' };
+        }
+        const r = await hook<string | undefined>(carol, 'importStore', conv);
+        if (r.missing) {
+          throw new Error('no importStore hook');
+        }
+        const text = rejectedText({ kind: 'unverifiable', missing: [removed] });
+        const banner = page(carol).locator('.ZrdtBanner--error');
+        const onScreen = await visible(page(carol), text, UI_MS * 2);
+        const state = await convState(demo, carol);
+        return {
+          ok: r.value === 'unverifiable' && onScreen,
+          detail:
+            `import status=${r.value}; "${text}" ${onScreen ? 'shown' : 'NOT shown'}` +
+            ` (error banners: ${await banner.count()}); ` +
+            `missing=${JSON.stringify(state?.rejected?.reason.missing?.map(tag))}`,
+        };
+      }
+    ));
+  await screenshots(demo, trio, 'beat4-rejected');
+
+  await attempt(
+    'beat4 "Keep what verifies" reports kept and dropped',
+    'zrdt',
+    async () => {
+      if (!rejected) {
+        return { ok: false, detail: 'skipped: the import step failed' };
+      }
+      let how = 'banner button';
+      const button = page(carol)
+        .locator('[data-testid="zrdt-banners"]')
+        .getByRole('button', { name: KEEP_WHAT_VERIFIES });
+      try {
+        await button.first().click({ timeout: UI_MS });
+      } catch {
+        how = 'keepWhatVerifies hook';
+        await hook(carol, 'keepWhatVerifies', conv);
+      }
+      const expectKept = count - 1 - unverifiable.length;
+      const res = await until(CLASSIFY_MS, async () => {
+        const state = await convState(demo, carol);
+        const salvage = state?.salvage;
+        const dropped = [...(salvage?.dropped ?? [])].sort();
+        const ok =
+          salvage !== undefined &&
+          state?.rejected === undefined &&
+          salvage.kept === expectKept &&
+          dropped.join(',') === [...unverifiable].sort().join(',');
+        return {
+          ok,
+          detail:
+            `kept=${salvage?.kept} (expected ${expectKept}) ` +
+            `dropped=[${dropped.map(tag).join(' ')}] ` +
+            `(expected [${unverifiable.map(tag).join(' ')}])`,
+        };
+      });
+      const onScreen =
+        res.ok &&
+        (await visible(
+          page(carol),
+          /^Kept \d+ messages? that verify\./,
+          UI_MS
+        ));
+      return {
+        ok: res.ok && onScreen,
+        detail: `${res.detail}; report ${onScreen ? 'shown' : 'NOT shown'} (${how})`,
+      };
+    }
+  );
+  await attempt("beat4 Carol's own chat does not change", 'zrdt', async () => {
+    const state = await convState(demo, carol);
+    const headsAfter = await sortedHeads(demo, carol);
+    const section = (state?.unconfirmed ?? []).length;
+    const ok = headsAfter === headsBefore && section === 0;
+    return {
+      ok,
+      detail:
+        `heads ${headsAfter === headsBefore ? 'unchanged' : 'CHANGED'}; ` +
+        `unconfirmed section ${section}; ` +
+        `${Object.keys(state?.statuses ?? {}).length} statuses`,
+    };
+  });
+  await screenshots(demo, trio, 'beat4-salvaged');
+  // Dismiss the salvage report (the presenter clicks OK).
+  try {
+    await page(carol)
+      .locator('[data-testid="zrdt-banners"]')
+      .getByRole('button', { name: 'OK' })
+      .first()
+      .click({ timeout: 2_000 });
+  } catch {
+    // cosmetic
+  }
+}
+
+function statusText(s: { kind: string; aci?: string } | undefined): string {
+  if (s === undefined) {
+    return 'none';
+  }
+  return s.aci ? `${s.kind}(${s.aci.toLowerCase().slice(0, 4)})` : s.kind;
+}
+
+/** Counts records whose status is not `want(record)`; lists a few. */
+function mismatches(
+  statuses: Record<string, { kind: string; aci?: string }>,
+  items: ReadonlyArray<{ digest: string; want: string; who: string }>
+): Array<string> {
+  return items
+    .filter(i => statusText(statuses[i.digest]) !== i.want)
+    .map(
+      i =>
+        `${tag(i.digest)}(${i.who}) is ${statusText(statuses[i.digest])}, want ${i.want}`
+    );
+}
+
+async function beat5(demo: Demo): Promise<void> {
+  const { alice, bob, dave } = demo.byName;
+  const aciOf = (m: Member) => m.boot.phone.device.aci.toLowerCase();
+  const nameByAuthorHex = new Map(
+    demo.members.map(m => [aciOf(m).replace(/-/g, ''), m.name])
+  );
+
+  const linkedOk = await attempt(
+    "beat5 Dave's desktop links (empty store)",
+    'harness',
+    async () => {
+      await linkDesktop(demo, 'dave');
+      await tile(linked(demo));
+      await openGroup(dave, demo.group);
+      let heads: string;
+      try {
+        heads = await sortedHeads(demo, dave);
+      } catch (error) {
+        heads = `(heads: ${String(error).split('\n')[0]})`;
+      }
+      return { ok: true, detail: `Dave's heads: [${heads}]` };
+    }
+  );
+  if (!linkedOk) {
+    return;
+  }
+  const four = linked(demo);
+
+  // Bob exports; doctor.ts appends two fakes by Bob; Dave's import path.
+  let genuine: Array<Analysed> = [];
+  let fakes: ReadonlyArray<string> = [];
+  const doctored = await attempt(
+    'beat5 Bob exports; doctor appends two fakes by Bob on the genuine head',
+    'zrdt',
+    async () => {
+      const r = await hook<string | undefined>(
+        bob,
+        'exportStore',
+        await conversationId(demo, bob)
+      );
+      if (r.missing || r.value === undefined) {
+        return { ok: false, detail: 'Bob could not export' };
+      }
+      const located = locateBlob(await fs.readFile(r.value));
+      genuine = analyse(parseBlob(located.blob));
+      const result = await appendFakes(located.blob, aciBytes(aciOf(bob)), {
+        daemon: process.env.ZRDT_DAEMON,
+      });
+      fakes = result.fakes;
+      const out = await dumpPath(demo, dave);
+      await fs.writeFile(out, located.replace(result.blob));
+      const bobHeads = await sortedHeads(demo, bob);
+      return {
+        ok:
+          fakes.length === 2 && [...result.heads].sort().join(',') === bobHeads,
+        detail:
+          `${genuine.length} genuine records; fakes ${fakes.map(tag).join(' ')} ` +
+          `on ${result.heads.map(tag).join(' ')}; passes OPEN; -> ${out}`,
+      };
+    }
+  );
+  if (!doctored) {
+    return;
+  }
+  const authorName = (a: Analysed) =>
+    nameByAuthorHex.get(hex(a.parts.author)) ?? hex(a.parts.author).slice(0, 8);
+  const total = genuine.length + fakes.length;
+
+  const imported = await attempt(
+    'beat5 Dave imports: everything collapsed and unconfirmed',
+    'zrdt',
+    async () => {
+      const r = await hook<string | undefined>(
+        dave,
+        'importStore',
+        await conversationId(demo, dave)
+      );
+      if (r.missing) {
+        throw new Error('no importStore hook');
+      }
+      const res = await until(CLASSIFY_MS, async () => {
+        const state = await convState(demo, dave);
+        const items = state?.unconfirmed ?? [];
+        const allUnconfirmed = items.every(
+          i => i.status.kind === 'unconfirmed'
+        );
+        return {
+          ok: items.length === total && allUnconfirmed,
+          detail: `section holds ${items.length}/${total}, all unconfirmed=${allUnconfirmed}`,
+        };
+      });
+      const title = unconfirmedSectionTitle(total);
+      const onScreen = await visible(page(dave), title, UI_MS);
+      return {
+        ok: r.value === 'ok' && res.ok && onScreen,
+        detail: `import status=${r.value}; ${res.detail}; "${title}" ${onScreen ? 'shown' : 'NOT shown'}`,
+      };
+    }
+  );
+  // Open the section so the labels are on screen (one click in the demo).
+  try {
+    await page(dave)
+      .locator('.ZrdtUnconfirmed__toggle')
+      .first()
+      .click({ timeout: UI_MS });
+  } catch {
+    say('could not expand the unconfirmed section on Dave');
+  }
+  await screenshots(demo, four, 'beat5-imported');
+
+  // Alice writes.
+  const fromAlice = {
+    from: alice,
+    text: 'welcome Dave! bring a headlamp',
+    ts: 0,
+  };
+  fromAlice.ts = await send(alice, fromAlice.text);
+  const daveGotAlice = await shown(dave, fromAlice.ts, fromAlice.text);
+  check(
+    "beat5 Alice's message reaches Dave",
+    'harness',
+    daveGotAlice,
+    `dave=${daveGotAlice}`
+  );
+  await attempt(
+    'beat5 Alice writes: genuine history "held by Alice", her own "confirmed"',
+    'zrdt',
+    async () => {
+      if (!imported) {
+        return { ok: false, detail: 'skipped: the import failed' };
+      }
+      const want = [
+        ...genuine.map(g => ({
+          digest: g.digest,
+          who: authorName(g),
+          want:
+            authorName(g) === 'alice'
+              ? 'confirmedByAuthor'
+              : `heldBy(${aciOf(alice).slice(0, 4)})`,
+        })),
+        ...fakes.map(f => ({ digest: f, who: 'fake', want: 'unconfirmed' })),
+      ];
+      const res = await until(CLASSIFY_MS, async () => {
+        const state = await convState(demo, dave);
+        const bad = mismatches(state?.statuses ?? {}, want);
+        return {
+          ok: bad.length === 0,
+          detail:
+            bad.length === 0
+              ? `${want.length} records as expected`
+              : `${bad.length} wrong: ${bad.slice(0, 4).join('; ')}`,
+        };
+      });
+      const title = unconfirmedSectionTitle(fakes.length);
+      const [held, titled] = await Promise.all([
+        visible(page(dave), 'held by Alice', UI_MS),
+        visible(page(dave), title, UI_MS),
+      ]);
+      return {
+        ok: res.ok && held && titled,
+        detail: `${res.detail}; "held by Alice" ${held ? 'shown' : 'NOT shown'}; "${title}" ${titled ? 'shown' : 'NOT shown'}`,
+      };
+    }
+  );
+  await screenshots(demo, four, 'beat5-alice');
+
+  // Bob writes.
+  const fromBob = { from: bob, text: "I'll drive Dave", ts: 0 };
+  fromBob.ts = await send(bob, fromBob.text);
+  const daveGotBob = await shown(dave, fromBob.ts, fromBob.text);
+  check(
+    "beat5 Bob's message reaches Dave",
+    'harness',
+    daveGotBob,
+    `dave=${daveGotBob}`
+  );
+  await attempt(
+    'beat5 Bob writes: his genuine ones confirmed, the fakes "not confirmed by Bob"',
+    'zrdt',
+    async () => {
+      if (!imported) {
+        return { ok: false, detail: 'skipped: the import failed' };
+      }
+      const want = [
+        ...genuine
+          .filter(g => authorName(g) === 'alice' || authorName(g) === 'bob')
+          .map(g => ({
+            digest: g.digest,
+            who: authorName(g),
+            want: 'confirmedByAuthor',
+          })),
+        ...fakes.map(f => ({
+          digest: f,
+          who: 'fake',
+          want: 'notConfirmedByAuthor',
+        })),
+      ];
+      const others = genuine.filter(
+        g => authorName(g) !== 'alice' && authorName(g) !== 'bob'
+      );
+      const res = await until(CLASSIFY_MS, async () => {
+        const state = await convState(demo, dave);
+        const statuses = state?.statuses ?? {};
+        const bad = mismatches(statuses, want);
+        // Carol's stay "held by" someone until Carol writes.
+        const notHeld = others.filter(
+          g => statuses[g.digest]?.kind !== 'heldBy'
+        );
+        return {
+          ok: bad.length === 0 && notHeld.length === 0,
+          detail:
+            (bad.length === 0
+              ? `${want.length} Alice/Bob/fake records as expected`
+              : `${bad.length} wrong: ${bad.slice(0, 4).join('; ')}`) +
+            `; ${others.length - notHeld.length}/${others.length} others held`,
+        };
+      });
+      const notConfirmed = await visible(
+        page(dave),
+        'not confirmed by Bob',
+        UI_MS
+      );
+      return {
+        ok: res.ok && notConfirmed,
+        detail: `${res.detail}; "not confirmed by Bob" ${notConfirmed ? 'shown' : 'NOT shown'}`,
+      };
+    }
+  );
+  await screenshots(demo, four, 'beat5-bob');
+}
+
 async function holdRelease(demo: Demo, panelUrl: string): Promise<void> {
   const { alice, bob, carol } = demo.byName;
   await post(panelUrl, 'rules/hold', { to: 'carol' });
@@ -562,12 +1143,25 @@ async function main(): Promise<void> {
       });
     }
 
-    await beat1(demo, trio);
-    await beat2(demo, trio, panel.url);
-    if (!onlyHarness) {
-      await beat3(demo, trio, panel.url);
+    const only = new Set(
+      (process.env.ZRDT_SMOKE_BEATS ?? '1,2,3,4,5')
+        .split(',')
+        .map(x => x.trim())
+    );
+    await timed('beat 1', () => beat1(demo, trio));
+    if (only.has('2')) {
+      await timed('beat 2', () => beat2(demo, trio, panel.url));
     }
-    await holdRelease(demo, panel.url);
+    if (!onlyHarness && only.has('3')) {
+      await timed('beat 3', () => beat3(demo, trio, panel.url));
+    }
+    if (!onlyHarness && only.has('4')) {
+      await timed('beat 4', () => beat4(demo, trio));
+    }
+    if (!onlyHarness && only.has('5')) {
+      await timed('beat 5', () => beat5(demo));
+    }
+    await timed('rules', () => holdRelease(demo, panel.url));
   } catch (error) {
     check(
       'harness',
@@ -598,6 +1192,7 @@ async function main(): Promise<void> {
       failed: failed.length,
       failedHarness: failed.filter(c => c.kind === 'harness').map(c => c.id),
       failedZrdt: failed.filter(c => c.kind === 'zrdt').map(c => c.id),
+      beatTimings,
       checks,
     };
     await fs.writeFile(
@@ -613,6 +1208,11 @@ async function main(): Promise<void> {
     for (const c of failed) {
       say(`  FAILED [${c.kind}] ${c.id}: ${c.detail}`);
     }
+    say(
+      `beat timings: ${beatTimings
+        .map(b => `${b.beat} ${(b.ms / 1000).toFixed(1)} s`)
+        .join(', ')}`
+    );
     process.exitCode = failed.length === 0 ? 0 : 1;
   }
 }
