@@ -460,9 +460,12 @@ export async function getZrdtGroupSendContent({
   messaging: MessageSender;
   log: LoggerType;
 }>): Promise<Proto.Content.Params> {
-  // Fail closed (APP.md §2): no backend, or not initialised yet (resumed
-  // jobs can run before zrdtService.init() finishes), fails this attempt and
-  // the job retries. A group record never goes out unlinked.
+  // Resumed send jobs can run before startup finished zrdtService.init();
+  // init() is idempotent (T0), so wait for it: heads must come from the store
+  // OPENed from SQL rows, never from an empty one.
+  await zrdtService.init();
+  // Fail closed (APP.md §2): no backend fails this attempt and the job
+  // retries. A group record never goes out unlinked.
   const backend = zrdtService.backendInfo();
   if (!backend.available) {
     throw new Error(`zrdt unavailable (${backend.kind}); will retry`);
