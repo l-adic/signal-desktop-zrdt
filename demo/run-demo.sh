@@ -123,8 +123,10 @@ if [ -n "$IN_KIT" ]; then
     xattr -p com.apple.quarantine "$KIT/node/bin/node" >/dev/null 2>&1 ||
     xattr -p com.apple.quarantine "$ELECTRON" >/dev/null 2>&1; then
     say "clearing the macOS quarantine flag on the kit (once, up to a minute)"
+    T0=$(date +%s)
     xattr -dr com.apple.quarantine "$KIT" 2>/dev/null || true
     touch "$KIT/.unquarantined"
+    say "quarantine cleared in $(($(date +%s) - T0)) s"
   fi
 fi
 
@@ -240,8 +242,12 @@ cleanup() {
 }
 trap cleanup EXIT
 
-say "starting the demo; press Ctrl-C ONCE to close everything (wait for 'closed')"
+say "starting the demo; to stop: the panel's Quit button (clean), or Ctrl-C once"
 node --import tsx demo/launch.ts --port "$PORT" ${LAUNCH_ARGS[@]+"${LAUNCH_ARGS[@]}"}
 rc=$?
-say "launch.ts exit status $rc; artifacts in $ROOT/demo/artifacts/demo"
+# Ctrl-C: Playwright's own SIGINT handler kills the desktops and exits 130
+# before launch.ts tears down; cleanup (kill_ours) makes sure nothing is left.
+[ $rc = 130 ] && say "stopped by Ctrl-C" && rc=0
+say "launch.ts exit status $rc; artifacts (screenshots, villain log) in $ROOT/demo/artifacts/demo"
+say "note: the next run deletes that folder; copy anything you want to keep"
 exit $rc
