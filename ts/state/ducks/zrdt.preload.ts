@@ -138,7 +138,7 @@ export function getZrdtDumpPath(conversationId: string): string {
 // key. A raw store blob (older exports) is read too. doctor.ts edits the
 // blob inside the JSON (its `locateBlob`).
 
-export type ZrdtDumpType = ReadonlyDeep<{
+type ZrdtDumpType = ReadonlyDeep<{
   blob: Uint8Array<ArrayBuffer>;
   content: ReadonlyMap<string, Uint8Array<ArrayBuffer>>;
 }>;
@@ -146,7 +146,7 @@ export type ZrdtDumpType = ReadonlyDeep<{
 const NONCE_BYTES = 32;
 const HEX_DIGEST = /^[0-9a-f]{64}$/;
 
-export function zrdtParseDump(bytes: Uint8Array<ArrayBuffer>): ZrdtDumpType {
+function zrdtParseDump(bytes: Uint8Array<ArrayBuffer>): ZrdtDumpType {
   // 0x7b is "{"
   if (bytes[0] !== 0x7b) {
     return { blob: bytes, content: new Map() };
@@ -167,7 +167,7 @@ export function zrdtParseDump(bytes: Uint8Array<ArrayBuffer>): ZrdtDumpType {
   return { blob: Bytes.fromBase64(doc.blob), content };
 }
 
-export function zrdtEncodeDump(dump: ZrdtDumpType): Uint8Array<ArrayBuffer> {
+function zrdtEncodeDump(dump: ZrdtDumpType): Uint8Array<ArrayBuffer> {
   const content: Record<string, string> = {};
   for (const [hex, opening] of dump.content) {
     content[hex] = Bytes.toBase64(opening);
