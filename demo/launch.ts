@@ -40,6 +40,7 @@
 // Environment: see demo/harness.ts (SIGNAL_MOCK_TESTS_BACKGROUND,
 // ZRDT_DAEMON, ZRDT_RESEND_DELAY_MS); ZRDT_PANEL_PORT for the panel port.
 
+import { writeFileSync } from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
@@ -439,6 +440,19 @@ async function main(): Promise<void> {
   process.once('SIGTERM', () => quit());
 
   const demo = await setUp({ artifacts, verbose: opts.verbose });
+  // Ctrl-C or `make stop`: Playwright's SIGINT handler exits (130) before
+  // tearDown runs, so list the temporary folders (profiles, the mock CDN) for
+  // run-demo.sh to remove once the desktops are gone.
+  process.once('exit', () => {
+    try {
+      writeFileSync(
+        path.join(artifacts, 'tmp-dirs.txt'),
+        `${[...demo.profiles, demo.cdn3Path].join('\n')}\n`
+      );
+    } catch {
+      // nothing to list
+    }
+  });
   let autoDoctor: AutoDoctor | undefined;
   let panel: Awaited<ReturnType<typeof startPanel>> | undefined;
   try {

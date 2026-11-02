@@ -16,9 +16,11 @@
 // Catch-up (JOIN_PLAN §6.1, §6.5; decisions in catchUp.std.ts): a device with
 // no store for a group it is a member of asks the adder, then two more
 // members, for the whole view it was sent (SERVE in catch-up mode). The first
-// reply opens the store: relative if it carries a boundary digest, closed
-// otherwise. Every reply goes through ACCEPT_VIEW (receive.preload.ts,
-// takeServedReply).
+// reply decides the store: relative if it carries a boundary digest, closed
+// otherwise. A store something else opened before that reply (a send, a live
+// record) is relative until then, and closed again by a reply without a
+// boundary digest (settleCatchUpStore). Every reply goes through
+// ACCEPT_VIEW (receive.preload.ts, takeServedReply).
 
 import { ContentHint } from '@signalapp/libsignal-client';
 
@@ -45,7 +47,12 @@ import {
   REQUEST_ID_BYTES,
   SERVE_HEADER_BYTES,
 } from './ZrdtBackend.std.ts';
-import type { ServeHeld, ServeMode, ServeReply } from './ZrdtBackend.std.ts';
+import type {
+  ServeEntry,
+  ServeHeld,
+  ServeMode,
+  ServeReply,
+} from './ZrdtBackend.std.ts';
 import { decodeServeEntries } from './backends/codec.std.ts';
 import { ServeRequestBook, checkServedReply } from './serveRequests.std.ts';
 import { isZrdtStrict, serveRequestFor } from './serveArgs.std.ts';
@@ -59,6 +66,8 @@ import type { ZrdtGroupUpdateType } from './groupHook.std.ts';
 import {
   CATCH_UP_TIMEOUT_MS,
   catchUpSince,
+  catchUpStoreMode,
+  catchUpStoreStep,
   catchUpTargets,
   joinRemovedSince,
   needsCatchUp,
@@ -574,6 +583,14 @@ async function onServed(
     if (state && state.answeredBy === undefined) {
       state.answeredBy = senderAci;
     }
+    const target = window.ConversationController.get(request.conversationId);
+    if (target && target.areWeAGroupMember() && target.hasMember(senderAci)) {
+      await settleCatchUpStore(
+        target,
+        new Uint8Array(groupId),
+        entries.map(entry => entry.kind)
+      );
+    }
   }
   const summary = await takeServedReply({
     conversationId: request.conversationId,
@@ -651,6 +668,8 @@ type CatchUpState = {
   startedAt: number;
   since: ReadonlyArray<string>;
   asked: Array<string>;
+  // Authors of live records asked while no reply had come (once each).
+  askedLive: Array<string>;
   answeredBy?: string;
   replies: number;
 };
@@ -662,7 +681,9 @@ export function getCatchUpState(
   conversationId: string
 ): Readonly<CatchUpState> | undefined {
   const state = catchUps.get(conversationId);
-  return state ? { ...state, asked: [...state.asked] } : undefined;
+  return state
+    ? { ...state, asked: [...state.asked], askedLive: [...state.askedLive] }
+    : undefined;
 }
 
 function catchUpTimeoutMs(): number {
@@ -670,13 +691,37 @@ function catchUpTimeoutMs(): number {
   return Number.isFinite(raw) && raw >= 0 ? raw : CATCH_UP_TIMEOUT_MS;
 }
 
+async function setCatchUpWait(
+  conversation: ConversationModel,
+  wait: { since: ReadonlyArray<string>; reAdd: boolean } | undefined
+): Promise<void> {
+  conversation.set({ zrdtCatchUp: wait });
+  await DataWriter.updateConversation(conversation.attributes);
+}
+
+async function askForCatchUp(
+  conversationId: string,
+  state: CatchUpState,
+  aci: string
+): Promise<void> {
+  state.asked.push(aci);
+  await sendServeRequest(
+    conversationId,
+    { kind: 'direct', aci },
+    [],
+    'catchup',
+    state.since
+  );
+}
+
 /**
  * Starts a catch-up for `conversation` (once per conversation and run): a
  * catch-up request to the adder (or the first other member), and after a
  * timeout to two more members if nobody answered. `since` is the old store's
  * heads ∪ pending ∪ missing on a re-add, empty otherwise. With `relative`
- * (a re-add) a relative store is opened now; otherwise the first reply opens
- * the store (takeServedReply).
+ * (a re-add) a relative store is opened now; otherwise the first reply
+ * decides the store (settleCatchUpStore), and until it comes a store opened
+ * for the conversation is relative (serviceCore #ensure).
  */
 export async function startCatchUp(
   conversation: ConversationModel,
@@ -703,10 +748,20 @@ export async function startCatchUp(
     startedAt: Date.now(),
     since: [...since],
     asked: [],
+    askedLive: [],
     replies: 0,
   };
   catchUps.set(conversationId, state);
+  // The wait is set before anything awaits, so a send or a live record that
+  // comes right after already opens a relative store; it is kept on the
+  // conversation, so a restart asks again.
+  const wait = conversation.get('zrdtCatchUp');
+  const persisted = setCatchUpWait(conversation, {
+    since: state.since,
+    reAdd: relative || wait?.reAdd === true,
+  });
   try {
+    await persisted;
     await zrdtService.init();
     if (!zrdtService.backendInfo().available) {
       catchUps.delete(conversationId);
@@ -732,19 +787,12 @@ export async function startCatchUp(
         `since ${state.since.length}): asking ${targets.first ?? 'nobody'}, ` +
         `then ${targets.more.join(', ') || 'nobody'}`
     );
-    const ask = async (aci: string) => {
-      state.asked.push(aci);
-      await sendServeRequest(
-        conversationId,
-        { kind: 'direct', aci },
-        [],
-        'catchup',
-        state.since
-      );
-    };
-    if (targets.first) {
-      await ask(targets.first);
+    if (!targets.first) {
+      // A group of one: nobody to ask, and nothing to catch up on.
+      await setCatchUpWait(conversation, undefined);
+      return;
     }
+    await askForCatchUp(conversationId, state, targets.first);
     setTimeout(() => {
       if (state.answeredBy !== undefined) {
         return;
@@ -754,10 +802,93 @@ export async function startCatchUp(
           targets.more.join(', ') || 'nobody'
         }`
       );
-      drop(Promise.all(targets.more.map(ask)));
+      drop(
+        Promise.all(
+          targets.more.map(aci => askForCatchUp(conversationId, state, aci))
+        )
+      );
     }, catchUpTimeoutMs());
   } catch (error) {
     log.error('catch-up failed to start', Errors.toLogFormat(error));
+  }
+}
+
+/**
+ * A live record from `authorAci` came while our catch-up waits for its first
+ * reply. The author holds a store now, though it may have had none when it
+ * was asked (in a new group nobody has one when the catch-ups start), so it
+ * is asked too, once per catch-up.
+ */
+export function askLiveAuthorForCatchUp(
+  conversationId: string,
+  authorAci: string
+): void {
+  const state = catchUps.get(conversationId);
+  if (
+    !state ||
+    state.answeredBy !== undefined ||
+    state.askedLive.includes(authorAci) ||
+    authorAci === itemStorage.user.getAci()
+  ) {
+    return;
+  }
+  state.askedLive.push(authorAci);
+  log.info(
+    `catch-up for ${conversationId}: no reply yet; asking ${authorAci}, ` +
+      'who wrote live'
+  );
+  drop(askForCatchUp(conversationId, state, authorAci));
+}
+
+/**
+ * Before a catch-up reply (or an export for this account, JOIN_PLAN §4.5) is
+ * taken: the first one decides the store (§6.1, catchUpStoreStep). Without
+ * a store it opens one, relative if the entries carry a boundary digest. A
+ * store opened while the catch-up waited (relative: a send or a live record
+ * came first) is closed again if they carry none, so a member from the
+ * start (a founder's or an old member's new device) does not stay relative,
+ * and a newcomer who wrote first keeps his relative store. Then the
+ * catch-up no longer waits. A closed store never becomes relative.
+ */
+export async function settleCatchUpStore(
+  conversation: ConversationModel,
+  groupId: Uint8Array<ArrayBuffer>,
+  entryKinds: ReadonlyArray<ServeEntry['kind']>
+): Promise<void> {
+  const conversationId = conversation.id;
+  const wait = conversation.get('zrdtCatchUp');
+  let store: 'none' | 'closed' | 'relative' = 'none';
+  if (await zrdtService.hasStore(conversationId)) {
+    store = (await zrdtService.isRelative(conversationId))
+      ? 'relative'
+      : 'closed';
+  }
+  const reply = catchUpStoreMode(entryKinds);
+  const step = catchUpStoreStep({
+    store,
+    provisional: wait != null && !wait.reAdd,
+    reply,
+  });
+  if (step === 'newRelative') {
+    await zrdtService.startRelative(conversationId, groupId);
+  }
+  if (wait != null) {
+    await setCatchUpWait(conversation, undefined);
+  }
+  if (step === 'newClosed' || step === 'close') {
+    // A store opened meanwhile (the wait still held) is relative: close it.
+    await zrdtService.ensureConversation(conversationId, groupId);
+    if (await zrdtService.isRelative(conversationId)) {
+      await zrdtService.closeRelative(conversationId);
+    }
+  }
+  if (step !== 'keep' || wait != null) {
+    log.info(
+      `catch-up for ${conversation.idForLogging()}: first reply (${reply}); ` +
+        `store ${store}: ${step}; ${
+          (await zrdtService.isRelative(conversationId)) ? 'relative' : 'closed'
+        } now`
+    );
   }
 }
 
@@ -773,16 +904,24 @@ export async function zrdtCatchUpAtStartup(): Promise<void> {
       return;
     }
     for (const conversation of window.ConversationController.getAll()) {
+      // A catch-up that waited for its first reply when the app stopped is
+      // asked again, with its `since`.
+      const wait = conversation.get('zrdtCatchUp');
       if (
         conversation.get('groupVersion') === 2 &&
         needsCatchUp({
           isMember: conversation.areWeAGroupMember(),
           // oxlint-disable-next-line no-await-in-loop
           hasStore: await zrdtService.hasStore(conversation.id),
+          waiting: wait != null,
         })
       ) {
         // oxlint-disable-next-line no-await-in-loop
-        await startCatchUp(conversation, { reason: 'startup' });
+        await startCatchUp(conversation, {
+          reason: wait ? 'startup, no reply before' : 'startup',
+          since: wait?.since,
+          relative: wait?.reAdd,
+        });
       }
     }
   } catch (error) {
@@ -797,7 +936,8 @@ export async function zrdtCatchUpAtStartup(): Promise<void> {
  *   (JOIN_PLAN §6.5);
  * - a re-add of ours: `since` = the old store's heads ∪ pending ∪ missing,
  *   the old store is archived, and a catch-up starts into a new one;
- * - no store (a member whose device has none): a catch-up starts.
+ * - no store (a member whose device has none), or a catch-up still waiting
+ *   for its first reply: a catch-up starts.
  */
 async function zrdtAfterGroupUpdate({
   conversation,
@@ -860,8 +1000,13 @@ async function zrdtAfterGroupUpdate({
       });
       return;
     }
-    if (needsCatchUp({ isMember: true, hasStore })) {
-      await startCatchUp(conversation, { reason: 'no store' });
+    const wait = conversation.get('zrdtCatchUp');
+    if (needsCatchUp({ isMember: true, hasStore, waiting: wait != null })) {
+      await startCatchUp(conversation, {
+        reason: 'no store',
+        since: wait?.since,
+        relative: wait?.reAdd,
+      });
     }
   } catch (error) {
     log.error('zrdtAfterGroupUpdate failed', Errors.toLogFormat(error));

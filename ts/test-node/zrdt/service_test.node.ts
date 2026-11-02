@@ -263,9 +263,11 @@ type Make = () => ZrdtBackend;
 function newService(
   storage: MemoryStorage,
   make: Make,
-  me: string = CAROL
+  me: string = CAROL,
+  awaitingCatchUp?: () => boolean
 ): ZrdtServiceCore {
   return new ZrdtServiceCore({
+    awaitingCatchUp,
     createBackend: make,
     intendedKind: () => 'stub',
     storage,
@@ -372,11 +374,15 @@ describe('zrdt service', function (this: Mocha.Suite) {
     }
     describe(`on ${name}`, () => {
       const services = new Array<ZrdtServiceCore>();
-      const fresh = (storage: MemoryStorage, me?: string) => {
+      const fresh = (
+        storage: MemoryStorage,
+        me?: string,
+        awaitingCatchUp?: () => boolean
+      ) => {
         if (make === undefined) {
           throw new Error('no backend');
         }
-        const s = newService(storage, make, me);
+        const s = newService(storage, make, me, awaitingCatchUp);
         services.push(s);
         return s;
       };
@@ -919,6 +925,154 @@ describe('zrdt service', function (this: Mocha.Suite) {
           storage.records.every(r => r.conversationId === archiveId)
         );
         assert.strictEqual(storage.modes.get(archiveId), 'relative');
+      });
+
+      it('a store opened while the catch-up waits is relative; the first reply decides it (JOIN_PLAN §6.1)', async () => {
+        // Bob holds a1 <- b1 <- c1.
+        const bob = fresh(new MemoryStorage(), BOB);
+        await bob.ensureConversation(CHAT, GROUP);
+        const a1 = digestOf(await incoming(bob, ALICE, 'a1', []));
+        const b1 = digestOf(await incoming(bob, BOB, 'b1', [a1]));
+        const c1 = await incoming(bob, CAROL, 'c1', [b1]);
+        const recordOf = async (d: B) => {
+          const got = await bob.get(CHAT, d);
+          if (got === undefined) {
+            throw new Error('Bob lacks a record');
+          }
+          return got.record;
+        };
+        if (c1.status !== 'accepted') {
+          throw new Error('c1 not accepted at Bob');
+        }
+
+        // Dave, a newcomer, writes before his catch-up has a reply: the
+        // store his send opens is relative (it was closed before the fix,
+        // and then ignored the reply's boundary).
+        let daveWaits = true;
+        const storage = new MemoryStorage();
+        const dave = fresh(storage, DAVE, () => daveWaits);
+        const hi = await dave.acceptOwn(CHAT, {
+          groupId: GROUP,
+          authorAci: aciStringToBytes(DAVE),
+          nonce: nonce(),
+          dataMessageBytes: dataMessage('hi all, dave here'),
+          links: await dave.linkable(CHAT),
+        });
+        assert.isTrue(await dave.isRelative(CHAT), 'opened relative');
+        assert.strictEqual(storage.modes.get(CHAT), 'relative');
+        // Carol's live c1 links history: it waits.
+        const early = await dave.acceptRecord(CHAT, {
+          record: c1.record,
+          opening: c1.opening,
+          provenance: { kind: 'live' },
+        });
+        assert.strictEqual(early.status, 'missing');
+        // Bob takes Dave's record live.
+        assert.strictEqual(
+          (
+            await bob.acceptRecord(CHAT, {
+              record: hi.record,
+              opening: hi.opening,
+              provenance: { kind: 'live' },
+            })
+          ).status,
+          'accepted'
+        );
+        // The first reply carries a boundary: kept, and c1 resolves.
+        daveWaits = false;
+        const outcomes = await dave.acceptView(CHAT, {
+          voucherAci: BOB,
+          forImport: false,
+          mode: 'catchup',
+          items: [
+            {
+              entry: { kind: 'after', record: await recordOf(b1) },
+              provenance: { kind: 'relayed', byAci: BOB },
+            },
+            {
+              entry: { kind: 'boundary', digest: a1 },
+              provenance: { kind: 'relayed', byAci: BOB },
+            },
+          ],
+        });
+        assert.deepEqual(
+          outcomes.map(o => o.result.kind),
+          ['ok', 'ok']
+        );
+        assert.deepEqual(storage.pending, [], 'nothing pending');
+        const sortedHeads = async (s: ZrdtServiceCore) =>
+          (await s.heads(CHAT)).map(toHex).sort();
+        assert.deepEqual(await sortedHeads(dave), await sortedHeads(bob));
+        assert.strictEqual(
+          await dave.closeRelative(CHAT),
+          'relative',
+          'a store that took a boundary digest stays relative'
+        );
+        assert.isTrue(await dave.isRelative(CHAT));
+
+        // Carol's new device (a member from the start, no store) writes
+        // before her catch-up has a reply; the reply has no boundary
+        // digest: the store is closed again, and stays closed.
+        let carolWaits = true;
+        const carolRows = new MemoryStorage();
+        const carol = fresh(carolRows, CAROL, () => carolWaits);
+        const back = await carol.acceptOwn(CHAT, {
+          groupId: GROUP,
+          authorAci: aciStringToBytes(CAROL),
+          nonce: nonce(),
+          dataMessageBytes: dataMessage('back again'),
+          links: await carol.linkable(CHAT),
+        });
+        carolRows.held.push({ digest: back.digest, opening: back.opening });
+        assert.isTrue(await carol.isRelative(CHAT));
+        carolWaits = false;
+        assert.strictEqual(await carol.closeRelative(CHAT), 'closed');
+        assert.isFalse(await carol.isRelative(CHAT));
+        assert.isFalse(carolRows.modes.has(CHAT));
+        assert.isTrue(await carol.has(CHAT, back.digest));
+        const view = await carol.acceptView(CHAT, {
+          voucherAci: BOB,
+          forImport: false,
+          mode: 'catchup',
+          items: [
+            {
+              entry: { kind: 'after', record: await recordOf(a1) },
+              provenance: { kind: 'relayed', byAci: BOB },
+            },
+            {
+              entry: { kind: 'after', record: await recordOf(b1) },
+              provenance: { kind: 'relayed', byAci: BOB },
+            },
+            {
+              entry: { kind: 'boundary', digest: new Uint8Array(32).fill(7) },
+              provenance: { kind: 'relayed', byAci: BOB },
+            },
+          ],
+        });
+        assert.deepEqual(
+          view.map(o => o.result.kind),
+          ['ok', 'ok', 'ignored'],
+          'a closed store takes no boundary digest'
+        );
+        const carolHeads = await sortedHeads(carol);
+        assert.deepEqual(carolHeads, [toHex(back.digest), toHex(b1)].sort());
+        const carolAgain = fresh(carolRows, CAROL);
+        await carolAgain.init();
+        assert.isFalse(await carolAgain.isRelative(CHAT), 'closed at restart');
+        assert.deepEqual(await sortedHeads(carolAgain), carolHeads);
+
+        // A restart while the catch-up still waits: the store reopens
+        // relative, and the first reply can still close it.
+        const aliceRows = new MemoryStorage();
+        const alice = fresh(aliceRows, ALICE, () => true);
+        const x = digestOf(await incoming(alice, BOB, 'x', []));
+        assert.isTrue(await alice.isRelative(CHAT));
+        const aliceAgain = fresh(aliceRows, ALICE, () => true);
+        await aliceAgain.init();
+        assert.isTrue(await aliceAgain.isRelative(CHAT));
+        assert.strictEqual(await aliceAgain.closeRelative(CHAT), 'closed');
+        assert.isTrue(await aliceAgain.has(CHAT, x));
+        assert.deepEqual(await sortedHeads(aliceAgain), [toHex(x)]);
       });
 
       it('disowns records in our name that we did not create', async () => {

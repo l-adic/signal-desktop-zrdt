@@ -7,6 +7,31 @@ Everything here runs from the repository root with Node 24 and `tsx`. Build
 `zrdtd` first: `cd zrdt/core && lake build` (the harness finds
 `zrdt/core/.lake/build/bin/zrdtd`; set `ZRDT_DAEMON` to use another one).
 
+## Quick start
+
+```sh
+git clone --recurse-submodules -b zrdt https://github.com/l-adic/signal-desktop-zrdt.git
+cd signal-desktop-zrdt
+make install    # zrdtd (Lean), node_modules, Electron, generated files
+make run        # the live demo
+```
+
+Prerequisites: macOS on Apple silicon, git, Node v24.22.0 (`.nvmrc`), pnpm
+11.24.0 (`corepack enable`, or `npm install -g pnpm@11.24.0`), and elan
+(`lake`). `make install` checks them first and says what is missing.
+
+`make run` opens three Signal desktops (Alice, Bob, Carol) linked to a local
+mock server, sends the warm-up messages to group "Camping", and opens the
+villain's control panel in the browser (default http://127.0.0.1:7357/);
+then follow [DEMO.md](DEMO.md). Ctrl-C closes everything. Other targets:
+`make smoke` (the go/no-go test, exit 0 only if every check passes),
+`make stop`, `make proofs` (the Lean proofs in `zrdt/`: heavy, the Mathlib
+cache and a build of about 5 minutes on 32 cores, about 9 GB of disk; best
+on Linux; not needed for `make run`), `make comparator` (Linux only,
+memory-heavy: see `zrdt/README.md`, "Running Comparator"), `make kit` (the
+MacBook demo kit), `make help`. `make run` leaves nothing in `$TMPDIR`: the
+desktop profiles are removed after Ctrl-C or `make stop` too.
+
 | File         | What it does                                                                                                                                                       |
 | ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `rules.ts`   | the villain's rules as pure functions: `dropGroupMsg(from, to)` (once, sends to ≥ 2 accounts from the inferred sender), `blackhole(to)`, `hold(to)`                |

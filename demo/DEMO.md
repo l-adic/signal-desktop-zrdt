@@ -8,6 +8,12 @@ all. Sources: `zrdt/docs/APP.md` §9, `RESTORE_PLAN.md` §6 and
 `docs/review-2026-11-01/AMENDMENTS.md` A11, A12. This file is the presenter's
 copy. Read it once with the kit running before the demo.
 
+**From a fork checkout** (no kit): `make install` once, then use `make run`,
+`make smoke` and `make stop` where this file says `~/zrdt-demo-kit/run-demo.sh`,
+`run-demo.sh --smoke` and `run-demo.sh --stop`; pass flags with `RUN_ARGS`,
+e.g. `make run RUN_ARGS="--link-dave --port 7400"` (`SMOKE_ARGS`, `STOP_ARGS`
+likewise). See `demo/README.md`, "Quick start".
+
 | Part                        | Time | Clock        |
 | --------------------------- | ---- | ------------ |
 | Intro                       | 30 s | 0:00 to 0:30 |

@@ -60,11 +60,11 @@ import type {
 } from './service.preload.ts';
 import type { ServeEntry } from './ZrdtBackend.std.ts';
 import {
+  askLiveAuthorForCatchUp,
   requestAuthorCopy,
   startCatchUp,
   zrdtResendScheduler,
 } from './resend.preload.ts';
-import { catchUpStoreMode } from './catchUp.std.ts';
 
 const { isEqual } = lodash;
 
@@ -285,18 +285,26 @@ export async function zrdtReceiveLive({
       return undefined;
     }
     const conversationId = conversation.id;
-    if (
-      meta.links.length > 0 &&
-      !(await zrdtService.hasStore(conversationId))
-    ) {
-      // This device has no store, and the record links history it does not
-      // hold: catch up (JOIN_PLAN §6.1). The store is relative, so the
-      // record waits in zrdt_pending until the boundary arrives.
-      log.info(`${logId}: no store, and the record links history: catch-up`);
-      await zrdtService.startRelative(conversationId, groupId);
-      drop(
-        startCatchUp(conversation, { reason: 'a live record links history' })
+    if (!(await zrdtService.hasStore(conversationId))) {
+      // This device has no store: catch up (JOIN_PLAN §6.1). The catch-up
+      // waits for its first reply from the moment it starts, so the store
+      // this record opens is relative until that reply decides it
+      // (catchUp.std.ts); a record that links history waits in zrdt_pending
+      // until the boundary arrives.
+      const linksHistory = meta.links.length > 0;
+      log.info(
+        `${logId}: no store${linksHistory ? ', and the record links history' : ''}: catch-up`
       );
+      drop(
+        startCatchUp(conversation, {
+          reason: linksHistory
+            ? 'a live record links history'
+            : 'a live record arrived',
+        })
+      );
+      if (linksHistory) {
+        await zrdtService.startRelative(conversationId, groupId);
+      }
     }
     await zrdtService.ensureConversation(conversationId, groupId);
 
@@ -317,6 +325,11 @@ export async function zrdtReceiveLive({
       // (APP.md §5 step 4); it never fires with SHA-256.
       log.warn(`${logId}: zrdt record refused: ${outcome.status}`);
       return undefined;
+    }
+
+    if (!isSync) {
+      // Its author holds a store: ask it too if our catch-up still waits.
+      askLiveAuthorForCatchUp(conversationId, authorAci);
     }
 
     const digest = outcome.digest ? toHex(outcome.digest) : undefined;
@@ -832,15 +845,8 @@ export async function takeServedReply({
     log.warn('served: not a group we share with the responder; ignored');
     return [];
   }
-  // No store yet (a catch-up, JOIN_PLAN §6.1): this reply opens it, relative
-  // only if it carries a boundary digest (catchUp.std.ts).
-  if (
-    catchUp &&
-    !(await zrdtService.hasStore(conversationId)) &&
-    catchUpStoreMode(entries.map(entry => entry.kind)) === 'relative'
-  ) {
-    await zrdtService.startRelative(conversationId, groupId);
-  }
+  // A catch-up reply: the caller (resend.preload.ts, settleCatchUpStore)
+  // opened or settled the store first (JOIN_PLAN §6.1, catchUp.std.ts).
   await zrdtService.ensureConversation(conversationId, groupId);
   const items = entries.map(entry => viewItem(entry, responderAci));
   // The request's mode (protocol 4): a per-digest reply's boundary digests

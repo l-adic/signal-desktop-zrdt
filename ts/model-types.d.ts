@@ -560,6 +560,12 @@ export type ConversationAttributesType = {
   // the remover told us that account was removed. SERVE joins them with that
   // account's `since`.
   zrdtRemovedSince?: Readonly<Record<string, ReadonlyArray<string>>>;
+  // zrdt (JOIN_PLAN §6.1): a catch-up that has not had its first reply. While
+  // set, a store opened for the group is relative and the first reply
+  // decides it (ts/zrdt/catchUp.std.ts); the catch-up is asked again at
+  // start. `since`: the request's (a re-add's old heads, hex); `reAdd`: the
+  // store is relative for good.
+  zrdtCatchUp?: Readonly<{ since: ReadonlyArray<string>; reAdd: boolean }>;
   pendingMembersV2?: Array<GroupV2PendingMemberType>;
   pendingAdminApprovalV2?: Array<GroupV2PendingAdminApprovalType>;
   bannedMembersV2?: Array<GroupV2BannedMemberType>;

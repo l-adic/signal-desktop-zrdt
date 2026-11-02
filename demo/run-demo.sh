@@ -115,8 +115,15 @@ fi
 
 # --- macOS: quarantine, signatures --------------------------------------------
 
-[ "$(uname -s)" = Darwin ] || die "the demo kit runs on macOS"
-[ "$(uname -m)" = arm64 ] || die "the kit is built for Apple silicon (arm64); this Mac is $(uname -m)"
+if [ -n "$IN_KIT" ]; then
+  [ "$(uname -s)" = Darwin ] || die "the demo kit runs on macOS"
+  [ "$(uname -m)" = arm64 ] || die "the kit is built for Apple silicon (arm64); this Mac is $(uname -m)"
+else
+  [ "$(uname -s)" = Darwin ] ||
+    die "the demo runs on macOS (on Apple silicon); this is $(uname -s). The Lean side runs anywhere: make proofs"
+  [ "$(uname -m)" = arm64 ] ||
+    say "warning: the demo is tested on Apple silicon (arm64); this Mac is $(uname -m)"
+fi
 
 # A kit that arrived by AirDrop, a browser or Finder carries the quarantine
 # flag, and Gatekeeper then blocks node, zrdtd, Electron and the native
@@ -145,14 +152,23 @@ fi
 
 # Each binary must start; one that macOS kills on sight (status 137: a bad
 # signature) is ad-hoc re-signed once.
+if [ -z "$IN_KIT" ]; then
+  command -v node >/dev/null 2>&1 ||
+    die "node is not on PATH; the demo needs Node $NODE_WANT (.nvmrc), then: make install"
+  [ -x "$DAEMON" ] || die "no zrdtd at $DAEMON: run make install first (it builds zrdtd)"
+  [ -x "$ELECTRON" ] || die "no Electron at $ELECTRON: run make install first"
+fi
 NODE_HAVE=$(node -v 2>/dev/null)
 rc=$?
 if [ $rc = 137 ] && [ -n "$IN_KIT" ]; then
   resign "$KIT/node/bin/node"
   NODE_HAVE=$(node -v 2>/dev/null)
 fi
-[ -n "$NODE_HAVE" ] || die "node does not start (try: $0 --resign)"
-[ "$NODE_HAVE" = "$NODE_WANT" ] || say "warning: node is $NODE_HAVE, the kit was tested with $NODE_WANT"
+if [ -z "$NODE_HAVE" ]; then
+  if [ -n "$IN_KIT" ]; then die "node does not start (try: $0 --resign)"; fi
+  die "node ($(command -v node)) does not start; the demo needs Node $NODE_WANT (.nvmrc)"
+fi
+[ "$NODE_HAVE" = "$NODE_WANT" ] || say "warning: node is $NODE_HAVE, the demo was tested with $NODE_WANT"
 
 [ -x "$DAEMON" ] || die "no zrdtd at $DAEMON"
 daemon_line() { LEAN_ABORT_ON_PANIC=1 "$DAEMON" </dev/null 2>&1 | head -1; }
@@ -245,9 +261,30 @@ if [ -z "$NO_OPEN" ]; then
   ) &
   WATCHER=$!
 fi
+# launch.ts lists its temporary folders (desktop profiles, the mock CDN) when
+# it exits. After Ctrl-C or --stop its own teardown never ran (Playwright's
+# SIGINT handler exits first), so remove what is left of them.
+TMP_LIST="${ZRDT_DEMO_OUT:-$ROOT/demo/artifacts/demo}/tmp-dirs.txt"
+remove_tmp_dirs() {
+  [ -f "$TMP_LIST" ] || return 0
+  local d n=0
+  while IFS= read -r d; do
+    case "$d" in
+      */mock-signal-* | */zrdt-demo-cdn3-*)
+        if [ -d "$d" ]; then
+          rm -rf "$d"
+          n=$((n + 1))
+        fi
+        ;;
+    esac
+  done <"$TMP_LIST"
+  rm -f "$TMP_LIST"
+  [ "$n" = 0 ] || say "removed $n temporary folders the run left (desktop profiles, mock CDN)"
+}
 cleanup() {
   [ -n "$WATCHER" ] && kill "$WATCHER" 2>/dev/null
   kill_ours
+  remove_tmp_dirs
 }
 trap cleanup EXIT
 

@@ -102,6 +102,10 @@ const core = new ZrdtServiceCore({
     }
     return held;
   },
+  // Set by resend.preload.ts while a catch-up waits for its first reply.
+  awaitingCatchUp: conversationId =>
+    window.ConversationController?.get(conversationId)?.get('zrdtCatchUp') !=
+    null,
 });
 
 export const zrdtService: ZrdtServiceType = core;
