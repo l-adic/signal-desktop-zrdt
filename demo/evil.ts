@@ -18,6 +18,8 @@
 // server sees (demo/rules.ts); that is a policy, not a property of the mock.
 
 import { createHash } from 'node:crypto';
+import { readFile, rm, writeFile } from 'node:fs/promises';
+import path from 'node:path';
 
 import { Server } from '@signalapp/mock-server';
 import type {
@@ -87,9 +89,63 @@ export class EvilServer extends Server {
   readonly #sendIdByKey = new Map<string, string>();
   readonly #sends = new Map<string, SendRecord>();
   #nextSend = 0;
+  // zrdt apps (BUILD_M1 §A.1): the CDN villain. Every attachment upload
+  // form the server issued, in order: the CDN keys are end-to-end
+  // encrypted, so the villain picks objects by upload order, as a server
+  // would by request (the mock does not pass the requesting device).
+  readonly #cdn3Path: string | undefined;
+  readonly #uploads = new Array<{ key: string; at: number }>();
 
   constructor(config: Config = {}) {
     super(config);
+    this.#cdn3Path = config.cdn3Path;
+  }
+
+  public override async getAttachmentUploadForm(
+    folder: string,
+    key: string
+  ): ReturnType<Server['getAttachmentUploadForm']> {
+    if (folder === 'attachments') {
+      this.#uploads.push({ key, at: Date.now() });
+    }
+    return super.getAttachmentUploadForm(folder, key);
+  }
+
+  /** How many attachment uploads the server has issued (a mark for `uploadsSince`). */
+  public uploadMark(): number {
+    return this.#uploads.length;
+  }
+
+  /** The uploads issued after `mark`, in order (the fork uploads pieces in index order). */
+  public uploadsSince(
+    mark: number
+  ): ReadonlyArray<{ key: string; at: number }> {
+    return this.#uploads.slice(mark);
+  }
+
+  #objectPath(index: number): string {
+    const upload = this.#uploads[index];
+    if (upload === undefined || this.#cdn3Path === undefined) {
+      throw new Error(`no CDN upload ${index}`);
+    }
+    return path.join(this.#cdn3Path, 'attachments', upload.key);
+  }
+
+  /** The server deletes the object of upload `index` (the fetch gets a 404). */
+  public async deleteUpload(index: number): Promise<void> {
+    await rm(this.#objectPath(index), { force: true });
+  }
+
+  /**
+   * The server flips one byte in the middle of the object of upload `index`
+   * (Signal's attachment MAC catches it on download).
+   */
+  public async corruptUpload(index: number): Promise<void> {
+    const file = this.#objectPath(index);
+    const bytes = await readFile(file);
+    const middle = Math.floor(bytes.length / 2);
+    bytes[middle] = 255 - (bytes[middle] ?? 0);
+    await writeFile(file, bytes);
   }
 
   /**

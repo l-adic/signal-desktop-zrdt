@@ -26,6 +26,9 @@ import {
   intendedBackendKind,
 } from './backendFactory.node.ts';
 import { ZrdtServiceCore } from './serviceCore.node.ts';
+import type { ZrdtAppsBackend } from './ZrdtBackend.std.ts';
+import { groupIdOfAppKey, isAppStoreKey } from './apps/channels.std.ts';
+import { appOpenings } from './apps/appOpenings.preload.ts';
 import type { ZrdtOpenOutcome, ZrdtServiceType } from './serviceCore.node.ts';
 
 export type {
@@ -42,6 +45,10 @@ export type {
 function groupIdOf(
   conversationId: string
 ): Uint8Array<ArrayBuffer> | undefined {
+  // zrdt apps: a channel store's key carries its group, the channel id.
+  if (isAppStoreKey(conversationId)) {
+    return groupIdOfAppKey(conversationId);
+  }
   const groupId =
     window.ConversationController?.get(conversationId)?.get('groupId');
   if (groupId == null) {
@@ -79,6 +86,15 @@ const core = new ZrdtServiceCore({
   groupIdOf,
   ourAci: () => itemStorage.user.getAci(),
   heldOpenings: async (conversationId, digests) => {
+    if (isAppStoreKey(conversationId)) {
+      // zrdt apps: openings live in the app opening store, not message rows.
+      const all = await appOpenings().all(conversationId);
+      if (digests === undefined) {
+        return all;
+      }
+      const want = new Set(digests.map(d => toHex(d)));
+      return all.filter(h => want.has(toHex(h.digest)));
+    }
     const wanted =
       digests ??
       (await DataReader.getZrdtRecords(conversationId)).map(row => row.digest);
@@ -109,6 +125,11 @@ const core = new ZrdtServiceCore({
 });
 
 export const zrdtService: ZrdtServiceType = core;
+
+/** zrdt apps: the protocol-5 ops while zrdtd speaks protocol 5, else undefined. */
+export function appsBackend(): ZrdtAppsBackend | undefined {
+  return core.appsBackend();
+}
 
 export const zrdtEvents: EventEmitter = core.events;
 

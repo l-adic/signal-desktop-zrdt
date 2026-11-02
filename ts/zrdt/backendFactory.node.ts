@@ -14,7 +14,7 @@
 import { ZrdtBackendError } from './ZrdtBackend.std.ts';
 import type { BackendKind, ZrdtBackend } from './ZrdtBackend.std.ts';
 import { DaemonBackend, readDaemonTimeoutMs } from './backends/daemon.node.ts';
-import { StubBackend } from './backends/stub.node.ts';
+import { AppsStubBackend } from './backends/appsStub.node.ts';
 
 export type BackendEnv = Readonly<Record<string, string | undefined>>;
 
@@ -51,5 +51,6 @@ export function createZrdtBackend(env: BackendEnv = process.env): ZrdtBackend {
         '(the TypeScript stub runs only in tests)'
     );
   }
-  return new StubBackend({ env });
+  // The protocol-5 stub: protocol 4 plus the app ops.
+  return new AppsStubBackend({ env });
 }

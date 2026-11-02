@@ -22,6 +22,8 @@ import { fromAciUuidBytes } from '../util/ServiceId.node.ts';
 import type { ServeReply } from './ZrdtBackend.std.ts';
 import { aciHex } from './audience.std.ts';
 import { keyTag, sealServeReply } from './seal.node.ts';
+import { MAX_INLINE_SEALED_BYTES } from './apps/appMessage.std.ts';
+import { uploadFresh } from './apps/cdn.preload.ts';
 
 const log = createLogger('zrdt/served');
 
@@ -61,6 +63,7 @@ export function buildZrdtServedContent({
         header: reply.headerBytes,
         ephemeralKey,
         sealed,
+        sealedOnCdn: null,
       },
     },
   };
@@ -79,11 +82,23 @@ export async function sendZrdtServed({
   reply: ServeReply;
   key: Bytes;
 }>): Promise<void> {
-  const { destinationAci, content } = buildZrdtServedContent({
+  const built = buildZrdtServedContent({
     groupId,
     reply,
     key,
   });
+  const { destinationAci } = built;
+  let { content } = built;
+  // zrdt apps (BUILD_M1 §B.9): a sealed reply over 48 KiB (every 1 MiB piece)
+  // goes as a CDN attachment holding exactly the sealed bytes.
+  const inline =
+    content && 'zrdtServed' in content ? content.zrdtServed : undefined;
+  if (inline?.sealed && inline.sealed.byteLength > MAX_INLINE_SEALED_BYTES) {
+    const pointer = await uploadFresh(new Uint8Array(inline.sealed));
+    content = {
+      zrdtServed: { ...inline, sealed: null, sealedOnCdn: pointer },
+    };
+  }
   const aci = fromAciUuidBytes(destinationAci);
   if (aci === undefined) {
     throw new Error('zrdt served: the header holds no ACI');

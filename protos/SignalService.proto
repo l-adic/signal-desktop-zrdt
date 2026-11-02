@@ -119,8 +119,7 @@ message Content {
     ZrdtNotFound zrdtNotFound = 202;
     ZrdtServed zrdtServed = 203;
     ZrdtServeRequest zrdtServeRequest = 204;
-    // zrdt apps: an app record (zrdt docs/apps/BUILD_M1.md section 2.1).
-    // PROTOTYPE (apps-map, docs/zrdt/FORK_MAP.md section 8).
+    // zrdt apps: an app record (zrdt docs/apps/BUILD_M1.md section B.9).
     ZrdtAppMessage zrdtApp = 205;
   }
   reserved 200, 201;
@@ -488,6 +487,11 @@ message ZrdtServeRequest {
   repeated bytes digests = 3; // per-digest repair: the wanted digests
   repeated bytes since = 4;
   optional bool catchup = 5;
+  // zrdt apps (docs/apps/BUILD_M1.md section B.9): a piece repair names the
+  // announcement (A's record digest; the responder finds its piece store by
+  // it); a channel catch-up names the app channel (its 32-byte id).
+  optional bytes announcement = 7;
+  optional bytes channel = 8;
 }
 
 // zrdt: a SERVE reply, sealed to the identity key SERVE checked
@@ -497,6 +501,9 @@ message ZrdtServed {
   optional bytes header = 2; // requester aci(16) || key tag(16) || request id(16)
   optional bytes ephemeralKey = 3; // 33-byte serialized public key
   optional bytes sealed = 4; // SERVE's entries, AES-256-GCM-SIV
+  // zrdt apps: a sealed reply over 48 KiB (every 1 MiB piece) travels as a
+  // CDN attachment holding exactly the bytes `sealed` would hold.
+  optional AttachmentPointer sealedOnCdn = 5;
 }
 
 // zrdt: the responder does not hold these records
@@ -507,16 +514,19 @@ message ZrdtNotFound {
 
 // zrdt apps: an app record, laid out like a DataMessage so that COMMIT's
 // committed bytes (the message minus fields 15 and 200) work unchanged
-// (zrdt docs/apps/BUILD_M1.md section 2.1). PROTOTYPE (apps-map).
+// (zrdt docs/apps/BUILD_M1.md section B.2). The committed fields come from
+// zrdtd (BT_BUILD, GIT_PREPARE) and are kept as bytes, so the bytes as sent
+// decode and encode again unchanged; receivers pass field 205 as received
+// to COMMIT. Field 216 holds a ZrdtPointers.
 message ZrdtAppMessage {
   optional GroupContextV2 groupV2 = 15; // routing; not committed
-  optional ZrdtMeta zrdt = 200; // links, nonce, version, disown; not committed
+  optional ZrdtMeta zrdt = 200; // links, nonce; not committed
   optional bytes zrdtAudience = 201;
   optional string app = 210;
   optional string channel = 211;
   optional bytes body = 212;
   optional bytes descriptor = 215;
-  optional ZrdtPointers pointers = 216; // opaque to Lean
+  optional bytes pointers = 216; // a ZrdtPointers, opaque to Lean
 }
 
 // zrdt apps: the CDN pointers of a record's pieces, in index order

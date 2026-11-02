@@ -217,6 +217,7 @@ import { onStoryRecipientUpdate } from './util/onStoryRecipientUpdate.preload.ts
 import { flushAttachmentDownloadQueue } from './util/attachmentDownloadQueue.preload.ts';
 import { initializeRedux } from './state/initializeRedux.preload.ts';
 import { zrdtService } from './zrdt/service.preload.ts';
+import { startApps } from './zrdt/apps/transport.preload.ts';
 import { reacceptZrdtOutgoingAtStartup } from './zrdt/send.preload.ts';
 import { zrdtCatchUpAtStartup } from './zrdt/resend.preload.ts';
 import { StartupQueue } from './util/StartupQueue.std.ts';
@@ -1246,6 +1247,8 @@ async function startApp(): Promise<void> {
       drop(reacceptZrdtOutgoingAtStartup());
       // zrdt (JOIN_PLAN §6.1): catch up groups we joined but hold no store for.
       drop(zrdtCatchUpAtStartup());
+      // zrdt apps (BUILD_M1 §B.10): the local endpoint, when ZRDT_APPS=1.
+      drop(startApps());
 
       await Promise.all([
         window.ConversationController.getOrCreateSignalConversation(),

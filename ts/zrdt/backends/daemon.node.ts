@@ -50,7 +50,22 @@ import type {
   ServeRequest,
   VersionInfo,
   ViewResult,
-  ZrdtBackend,
+  ZrdtAppsBackend,
+  AcceptResult,
+  AssembleResult,
+  BtBuildRequest,
+  BtBuildResult,
+  BtFileResult,
+  ChannelResult,
+  GitObjectsResult,
+  GitPrepareRequest,
+  GitPrepareResult,
+  GitViewResult,
+  PieceAcceptResult,
+  PieceOpeningResult,
+  PiecesBindRequest,
+  PiecesBindResult,
+  ServeHeld,
 } from '../ZrdtBackend.std.ts';
 import {
   Code,
@@ -60,6 +75,8 @@ import {
   encodeRequestBody,
 } from './codec.std.ts';
 import type { Request, ResultOf } from './codec.std.ts';
+import { AppOp, decodeAppReply, encodeAppRequestBody } from './codec5.std.ts';
+import type { AppRequest, AppResultOf } from './codec5.std.ts';
 
 export { Op } from './codec.std.ts';
 
@@ -192,7 +209,7 @@ type Pending = Readonly<{
 }>;
 
 /** The Lean backend: one zrdtd child process. */
-export class DaemonBackend implements ZrdtBackend {
+export class DaemonBackend implements ZrdtAppsBackend {
   readonly kind: BackendKind = 'lean';
 
   readonly #child: ChildProcessWithoutNullStreams;
@@ -258,7 +275,7 @@ export class DaemonBackend implements ZrdtBackend {
    * Sends one request frame and resolves with zrdtd's reply frame. Replies
    * come in request order, so the oldest pending call gets each reply.
    */
-  call(op: Op, body: Bytes): Promise<Frame> {
+  call(op: Op | AppOp, body: Bytes): Promise<Frame> {
     if (this.#failure !== undefined) {
       return Promise.reject(this.#failure);
     }
@@ -565,5 +582,127 @@ export class DaemonBackend implements ZrdtBackend {
     key: Bytes
   ): Promise<Array<Digest>> {
     return this.#request({ op: Op.ADDRESSED, chat, aci, key });
+  }
+
+  // -------------------------------------------------------------------------
+  // Protocol 5: the app ops (codec5.std.ts). A protocol-4 zrdtd answers
+  // them UNKNOWN_OP, a `protocol` error; the host asks only when VERSION
+  // said 5.
+  // -------------------------------------------------------------------------
+
+  /** Sends a typed app request and reads the typed reply. */
+  async #requestApp<O extends AppOp>(
+    req: AppRequest & { op: O }
+  ): Promise<AppResultOf[O]> {
+    const name = AppOp[req.op];
+    const frame = await this.call(req.op, encodeAppRequestBody(req));
+    let result: AppResultOf[O] | undefined;
+    try {
+      result = decodeAppReply(req.op, frame.tag, frame.body);
+    } catch (error) {
+      if (!(error instanceof ReplyError)) {
+        throw error;
+      }
+      switch (error.status) {
+        case Code.NO_CHAT:
+          throw new ZrdtBackendError('unknownChat', `${name}: no store`);
+        case Code.CHAT_OPEN:
+          throw new ZrdtBackendError('chatOpen', `${name}: chat open`);
+        case Code.BAD_REQUEST:
+          throw new ZrdtBackendError('badInput', `${name}: bad request`);
+        case Code.UNKNOWN_OP:
+          throw new ZrdtBackendError('protocol', `${name}: unknown op`);
+        default:
+          break;
+      }
+      this.#fail(error.message);
+      throw new ZrdtBackendError('unavailable', error.message);
+    }
+    if (result === undefined) {
+      const message = `zrdtd sent an unreadable ${name} reply`;
+      this.#fail(message);
+      throw new ZrdtBackendError('unavailable', message);
+    }
+    return result;
+  }
+
+  async channel(
+    signalGroup: Bytes,
+    app: string,
+    name: string
+  ): Promise<ChannelResult> {
+    return this.#requestApp({ op: AppOp.CHANNEL, signalGroup, app, name });
+  }
+
+  async piecesBind(request: PiecesBindRequest): Promise<PiecesBindResult> {
+    return this.#requestApp({ ...request, op: AppOp.PIECES_BIND });
+  }
+
+  async pieceAccept(
+    pieceKey: ChatKey,
+    index: number,
+    piece: Bytes
+  ): Promise<PieceAcceptResult> {
+    return this.#requestApp({
+      op: AppOp.PIECE_ACCEPT,
+      pieceKey,
+      index,
+      piece,
+    });
+  }
+
+  async pieceOpening(
+    pieceKey: ChatKey,
+    index: number,
+    piece: Bytes
+  ): Promise<PieceOpeningResult> {
+    return this.#requestApp({
+      op: AppOp.PIECE_OPENING,
+      pieceKey,
+      index,
+      piece,
+    });
+  }
+
+  async piecesComplete(pieceKey: ChatKey): Promise<AcceptResult> {
+    return this.#requestApp({ op: AppOp.PIECES_COMPLETE, pieceKey });
+  }
+
+  async assemble(pieceKey: ChatKey, stream: Bytes): Promise<AssembleResult> {
+    return this.#requestApp({ op: AppOp.ASSEMBLE, pieceKey, stream });
+  }
+
+  async btBuild(request: BtBuildRequest): Promise<BtBuildResult> {
+    return this.#requestApp({ ...request, op: AppOp.BT_BUILD });
+  }
+
+  async btFile(pieceKey: ChatKey): Promise<BtFileResult> {
+    return this.#requestApp({ op: AppOp.BT_FILE, pieceKey });
+  }
+
+  async gitPrepare(request: GitPrepareRequest): Promise<GitPrepareResult> {
+    return this.#requestApp({ ...request, op: AppOp.GIT_PREPARE });
+  }
+
+  async gitObjects(
+    pieceKey: ChatKey,
+    stream: Bytes
+  ): Promise<GitObjectsResult> {
+    return this.#requestApp({ op: AppOp.GIT_OBJECTS, pieceKey, stream });
+  }
+
+  async gitView(
+    signalGroup: Bytes,
+    channelKey: ChatKey,
+    repo: string,
+    helds: ReadonlyArray<ServeHeld>
+  ): Promise<GitViewResult> {
+    return this.#requestApp({
+      op: AppOp.GIT_VIEW,
+      signalGroup,
+      channelKey,
+      repo,
+      helds,
+    });
   }
 }

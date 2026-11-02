@@ -70,6 +70,7 @@ import type { ZrdtRejectReason } from '../../zrdt/ui/labels.std.ts';
 import { rejectedText } from '../../zrdt/ui/labels.std.ts';
 import type { ZrdtCompareOutcome } from '../../zrdt/ui/ZrdtCompareModal.dom.tsx';
 import { readBlob3Header } from '../../zrdt/blob.std.ts';
+import { isAppStoreKey } from '../../zrdt/apps/channels.std.ts';
 import {
   classifyCompare,
   encodeCompareCode,
@@ -1778,14 +1779,15 @@ export function initZrdtRedux(store: Store<RootStateType>): void {
     }
   });
   zrdtEvents.on('accepted', (conversationId: unknown) => {
-    if (typeof conversationId !== 'string') {
+    // zrdt apps: channel stores are not conversations.
+    if (typeof conversationId !== 'string' || isAppStoreKey(conversationId)) {
       return;
     }
     scheduleRefresh(conversationId);
     void dispatch(onAccepted(conversationId));
   });
   zrdtEvents.on('classify', (conversationId: unknown) => {
-    if (typeof conversationId === 'string') {
+    if (typeof conversationId === 'string' && !isAppStoreKey(conversationId)) {
       scheduleRefresh(conversationId);
     }
   });

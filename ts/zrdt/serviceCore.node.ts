@@ -29,8 +29,15 @@ import type {
   ZrdtRecordRowType,
   ZrdtStoreModeType,
 } from '../types/Zrdt.std.ts';
-import { PROTOCOL_VERSION, ZrdtBackendError } from './ZrdtBackend.std.ts';
+import {
+  ACCEPTED_PROTOCOLS,
+  APPS_PROTOCOL_VERSION,
+  PROTOCOL_VERSION,
+  ZrdtBackendError,
+  hasAppsOps,
+} from './ZrdtBackend.std.ts';
 import type {
+  ZrdtAppsBackend,
   AcceptRecordResult,
   AudienceMember,
   OpenResult,
@@ -425,6 +432,8 @@ export class ZrdtServiceCore implements ZrdtServiceType {
   readonly #state = new Map<string, ConversationState>();
   readonly #locks = new Map<string, Promise<unknown>>();
   #scratchCounter = 0;
+  // The backend's protocol (VERSION): 4, or 5 with the app ops.
+  #protocol = 0;
   // The openings of records waiting in zrdt_pending (`<chat>:<hex digest>`),
   // so the record goes in with its opening and its audience is recorded
   // (protocol 4: every live record has its audience). After a restart the
@@ -463,10 +472,12 @@ export class ZrdtServiceCore implements ZrdtServiceType {
     });
     try {
       const { protocol, build } = await backend.version();
-      if (protocol !== PROTOCOL_VERSION) {
+      if (!ACCEPTED_PROTOCOLS.includes(protocol)) {
         // Fail closed: the frames of another protocol do not match.
+        // Protocol 5 (the apps) changes no protocol-4 layout, so chat runs
+        // on either; the apps run only on 5 (appsBackend()).
         log.error(
-          `zrdt: backend speaks protocol ${protocol}, not ${PROTOCOL_VERSION}`
+          `zrdt: backend speaks protocol ${protocol}, not ${PROTOCOL_VERSION} or ${APPS_PROTOCOL_VERSION}`
         );
         this.#setInfo({
           kind: backend.kind,
@@ -475,6 +486,7 @@ export class ZrdtServiceCore implements ZrdtServiceType {
         });
         return;
       }
+      this.#protocol = protocol;
       this.#setInfo({
         kind: backend.kind,
         version: `${build} (protocol ${protocol})`,
@@ -514,6 +526,26 @@ export class ZrdtServiceCore implements ZrdtServiceType {
 
   backendInfo(): ZrdtBackendInfo {
     return { ...this.#info };
+  }
+
+  /**
+   * The app ops (zrdt docs/apps/BUILD_M1.md §B), while the backend is
+   * available and speaks protocol 5; undefined otherwise. Piece stores are
+   * zrdtd's own (no SQL rows): the apps call these directly; channel stores
+   * go through the methods below like chats.
+   */
+  appsBackend(): ZrdtAppsBackend | undefined {
+    const backend = this.#backend;
+    if (
+      backend === undefined ||
+      !backend.isAvailable() ||
+      !this.#info.available ||
+      this.#protocol !== APPS_PROTOCOL_VERSION ||
+      !hasAppsOps(backend)
+    ) {
+      return undefined;
+    }
+    return backend;
   }
 
   /** The OPEN outcome of a conversation rejected at start, if it was. */

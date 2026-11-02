@@ -585,7 +585,8 @@ function sendStateAcis(message: MessageModel): Array<AciString> {
  * (unregistered) gives none (the zero tag); any other failure throws, so the
  * attempt fails and the job retries (JOIN_PLAN §4.1).
  */
-async function loadOrFetchIdentityKey(
+/** The identity key this device holds for `aci`, fetched if it has none (apps reuse it). */
+export async function loadOrFetchIdentityKey(
   aci: AciString,
   log: LoggerType
 ): Promise<ArrayBytes | undefined> {

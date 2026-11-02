@@ -54,6 +54,19 @@ export const RECORD_COUNT_LIMIT = 2 ** 24;
 export const PROTOCOL_VERSION = 4;
 
 /**
+ * The protocol of the apps (zrdt docs/apps/BUILD_M1.md §B): protocol 4 plus
+ * the ops 0x17-0x2F. It changes no protocol-4 layout, so the host speaks
+ * chat to a backend of either version, and the apps only to protocol 5.
+ */
+export const APPS_PROTOCOL_VERSION = 5;
+
+/** The protocols the host accepts from a backend (chat on both). */
+export const ACCEPTED_PROTOCOLS: ReadonlyArray<number> = [
+  PROTOCOL_VERSION,
+  APPS_PROTOCOL_VERSION,
+];
+
+/**
  * The parts of a record. `group` is the group's 32-byte id, `commit` the
  * 32-byte commitment from `commit()`, `links` the sender's heads at send time,
  * and `author` the sender's 16-byte ACI.
@@ -507,3 +520,322 @@ export type ZrdtBackend = {
    */
   addressed(chat: ChatKey, aci: Bytes, key: Bytes): Promise<Array<Digest>>;
 };
+
+// ---------------------------------------------------------------------------
+// Protocol 5: the apps (zrdt docs/apps/BUILD_M1.md §B.4-§B.7)
+// ---------------------------------------------------------------------------
+
+/** A git object id: 32 bytes, SHA-256 of the raw object. */
+export type Oid = Uint8Array<ArrayBuffer>;
+
+/** A seat: an ACI (16) and the tag of its key (16), as audiences hold them. */
+export type AppSeat = Readonly<{ aci: Bytes; tag: Bytes }>;
+
+/**
+ * Why an app op refused (`BAD_APP`, its reason byte 1-7):
+ * - `notStored` (1): A is not stored in the channel, or the channel is not
+ *   `channelId(signal group, app, name)`;
+ * - `opening` (2): the opening does not match A;
+ * - `notApp` (3): not a canonical app message of this app and channel;
+ * - `notSeated` (4): A's audience does not seat this device (T-m12): never
+ *   offer, open or fetch it;
+ * - `descriptor` (5): no descriptor, or one that breaks M1's limits (also a
+ *   torrent manifest that is malformed or disagrees with the descriptor);
+ * - `limits` (6): an input breaks the limits (sizes, audience, names);
+ * - `wrongApp` (7): the piece key's context belongs to another app.
+ */
+export type BadAppReason =
+  | 'notStored'
+  | 'opening'
+  | 'notApp'
+  | 'notSeated'
+  | 'descriptor'
+  | 'limits'
+  | 'wrongApp';
+
+export const BAD_APP_REASONS: ReadonlyArray<BadAppReason> = [
+  'notStored',
+  'opening',
+  'notApp',
+  'notSeated',
+  'descriptor',
+  'limits',
+  'wrongApp',
+];
+
+export type BadApp = Readonly<{ kind: 'badApp'; reason: BadAppReason }>;
+
+/** CHANNEL: the channel id of (signal group, app, name). */
+export type ChannelResult = Readonly<{ kind: 'ok'; channel: Bytes }> | BadApp;
+
+/**
+ * PIECES_BIND's request. The host uses hex(A's digest) as the piece key
+ * (T-m10); `channelKey` is the channel store A is stored in.
+ */
+export type PiecesBindRequest = Readonly<{
+  pieceKey: ChatKey;
+  channelKey: ChatKey;
+  signalGroup: Bytes;
+  app: string;
+  ownAci: Bytes;
+  ownKey: Bytes;
+  /** A's encoding. */
+  announcement: Bytes;
+  /** A's opening. */
+  opening: Bytes;
+}>;
+
+/**
+ * PIECES_BIND's reply: on `ok`, the bound announcement's stream length `len`,
+ * piece size 2^`exp`, the piece digests in index order, its body, the app
+ * manifest and the pointers (field 216, empty if absent).
+ */
+export type PiecesBindResult =
+  | Readonly<{
+      kind: 'ok';
+      len: number;
+      exp: number;
+      ordered: Array<Digest>;
+      body: Bytes;
+      manifest: Bytes;
+      pointers: Bytes;
+    }>
+  | Readonly<{ kind: 'malformed' }>
+  | BadApp;
+
+/** PIECE_ACCEPT: the piece record's digest, or `badPiece` (nothing changed). */
+export type PieceAcceptResult =
+  | Readonly<{ kind: 'ok'; digest: Digest }>
+  | Readonly<{ kind: 'badPiece' }>;
+
+/** PIECE_OPENING: the piece's opening (for SERVE's `held`), or `badPiece`. */
+export type PieceOpeningResult =
+  | Readonly<{ kind: 'ok'; opening: Bytes }>
+  | Readonly<{ kind: 'badPiece' }>;
+
+/** ASSEMBLE (and the BAD_PIECE of GIT_OBJECTS): the first bad index (N if the length is not L). */
+export type AssembleResult =
+  | Readonly<{ kind: 'ok' }>
+  | Readonly<{ kind: 'badPiece'; index: number }>;
+
+/** BT_BUILD's request (the author's torrent announcement). */
+export type BtBuildRequest = Readonly<{
+  channel: Bytes;
+  author: Bytes;
+  /** The store nonce, 32 random bytes. */
+  nonce: Bytes;
+  /** log2 of the piece size: 20 (hosts) or 10 (tests). */
+  exp: number;
+  /** AUDIENCE's value. */
+  audience: Bytes;
+  name: string;
+  /** ZrdtPointers bytes (field 216), opaque to zrdtd. */
+  pointers: Bytes;
+  stream: Bytes;
+}>;
+
+/** BT_BUILD: the committed bytes of A and the piece digests. */
+export type BtBuildResult =
+  | Readonly<{ kind: 'ok'; message: Bytes; ordered: Array<Digest> }>
+  | Readonly<{ kind: 'badName' }>
+  | BadApp;
+
+/** BT_FILE: the bound torrent's file name and length. */
+export type BtFileResult =
+  | Readonly<{ kind: 'ok'; name: string; len: number }>
+  | Readonly<{ kind: 'badName' }>
+  | BadApp;
+
+/** One ref update of a push: old (absent: a create), new (absent: a delete). */
+export type GitUpdate = Readonly<{
+  name: string;
+  old?: Oid;
+  new?: Oid;
+  forced: boolean;
+}>;
+
+/** GIT_PREPARE's request (BUILD_M1 §B.7). */
+export type GitPrepareRequest = Readonly<{
+  signalGroup: Bytes;
+  channelKey: ChatKey;
+  author: Bytes;
+  nonce: Bytes;
+  exp: number;
+  audience: Bytes;
+  share: boolean;
+  expect: ReadonlyArray<AppSeat>;
+  repo: string;
+  updates: ReadonlyArray<GitUpdate>;
+  helds: ReadonlyArray<ServeHeld>;
+  pointers: Bytes;
+  stream: Bytes;
+}>;
+
+export type PushRefusedReason =
+  | 'root'
+  | 'oldObject'
+  | 'gate'
+  | 'badShare'
+  | 'keyChanged'
+  | 'coversChanged';
+
+export const PUSH_REFUSED_REASONS: ReadonlyArray<PushRefusedReason> = [
+  'root',
+  'oldObject',
+  'gate',
+  'badShare',
+  'keyChanged',
+  'coversChanged',
+];
+
+/** How a seat failed a push check: new, key changed, or covered (a share). */
+export type SeatMark = 'new' | 'keyChanged' | 'covered';
+
+export const SEAT_MARKS: ReadonlyArray<SeatMark> = [
+  'new',
+  'keyChanged',
+  'covered',
+];
+
+export type BadObjectsReason =
+  | 'malformed'
+  | 'kind'
+  | 'gitlink'
+  | 'header'
+  | 'order'
+  | 'limits'
+  | 'name'
+  | 'list';
+
+export const BAD_OBJECTS_REASONS: ReadonlyArray<BadObjectsReason> = [
+  'malformed',
+  'kind',
+  'gitlink',
+  'header',
+  'order',
+  'limits',
+  'name',
+  'list',
+];
+
+export type PushRefused = Readonly<{
+  kind: 'pushRefused';
+  reason: PushRefusedReason;
+  seats: ReadonlyArray<Readonly<{ seat: AppSeat; mark: SeatMark }>>;
+  refs: ReadonlyArray<string>;
+  oids: ReadonlyArray<Oid>;
+}>;
+
+export type BadObjects = Readonly<{
+  kind: 'badObjects';
+  reason: BadObjectsReason;
+  /** The offending object, if any. */
+  oid?: Oid;
+}>;
+
+/** Stored channel records with a recorded audience but no held opening. */
+export type OpeningsMissing = Readonly<{
+  kind: 'openingsMissing';
+  digests: Array<Digest>;
+}>;
+
+/** GIT_PREPARE: the push's committed bytes, piece digests and covers. */
+export type GitPrepareResult =
+  | Readonly<{
+      kind: 'ok';
+      message: Bytes;
+      ordered: Array<Digest>;
+      covers: Array<AppSeat>;
+    }>
+  | PushRefused
+  | BadObjects
+  | OpeningsMissing
+  | Readonly<{ kind: 'badOpening' }>
+  | BadApp;
+
+export type GitObjectKind = 'commit' | 'tree' | 'blob';
+
+/** One object of a checked stream: where its raw bytes are. */
+export type GitObjectEntry = Readonly<{
+  kind: GitObjectKind;
+  oid: Oid;
+  offset: number;
+  length: number;
+}>;
+
+/** GIT_OBJECTS: the stream's objects, in stream order. */
+export type GitObjectsResult =
+  | Readonly<{ kind: 'ok'; objects: Array<GitObjectEntry> }>
+  | Readonly<{ kind: 'badPiece'; index: number }>
+  | BadObjects
+  | BadApp;
+
+/** One update of the push log. */
+export type GitLogEntry = Readonly<{
+  digest: Digest;
+  author: Bytes;
+  share: boolean;
+  update: GitUpdate;
+}>;
+
+/** One live assignment of the register: ref `name` := `value` by record `digest`. */
+export type GitRefEntry = Readonly<{
+  name: string;
+  digest: Digest;
+  value?: Oid;
+}>;
+
+/** GIT_VIEW: the push log and the live assignments of one repository. */
+export type GitViewResult =
+  | Readonly<{ kind: 'ok'; log: Array<GitLogEntry>; refs: Array<GitRefEntry> }>
+  | OpeningsMissing
+  | Readonly<{ kind: 'badOpening' }>
+  | BadApp;
+
+/**
+ * The protocol-5 ops (BUILD_M1 §B.5-§B.7). NO_CHAT and CHAT_OPEN throw
+ * `unknownChat` and `chatOpen`, as for protocol 4. A backend has them when
+ * its VERSION is 5; the daemon backend always has the methods, and a
+ * protocol-4 zrdtd answers them UNKNOWN_OP (a `protocol` error).
+ */
+export type ZrdtAppsOps = {
+  channel(
+    signalGroup: Bytes,
+    app: string,
+    name: string
+  ): Promise<ChannelResult>;
+  piecesBind(request: PiecesBindRequest): Promise<PiecesBindResult>;
+  pieceAccept(
+    pieceKey: ChatKey,
+    index: number,
+    piece: Bytes
+  ): Promise<PieceAcceptResult>;
+  pieceOpening(
+    pieceKey: ChatKey,
+    index: number,
+    piece: Bytes
+  ): Promise<PieceOpeningResult>;
+  piecesComplete(pieceKey: ChatKey): Promise<AcceptResult>;
+  assemble(pieceKey: ChatKey, stream: Bytes): Promise<AssembleResult>;
+  btBuild(request: BtBuildRequest): Promise<BtBuildResult>;
+  btFile(pieceKey: ChatKey): Promise<BtFileResult>;
+  gitPrepare(request: GitPrepareRequest): Promise<GitPrepareResult>;
+  gitObjects(pieceKey: ChatKey, stream: Bytes): Promise<GitObjectsResult>;
+  gitView(
+    signalGroup: Bytes,
+    channelKey: ChatKey,
+    repo: string,
+    helds: ReadonlyArray<ServeHeld>
+  ): Promise<GitViewResult>;
+};
+
+/** A backend that also has the app ops. */
+export type ZrdtAppsBackend = ZrdtBackend & ZrdtAppsOps;
+
+/** Whether `backend` has the app ops (it may still be protocol 4: ask VERSION). */
+export function hasAppsOps(backend: ZrdtBackend): backend is ZrdtAppsBackend {
+  return (
+    typeof (backend as Partial<ZrdtAppsOps>).piecesBind === 'function' &&
+    typeof (backend as Partial<ZrdtAppsOps>).gitPrepare === 'function'
+  );
+}

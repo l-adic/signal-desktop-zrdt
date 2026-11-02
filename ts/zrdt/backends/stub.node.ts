@@ -427,7 +427,7 @@ export function commitWithOpening(
  * 15 or 200, whose commitment under the record's group and author is the
  * record's commit.
  */
-function opens(record: StubRecord, opening: Bytes): boolean {
+export function opens(record: StubRecord, opening: Bytes): boolean {
   if (opening.length < NONCE_BYTES) {
     return false;
   }
@@ -1260,6 +1260,15 @@ export class StubBackend implements ZrdtBackend {
   onUnavailable(): () => void {
     // The stub never fails.
     return () => undefined;
+  }
+
+  /**
+   * The store under `chat`, if any, for reading only: the apps stub
+   * (appsStub.node.ts) reads a channel store's records, boundary and
+   * recorded audiences through it, as zrdtd's protocol-5 ops do.
+   */
+  peek(chat: ChatKey): StubStore | undefined {
+    return this.#stores.get(chat);
   }
 
   #store(chat: ChatKey): StubStore {

@@ -73,6 +73,9 @@ export type Demo = {
   byName: Readonly<Record<MemberName, Member>>;
   // Replaced by addToGroup (a new revision).
   group: Group;
+  // Every group by title ("Camping" is `group`), for the app beats: the git
+  // beat runs in a second group, "Code" (zrdt docs/apps/BUILD_M1.md §A.2).
+  groups: Record<string, Group>;
   artifacts: string;
   // Every profile directory a desktop of ours used.
   profiles: Set<string>;
@@ -151,7 +154,7 @@ export function linked(demo: Demo): Array<Member> {
 async function writeStorageState(
   m: Member,
   members: ReadonlyArray<Member>,
-  group: Group | undefined
+  groups: ReadonlyArray<Group>
 ): Promise<void> {
   const { phone } = m.boot;
   let state = StorageState.getEmpty().updateAccount({
@@ -159,7 +162,7 @@ async function writeStorageState(
     givenName: m.display,
     typingIndicators: false,
   });
-  if (group) {
+  for (const group of groups) {
     state = state.addGroup(group, { whitelisted: true }).pinGroup(group);
   }
   for (const other of members) {
@@ -180,14 +183,19 @@ async function writeStorageState(
 
 async function writeStorageStates(
   members: ReadonlyArray<Member>,
-  founders: ReadonlySet<Member>,
-  group: Group
+  groupsOf: (m: Member) => ReadonlyArray<Group>
 ): Promise<void> {
   for (const m of members) {
     // oxlint-disable-next-line no-await-in-loop
-    await writeStorageState(m, members, founders.has(m) ? group : undefined);
+    await writeStorageState(m, members, groupsOf(m));
   }
 }
+
+/** A further group for the app beats: its title and its founders. */
+export type ExtraGroup = Readonly<{
+  title: string;
+  founders: ReadonlyArray<MemberName>;
+}>;
 
 const DISPLAY: Readonly<Record<MemberName, string>> = {
   alice: 'Alice',
@@ -207,11 +215,13 @@ export async function setUp({
   verbose = false,
   founders = ['alice', 'bob', 'carol', 'dave'],
   late = [],
+  extraGroups = [],
 }: {
   artifacts: string;
   verbose?: boolean;
   founders?: ReadonlyArray<MemberName>;
   late?: ReadonlyArray<MemberName>;
+  extraGroups?: ReadonlyArray<ExtraGroup>;
 }): Promise<Demo> {
   await fs.rm(artifacts, { recursive: true, force: true });
   await fs.mkdir(artifacts, { recursive: true });
@@ -261,13 +271,48 @@ export async function setUp({
     title: 'Camping',
     members: [...founding].map(m => m.boot.phone),
   });
-  await writeStorageStates(members, founding, group);
+  const groups: Record<string, Group> = { Camping: group };
+  const extraOf = new Map<Member, Array<Group>>();
+  for (const extra of extraGroups) {
+    const first = extra.founders[0];
+    if (
+      first === undefined ||
+      !extra.founders.every(name => members.includes(byName[name]))
+    ) {
+      throw new Error(`group "${extra.title}": its founders need phones`);
+    }
+    // oxlint-disable-next-line no-await-in-loop
+    const g = await byName[first].boot.phone.createGroup({
+      title: extra.title,
+      members: extra.founders.map(name => byName[name].boot.phone),
+    });
+    groups[extra.title] = g;
+    for (const name of extra.founders) {
+      const list = extraOf.get(byName[name]) ?? [];
+      list.push(g);
+      extraOf.set(byName[name], list);
+    }
+    say(`group "${extra.title}" ${g.id} with ${extra.founders.join(', ')}`);
+  }
+  await writeStorageStates(members, m => [
+    ...(founding.has(m) ? [group] : []),
+    ...(extraOf.get(m) ?? []),
+  ]);
   say(
     `group "Camping" ${group.id} with ${founding.size} members` +
       (late.length > 0 ? ` (${late.join(', ')} not yet)` : '')
   );
 
-  return { server, members, byName, group, artifacts, profiles, cdn3Path };
+  return {
+    server,
+    members,
+    byName,
+    group,
+    groups,
+    artifacts,
+    profiles,
+    cdn3Path,
+  };
 }
 
 /**
@@ -283,14 +328,17 @@ export async function setUp({
 export async function addToGroup(
   demo: Demo,
   adderName: MemberName,
-  joinerName: MemberName
+  joinerName: MemberName,
+  { title = 'Camping' }: { title?: string } = {}
 ): Promise<number> {
   const adder = demo.byName[adderName];
   const joiner = demo.byName[joinerName];
   const { server } = demo;
-  const serverGroup = await server.getGroup(
-    demo.group.publicParams.serialize()
-  );
+  const current = title === 'Camping' ? demo.group : demo.groups[title];
+  if (current === undefined) {
+    throw new Error(`no group "${title}"`);
+  }
+  const serverGroup = await server.getGroup(current.publicParams.serialize());
   if (!serverGroup) {
     throw new Error('the group is not on the server');
   }
@@ -299,7 +347,7 @@ export async function addToGroup(
     aci: joiner.boot.phone.device.aci,
     profileKey: joiner.boot.phone.profileKey,
     profileKeyCommitment: joiner.boot.phone.device.profileKeyCommitment,
-    groupParams: demo.group.secretParams,
+    groupParams: current.secretParams,
   });
   // The mock's ServerGroup keeps these private; the change goes through them
   // exactly as its own `modify` does.
@@ -333,7 +381,7 @@ export async function addToGroup(
   const actions: Proto.GroupChange.Actions.Params = {
     ...EMPTY_GROUP_ACTIONS,
     version,
-    sourceUserId: demo.group.encryptServiceId(adder.boot.phone.device.aci),
+    sourceUserId: current.encryptServiceId(adder.boot.phone.device.aci),
     groupId: Buffer.from(serverGroup.id, 'base64'),
     addMembers: [{ added, joinFromInviteLink: false }],
   };
@@ -355,12 +403,16 @@ export async function addToGroup(
     },
   });
   const group = new Group({
-    secretParams: demo.group.secretParams,
+    secretParams: current.secretParams,
     groupState: serverGroup.state,
   });
   // The demo's group is the latest revision from now on.
+  if (title === 'Camping') {
+    // oxlint-disable-next-line no-param-reassign
+    demo.group = group;
+  }
   // oxlint-disable-next-line no-param-reassign
-  demo.group = group;
+  demo.groups[title] = group;
 
   const timestamp = Date.now();
   const groupV2 = {
@@ -424,9 +476,12 @@ export async function addToGroup(
     previous.addGroup(group, { whitelisted: true }).pinGroup(group),
     previous
   );
-  server.joinGroup(joiner.name);
+  if (title === 'Camping') {
+    // The villain's rules read the demo group's membership (Camping only).
+    server.joinGroup(joiner.name);
+  }
   say(
-    `${adder.display} added ${joiner.display} to "Camping" at revision ${version}`
+    `${adder.display} added ${joiner.display} to "${title}" at revision ${version}`
   );
   return version;
 }
@@ -649,6 +704,78 @@ export async function hook<T>(
     },
     { n: name, a: args }
   );
+}
+
+/**
+ * zrdt apps: the local endpoint of `m`'s desktop (ts/zrdt/apps/endpoint.node.ts),
+ * read from `<userData>/zrdt-apps.json` once the desktop wrote it (ZRDT_APPS=1).
+ */
+export type AppsEndpointOfMember = Readonly<{
+  /** `unix:<path>` or `http://127.0.0.1:<port>`: what ZRDT_ENDPOINT takes. */
+  endpoint: string;
+  socket?: string;
+  url?: string;
+  gitTokenFile: string;
+  btTokenFile: string;
+}>;
+
+export async function appsEndpointOf(
+  m: Member,
+  timeoutMs = 30_000
+): Promise<AppsEndpointOfMember> {
+  if (m.storagePath === undefined) {
+    throw new Error(`${m.display} has no profile`);
+  }
+  const file = path.join(m.storagePath, 'zrdt-apps.json');
+  const start = Date.now();
+  for (;;) {
+    try {
+      // oxlint-disable-next-line no-await-in-loop
+      const info = JSON.parse(await fs.readFile(file, 'utf8')) as {
+        endpoint: string;
+        socket?: string;
+        url?: string;
+        tokenFiles: { git: string; bt: string };
+      };
+      return {
+        endpoint: info.endpoint,
+        ...(info.socket === undefined ? {} : { socket: info.socket }),
+        ...(info.url === undefined ? {} : { url: info.url }),
+        gitTokenFile: info.tokenFiles.git,
+        btTokenFile: info.tokenFiles.bt,
+      };
+    } catch (error) {
+      if (Date.now() - start > timeoutMs) {
+        throw new Error(
+          `${m.display}: no apps endpoint after ${timeoutMs} ms (ZRDT_APPS=1?): ${String(error)}`
+        );
+      }
+      // oxlint-disable-next-line no-await-in-loop
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+  }
+}
+
+/**
+ * Writes `<dir>/<member>.sh` for the presenter's Terminal (FORK_MAP §7.1):
+ * `source` it, then `git push team main` or `zbt share ...` reach that
+ * member's desktop.
+ */
+export async function writeAppsEnv(m: Member, dir: string): Promise<string> {
+  const ep = await appsEndpointOf(m);
+  await fs.mkdir(dir, { recursive: true });
+  const file = path.join(dir, `${m.name}.sh`);
+  const quote = (v: string) => `'${v.replaceAll("'", "'\\''")}'`;
+  await fs.writeFile(
+    file,
+    `# ${m.display}'s desktop (zrdt apps endpoint)\n` +
+      `export ZRDT_ENDPOINT=${quote(ep.endpoint)}\n` +
+      `export ZRDT_TOKEN_FILE=${quote(ep.gitTokenFile)}\n` +
+      `export ZBT_TOKEN_FILE=${quote(ep.btTokenFile)}\n` +
+      `export PATH=${quote(path.join(REPO, 'zrdt', 'tools', 'git-remote-zrdt'))}:"$PATH"\n`,
+    { mode: 0o600 }
+  );
+  return file;
 }
 
 /** `m`'s conversation id for the group (each desktop has its own). */

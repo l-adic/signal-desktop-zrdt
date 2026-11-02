@@ -62,6 +62,12 @@ import { zrdtEvents, zrdtService } from './service.preload.ts';
 import { setGapState, takeServedReply, toHex } from './receive.preload.ts';
 import type { ZrdtBytes, ZrdtServedEntrySummary } from './receive.preload.ts';
 import { setZrdtGroupUpdateHook } from './groupHook.std.ts';
+import {
+  handleAppsServeRequest,
+  handleAppsServed,
+  isAppsServeRequest,
+  isAppsServed,
+} from './apps/transport.preload.ts';
 import type { ZrdtGroupUpdateType } from './groupHook.std.ts';
 import {
   CATCH_UP_TIMEOUT_MS,
@@ -255,6 +261,8 @@ async function sendServeRequest(
                 : [],
             since: since.map(digest => Bytes.fromHex(digest)),
             catchup: mode === 'catchup',
+            announcement: null,
+            channel: null,
           },
         };
         serveRequests.add({
@@ -307,10 +315,18 @@ export async function handleZrdtControlMessage({
   try {
     if ('zrdtServeRequest' in content && content.zrdtServeRequest) {
       // Answer in the background: replies are sends, and must not hold up
-      // the receive queue.
-      drop(onServeRequest(senderAci, content.zrdtServeRequest));
+      // the receive queue. zrdt apps: a piece repair or a channel catch-up.
+      if (isAppsServeRequest(content.zrdtServeRequest)) {
+        handleAppsServeRequest(senderAci, content.zrdtServeRequest);
+      } else {
+        drop(onServeRequest(senderAci, content.zrdtServeRequest));
+      }
     } else if ('zrdtServed' in content && content.zrdtServed) {
-      await onServed(senderAci, content.zrdtServed);
+      if (isAppsServed(content.zrdtServed)) {
+        await handleAppsServed(senderAci, content.zrdtServed);
+      } else {
+        await onServed(senderAci, content.zrdtServed);
+      }
     } else if ('zrdtNotFound' in content && content.zrdtNotFound) {
       const { groupId, digests } = content.zrdtNotFound;
       const conversation = groupId

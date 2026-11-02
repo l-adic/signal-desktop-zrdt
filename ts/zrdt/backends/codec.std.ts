@@ -87,6 +87,13 @@ export enum Code {
   NO_AUDIENCE = 0x09,
   EPHEMERAL = 0x0a,
   IGNORED = 0x0b,
+  // Protocol 5 (zrdt docs/apps/BUILD_M1.md §B.4; codec5.std.ts).
+  BAD_PIECE = 0x0c,
+  BAD_APP = 0x0d,
+  BAD_NAME = 0x0e,
+  PUSH_REFUSED = 0x10,
+  BAD_OBJECTS = 0x11,
+  OPENINGS_MISSING = 0x12,
   BAD_REQUEST = 0x80,
   UNKNOWN_OP = 0x81,
   NO_CHAT = 0x82,
@@ -113,28 +120,30 @@ export function concatBytes(
   return out;
 }
 
-function u8(value: number): Bytes {
+export function u8(value: number): Bytes {
   return Uint8Array.of(value);
 }
 
-function u32(value: number): Bytes {
+export function u32(value: number): Bytes {
   const out = new Uint8Array(4);
   new DataView(out.buffer).setUint32(0, value, false);
   return out;
 }
 
 /** `bytes`: a u32 length, then the bytes. */
-function wBytes(bytes: Uint8Array<ArrayBuffer>): Bytes {
+export function wBytes(bytes: Uint8Array<ArrayBuffer>): Bytes {
   return concatBytes([u32(bytes.length), bytes]);
 }
 
 /** `str`: UTF-8 text as `bytes`. */
-function wStr(text: string): Bytes {
+export function wStr(text: string): Bytes {
   return wBytes(new TextEncoder().encode(text));
 }
 
 /** `digests`: a u32 count, then the digests. */
-function wDigests(digests: ReadonlyArray<Uint8Array<ArrayBuffer>>): Bytes {
+export function wDigests(
+  digests: ReadonlyArray<Uint8Array<ArrayBuffer>>
+): Bytes {
   return concatBytes([u32(digests.length), ...digests]);
 }
 
@@ -192,7 +201,9 @@ function wStatus(status: Status): Bytes {
 }
 
 /** `u8 flag ‖ bytes?`: an optional opening. */
-function wOptionalBytes(bytes: Uint8Array<ArrayBuffer> | undefined): Bytes {
+export function wOptionalBytes(
+  bytes: Uint8Array<ArrayBuffer> | undefined
+): Bytes {
   return bytes === undefined ? u8(0) : concatBytes([u8(1), wBytes(bytes)]);
 }
 
@@ -204,7 +215,7 @@ function wMember(member: AudienceMember): Bytes {
 
 const SERVE_MODES: ReadonlyArray<ServeMode> = ['catchup', 'perDigest'];
 
-function wHeld(held: ServeHeld): Bytes {
+export function wHeld(held: ServeHeld): Bytes {
   return concatBytes([held.digest, wBytes(held.opening)]);
 }
 
@@ -236,10 +247,10 @@ export function encodeServeEntries(entries: ReadonlyArray<ServeEntry>): Bytes {
 // Reading
 // ---------------------------------------------------------------------------
 
-class Short extends Error {}
+export class Short extends Error {}
 
 /** Reads fields from a body; throws `Short` when a field is cut short. */
-class Reader {
+export class Reader {
   #offset = 0;
   readonly #bytes: Bytes;
 
@@ -425,7 +436,7 @@ export function decodeServeEntries(
 }
 
 /** Runs `read` on `bytes`; undefined if a field is cut short or bytes are left. */
-function readAll<T>(
+export function readAll<T>(
   bytes: Uint8Array<ArrayBuffer>,
   read: (r: Reader) => T
 ): T | undefined {
@@ -813,7 +824,7 @@ function refusalBytes(result: { kind: string; digest?: Digest }): Bytes {
   }
 }
 
-function acceptBytes(result: AcceptRecordResult): Bytes {
+export function acceptBytes(result: AcceptRecordResult): Bytes {
   if (result.kind === 'accepted') {
     return concatBytes([u8(Code.OK), result.digest, wBytes(result.record)]);
   }
@@ -962,13 +973,15 @@ function readServeReply(r: Reader, bodyLength: number): ServeReply {
 export class ReplyError extends Error {
   readonly status: number;
 
-  constructor(op: Op, status: number) {
-    super(`zrdt: unexpected reply 0x${status.toString(16)} to ${Op[op]}`);
+  /** `op` is a protocol-4 `Op`, or a protocol-5 op byte named by `name`. */
+  constructor(op: number, status: number, name?: string) {
+    const label = name ?? Op[op] ?? `op 0x${op.toString(16)}`;
+    super(`zrdt: unexpected reply 0x${status.toString(16)} to ${label}`);
     this.status = status;
   }
 }
 
-function readRefusal(
+export function readRefusal(
   op: Op,
   status: number,
   r: Reader
