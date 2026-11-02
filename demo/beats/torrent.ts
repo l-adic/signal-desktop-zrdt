@@ -383,7 +383,9 @@ export async function torrentBeat(
     );
     await dialog.getByRole('button', { name: 'Share', exact: true }).click();
   } catch (error) {
+    // zbt still waits on the dialog; it exits when the desktops close.
     check("torrent: Alice's dialog asks first", false, String(error));
+    return;
   }
   const shared = await sharing;
   const sharedJson = shared.json as
