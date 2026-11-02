@@ -30,6 +30,12 @@ import type { ZrdtServedLogItem } from './resend.preload.ts';
 import type { MessageModel } from '../models/messages.preload.ts';
 import { enqueueReactionForSend } from '../reactions/enqueueReactionForSend.preload.ts';
 import { sleep } from '../util/sleep.std.ts';
+import {
+  appProbeListen,
+  appProbeReceived,
+  appProbeRefetch,
+  appProbeSend,
+} from './apps/probe.preload.ts';
 
 /** The message of `conversationId` sent at `sentAt`, from the cache or the DB. */
 async function findSentAt(
@@ -154,6 +160,11 @@ export type ZrdtCIHooks = {
     scanned: number;
     hits: Array<{ text: string; id: string; type: string; where: string }>;
   }>;
+  // PROTOTYPE (apps-map): ts/zrdt/apps/probe.preload.ts
+  appProbeListen: typeof appProbeListen;
+  appProbeSend: typeof appProbeSend;
+  appProbeReceived: typeof appProbeReceived;
+  appProbeRefetch: typeof appProbeRefetch;
 };
 
 /** The body a zrdt opening (nonce ‖ DataMessage) commits, if it decodes. */
@@ -425,6 +436,10 @@ export function installZrdtCIHooks(): void {
       }
       return { scanned: all.length, hits };
     },
+    appProbeListen,
+    appProbeSend,
+    appProbeReceived,
+    appProbeRefetch,
   };
   setZrdtCIHooks(hooks);
 }

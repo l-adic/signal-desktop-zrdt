@@ -119,6 +119,9 @@ message Content {
     ZrdtNotFound zrdtNotFound = 202;
     ZrdtServed zrdtServed = 203;
     ZrdtServeRequest zrdtServeRequest = 204;
+    // zrdt apps: an app record (zrdt docs/apps/BUILD_M1.md section 2.1).
+    // PROTOTYPE (apps-map, docs/zrdt/FORK_MAP.md section 8).
+    ZrdtAppMessage zrdtApp = 205;
   }
   reserved 200, 201;
 
@@ -500,6 +503,25 @@ message ZrdtServed {
 message ZrdtNotFound {
   optional bytes groupId = 1;
   repeated bytes digests = 2;
+}
+
+// zrdt apps: an app record, laid out like a DataMessage so that COMMIT's
+// committed bytes (the message minus fields 15 and 200) work unchanged
+// (zrdt docs/apps/BUILD_M1.md section 2.1). PROTOTYPE (apps-map).
+message ZrdtAppMessage {
+  optional GroupContextV2 groupV2 = 15; // routing; not committed
+  optional ZrdtMeta zrdt = 200; // links, nonce, version, disown; not committed
+  optional bytes zrdtAudience = 201;
+  optional string app = 210;
+  optional string channel = 211;
+  optional bytes body = 212;
+  optional bytes descriptor = 215;
+  optional ZrdtPointers pointers = 216; // opaque to Lean
+}
+
+// zrdt apps: the CDN pointers of a record's pieces, in index order
+message ZrdtPointers {
+  repeated AttachmentPointer pieces = 1;
 }
 
 message NullMessage {

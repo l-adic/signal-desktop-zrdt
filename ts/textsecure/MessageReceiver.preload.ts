@@ -187,6 +187,7 @@ import type { ConversationAttributesTypeType } from '../model-types.d.ts';
 import { zrdtReceiveLive } from '../zrdt/receive.preload.ts';
 import type { ZrdtLiveStepResult } from '../zrdt/receive.preload.ts';
 import { handleZrdtControlMessage } from '../zrdt/resend.preload.ts';
+import { handleZrdtAppMessage } from '../zrdt/apps/probe.preload.ts';
 import {
   getDataMessageBytes,
   getSyncSentDataMessageBytes,
@@ -2721,6 +2722,21 @@ export default class MessageReceiver
         content.content.dataMessage,
         plaintext
       );
+      return;
+    }
+    // zrdt apps (Content 205): app records. PROTOTYPE (apps-map).
+    if (content.content?.zrdtApp) {
+      try {
+        await handleZrdtAppMessage({
+          senderAci: envelope.sourceServiceId,
+          senderDevice: envelope.sourceDevice,
+          timestamp: envelope.timestamp,
+          message: content.content.zrdtApp,
+          plaintext,
+        });
+      } finally {
+        this.#removeFromCache(envelope);
+      }
       return;
     }
     // zrdt control messages (Content 202-204): SERVE requests, sealed

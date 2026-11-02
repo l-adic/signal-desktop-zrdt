@@ -36,6 +36,7 @@ export const sendTypesEnum = z.enum([
   'pollTerminate',
   'pollVote', // non-urgent
   'unpinMessage',
+  'zrdtApp', // zrdt apps: excluded from send log (CDN pointers are bearer tokens)
   'typing', // excluded from send log; non-urgent
 
   // Responding to incoming messages, all non-urgent
@@ -104,6 +105,10 @@ export function shouldSaveProto(sendType: SendTypesType): boolean {
   }
 
   if (sendType === 'typing') {
+    return false;
+  }
+
+  if (sendType === 'zrdtApp') {
     return false;
   }
 

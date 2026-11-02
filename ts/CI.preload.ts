@@ -114,6 +114,10 @@ const ZRDT_CI_HOOK_NAMES = Object.keys({
   allMessages: true,
   memberAcis: true,
   scanMessages: true,
+  appProbeListen: true,
+  appProbeSend: true,
+  appProbeReceived: true,
+  appProbeRefetch: true,
 } satisfies Record<keyof ZrdtCIHooks, true>) as Array<keyof ZrdtCIHooks>;
 
 type AnyHookType = (...args: ReadonlyArray<unknown>) => unknown;
