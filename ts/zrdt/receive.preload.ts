@@ -12,6 +12,7 @@
 // in step. Nothing here may break Signal's own receive path: every entry point
 // catches and logs, and a message is then processed as if zrdt were absent.
 
+import { isAppStoreKey } from './apps/channels.std.ts';
 import lodash from 'lodash';
 
 import * as Bytes from '../Bytes.std.ts';
@@ -214,9 +215,26 @@ export function initZrdtReceive(): void {
     return;
   }
   listening = true;
-  zrdtEvents.on('accepted', onAcceptedEvent);
-  zrdtEvents.on('classify', scheduleStatusRefresh);
-  zrdtEvents.on('boundary', onBoundaryEvent);
+  // zrdt apps: channel stores are not conversations; their events are the
+  // app transport's (ts/zrdt/apps/).
+  zrdtEvents.on('accepted', (conversationId: string, digest: string) => {
+    if (!isAppStoreKey(conversationId)) {
+      onAcceptedEvent(conversationId, digest);
+    }
+  });
+  zrdtEvents.on('classify', (conversationId: string) => {
+    if (!isAppStoreKey(conversationId)) {
+      scheduleStatusRefresh(conversationId);
+    }
+  });
+  zrdtEvents.on(
+    'boundary',
+    (conversationId: string, digests: ReadonlyArray<string>) => {
+      if (!isAppStoreKey(conversationId)) {
+        onBoundaryEvent(conversationId, digests);
+      }
+    }
+  );
 }
 
 // --- the live step (MessageReceiver) ----------------------------------------------

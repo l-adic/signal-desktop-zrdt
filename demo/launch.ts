@@ -71,6 +71,7 @@ import {
   dumpPath,
   hook,
   linkDesktop,
+  writeAppsEnv,
   linked,
   openGroup,
   page,
@@ -93,6 +94,10 @@ type Options = {
   port: number;
   verbose: boolean;
   beat5: boolean;
+  // zrdt apps: each desktop runs its local endpoint (ZRDT_APPS=1), the group
+  // "Code" (Alice, Bob, Carol) is made for the git beat, and
+  // <artifacts>/apps-env/<member>.sh is written for the presenter.
+  apps: boolean;
 };
 
 function parseArgs(argv: ReadonlyArray<string>): Options {
@@ -102,6 +107,7 @@ function parseArgs(argv: ReadonlyArray<string>): Options {
     port: Number(process.env.ZRDT_PANEL_PORT ?? DEFAULT_PORT),
     verbose: false,
     beat5: false,
+    apps: false,
   };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
@@ -113,6 +119,8 @@ function parseArgs(argv: ReadonlyArray<string>): Options {
       opts.verbose = true;
     } else if (a === '--beat5') {
       opts.beat5 = true;
+    } else if (a === '--apps') {
+      opts.apps = true;
     } else if (a === '--port') {
       opts.port = Number(argv[i + 1]);
       i += 1;
@@ -466,7 +474,17 @@ async function main(): Promise<void> {
   process.once('SIGINT', () => quit());
   process.once('SIGTERM', () => quit());
 
-  const demo = await setUp({ artifacts, verbose: opts.verbose });
+  if (opts.apps) {
+    // The desktops inherit this process's environment.
+    process.env.ZRDT_APPS = '1';
+  }
+  const demo = await setUp({
+    artifacts,
+    verbose: opts.verbose,
+    extraGroups: opts.apps
+      ? [{ title: 'Code', founders: ['alice', 'bob', 'carol'] }]
+      : [],
+  });
   // Ctrl-C or `make stop`: Playwright's SIGINT handler exits (130) before
   // tearDown runs, so list the temporary folders (profiles, the mock CDN) for
   // run-demo.sh to remove once the desktops are gone.
@@ -496,6 +514,13 @@ async function main(): Promise<void> {
     }
     await warmUp(first);
     await screenshots(demo, first, 'ready');
+    if (opts.apps) {
+      for (const m of first) {
+        // oxlint-disable-next-line no-await-in-loop
+        const file = await writeAppsEnv(m, path.join(artifacts, 'apps-env'));
+        say(`apps env: ${file}`);
+      }
+    }
     if (opts.autoDoctor) {
       autoDoctor = startAutoDoctor(demo);
     }

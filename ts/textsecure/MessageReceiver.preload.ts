@@ -187,7 +187,7 @@ import type { ConversationAttributesTypeType } from '../model-types.d.ts';
 import { zrdtReceiveLive } from '../zrdt/receive.preload.ts';
 import type { ZrdtLiveStepResult } from '../zrdt/receive.preload.ts';
 import { handleZrdtControlMessage } from '../zrdt/resend.preload.ts';
-import { handleZrdtAppMessage } from '../zrdt/apps/probe.preload.ts';
+import { handleZrdtAppMessage } from '../zrdt/apps/transport.preload.ts';
 import {
   getDataMessageBytes,
   getSyncSentDataMessageBytes,
@@ -2724,13 +2724,13 @@ export default class MessageReceiver
       );
       return;
     }
-    // zrdt apps (Content 205): app records. PROTOTYPE (apps-map).
+    // zrdt apps (Content 205): app records (zrdt docs/apps/BUILD_M1.md
+    // §B.9). The record and its opening are stored before the envelope
+    // leaves the cache; the pieces are fetched after.
     if (content.content?.zrdtApp) {
       try {
         await handleZrdtAppMessage({
           senderAci: envelope.sourceServiceId,
-          senderDevice: envelope.sourceDevice,
-          timestamp: envelope.timestamp,
           message: content.content.zrdtApp,
           plaintext,
         });

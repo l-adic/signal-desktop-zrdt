@@ -31,11 +31,11 @@ import type { MessageModel } from '../models/messages.preload.ts';
 import { enqueueReactionForSend } from '../reactions/enqueueReactionForSend.preload.ts';
 import { sleep } from '../util/sleep.std.ts';
 import {
-  appProbeListen,
-  appProbeReceived,
-  appProbeRefetch,
-  appProbeSend,
-} from './apps/probe.preload.ts';
+  appsEndpointInfo,
+  appsRepairStatus,
+  appsStatus,
+} from './apps/transport.preload.ts';
+import { setDemoVillain } from './apps/demoHooks.std.ts';
 
 /** The message of `conversationId` sent at `sentAt`, from the cache or the DB. */
 async function findSentAt(
@@ -160,11 +160,13 @@ export type ZrdtCIHooks = {
     scanned: number;
     hits: Array<{ text: string; id: string; type: string; where: string }>;
   }>;
-  // PROTOTYPE (apps-map): ts/zrdt/apps/probe.preload.ts
-  appProbeListen: typeof appProbeListen;
-  appProbeSend: typeof appProbeSend;
-  appProbeReceived: typeof appProbeReceived;
-  appProbeRefetch: typeof appProbeRefetch;
+  // zrdt apps (ts/zrdt/apps/transport.preload.ts): the announcements of a
+  // group (no pointers, no openings), a repair's status, the endpoint, and
+  // the demo villain of this desktop (BUILD_M1 §A.1: Dave tampers).
+  appsStatus: typeof appsStatus;
+  appsRepairStatus: typeof appsRepairStatus;
+  appsEndpointInfo: () => ReturnType<typeof appsEndpointInfo> | null;
+  appsSetVillain: (mode: 'tamper' | null) => void;
 };
 
 /** The body a zrdt opening (nonce ‖ DataMessage) commits, if it decodes. */
@@ -436,10 +438,10 @@ export function installZrdtCIHooks(): void {
       }
       return { scanned: all.length, hits };
     },
-    appProbeListen,
-    appProbeSend,
-    appProbeReceived,
-    appProbeRefetch,
+    appsStatus,
+    appsRepairStatus,
+    appsEndpointInfo: () => appsEndpointInfo() ?? null,
+    appsSetVillain: mode => setDemoVillain(mode ?? undefined),
   };
   setZrdtCIHooks(hooks);
 }
