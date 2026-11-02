@@ -1,0 +1,6 @@
+{
+  "name": "zbt",
+  "private": true,
+  "description": "zbt: share a file with a Signal group through zrdt (README.md)",
+  "type": "module"
+}

@@ -24,7 +24,7 @@ KIT_ARGS ?=
 ZRDTD := zrdt/core/.lake/build/bin/zrdtd
 ELECTRON_APP := node_modules/electron/dist/Electron.app
 
-.PHONY: help tools install built run smoke stop proofs comparator kit
+.PHONY: help tools install built run smoke smoke-apps stop proofs comparator kit
 
 help: ## Show this help
 	@echo "Usage: make install && make run"
@@ -86,6 +86,9 @@ run: built ## Live demo: Alice, Bob, Carol linked, the villain's panel in the br
 
 smoke: built ## Smoke test (beats 1-5, headless-ish); exit 0 only if every check passes (SMOKE_ARGS=...)
 	demo/run-demo.sh --smoke $(SMOKE_ARGS)
+
+smoke-apps: built ## Apps smoke: the torrent beat on the mock server (SMOKE_ARGS="--plan": no desktops)
+	LEAN_ABORT_ON_PANIC=1 node --import tsx demo/smoke-apps.ts $(SMOKE_ARGS)
 
 stop: ## Stop desktops a crashed run left behind (STOP_ARGS="--port N" if not 7357)
 	demo/run-demo.sh --stop $(STOP_ARGS)

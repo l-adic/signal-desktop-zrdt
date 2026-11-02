@@ -1,0 +1,17 @@
+{
+  "$schema": "../../node_modules/oxlint/configuration_schema.json",
+  // tools/zbt holds a Node CLI that plain `node` runs (type stripping),
+  // outside Signal's ts/ suffix scheme, like demo/.
+  "extends": ["../../.oxlintrc.json"],
+  "overrides": [
+    {
+      "files": ["**/*.ts"],
+      "env": { "node": true },
+      "rules": {
+        "signal-desktop/enforce-file-suffix": "off",
+        "signal-desktop/enforce-license-comments": "off",
+        "eslint/no-restricted-globals": ["error"]
+      }
+    }
+  ]
+}

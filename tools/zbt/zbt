@@ -1,0 +1,8 @@
+#!/bin/sh
+# Copyright 2026 zrdt contributors
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# zbt: share a file with a Signal group through zrdt (tools/zbt/README.md).
+# Node 24 runs zbt.ts directly (it strips the types); no install step.
+here=$(cd "$(dirname "$0")" && pwd)
+exec node "$here/zbt.ts" "$@"
