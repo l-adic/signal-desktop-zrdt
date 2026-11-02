@@ -312,3 +312,49 @@ Decide quickly: losing more than 20 s means switching to the fallback.
 - TODO(F3): trim `libsignal-client` and `ringrtc` prebuilds for other
   platforms from the kit (about 200 MB); remove the `mock-signal-*` profile
   folders that runs leave in `$TMPDIR`.
+
+## Apps (M1): the torrent beat
+
+Status: built on the fork's side against a scripted stand-in for lane transport's API (the lane
+torrent-ui, 2026-11-02). It plays on desktops once lane transport's endpoint, the dialog wiring
+and Dave's `setVillain` hook land. Source: zrdt `docs/apps/BUILD_M1.md` §A.1. Group "Camping":
+Alice, Bob, Carol, Dave.
+
+**Run it.**
+
+- `make smoke-apps SMOKE_ARGS="--plan"` checks the beat's own parts in seconds, with no desktops:
+  - the CDN villain on a scratch folder laid out like the mock's store;
+  - a dress rehearsal of Carol's repair on the torrent manager. Her row must read exactly what the
+    live beat checks.
+- `make smoke-apps SMOKE_ARGS="--background --port 7472"` plays the beat on four desktops, with
+  one check per step. It refuses to start while another demo, smoke or beat runs. The results are
+  in `demo/artifacts/smoke-apps/run.json`.
+
+**Each member's terminal.** `zbt` finds its desktop through `ZRDT_ENDPOINT`, the path of
+`<userData>/zrdt-apps.json`. See `tools/zbt/README.md`.
+
+| Do                                                                               | The audience sees                                                                                                                                                                                       |
+| -------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Carol quits her app (in the smoke, the server holds what is sent to her)         | Carol's window closes                                                                                                                                                                                   |
+| Alice's terminal: `zbt share ~/trip.mp4 --group Camping`                         | Alice's window: "Share trip.mp4 (20 MiB) with Camping (4 members)?"                                                                                                                                     |
+| Alice: **Share**                                                                 | Alice's row: 20 cells turn green, then "Shared with 4 members: every piece checked"                                                                                                                     |
+| (nothing)                                                                        | Bob's and Dave's rows fill by themselves: "Checked: every piece passed its check", **Show in folder**                                                                                                   |
+| Alice quits her app. Panel (or the smoke): delete pieces 3, 7 and 12, corrupt 15 |                                                                                                                                                                                                         |
+| Carol starts her app                                                             | Carol's row: 16 green cells, 4 yellow ones (3, 7, 12, 15: "could not be downloaded" or "did not arrive intact; asking members"). They turn blue as Bob's copies pass; piece 3 after Alice's 5 s timeout |
+| (nothing)                                                                        | Carol: "pieces 3, 7, 12 and 15 resent by Bob" and, in red, "piece 7 from Dave failed its check". Bob's and Dave's rows show no such line                                                                |
+
+Say: "The server deleted three pieces and damaged a fourth. Signal's own check caught the damage.
+Carol's app asked the others. Dave sent a bad piece 7, and zrdt's check caught that: only Carol
+is told, and Bob's copy is taken instead. Everyone who finishes holds the same bytes, and Lean
+proves that."
+
+Claims and theorems (BUILD_M1 §A.1, §C.2):
+
+- The missing list is exact (`run_complete_missing`).
+- Every byte is checked, whether it came from the CDN or from a member (`run_piece_accept`).
+- Repair content goes only to the members the announcement seats (`serve_pieces`,
+  `pieces_follow_announcement`).
+- Everyone who completes holds the same bytes (`assemble_unique`).
+
+Do not say that zrdt caught the server: Signal's MAC catches the server, and zrdt's check
+catches members.
