@@ -82,6 +82,14 @@ import type {
   RemoteMegaphoneId,
   RemoteMegaphoneType,
 } from '../types/Megaphone.std.ts';
+import type {
+  UpsertZrdtProvenanceOptionsType,
+  ZrdtBoundaryRowType,
+  ZrdtPendingRowType,
+  ZrdtProvenanceRowType,
+  ZrdtRecordRowType,
+  ZrdtStoreModeType,
+} from '../types/Zrdt.std.ts';
 import { sqlFragment, sqlId, sqlJoin } from './util.std.ts';
 import type { MIMEType } from '../types/MIME.std.ts';
 import type { Emoji } from '../axo/emoji.std.ts';
@@ -1139,6 +1147,19 @@ type ReadableInterface = {
   ) => ReadonlyArray<PinnedMessagePreloadData>;
   getNextExpiringPinnedMessageAcrossConversations: () => PinnedMessage | null;
 
+  // zrdt (ts/sql/server/zrdt.std.ts)
+  getZrdtRecords: (conversationId: string) => Array<ZrdtRecordRowType>;
+  getZrdtConversationIds: () => Array<string>;
+  getZrdtPending: (conversationId: string) => Array<ZrdtPendingRowType>;
+  getZrdtProvenance: (conversationId: string) => Array<ZrdtProvenanceRowType>;
+  getMessageIdsByZrdtDigest: (
+    conversationId: string,
+    digests: ReadonlyArray<string>
+  ) => Array<{ digest: string; messageId: string }>;
+  getZrdtGapMessageIds: (conversationId: string) => Array<string>;
+  getZrdtStoreMode: (conversationId: string) => ZrdtStoreModeType;
+  getZrdtBoundary: (conversationId: string) => Array<ZrdtBoundaryRowType>;
+
   getMessagesNeedingUpgrade: (
     limit: number,
     options: { maxVersion: number }
@@ -1545,6 +1566,32 @@ type WritableInterface = {
   deleteAllExpiredPinnedMessagesBefore: (
     beforeTimestamp: number
   ) => ReadonlyArray<PinnedMessage>;
+
+  // zrdt (ts/sql/server/zrdt.std.ts)
+  insertZrdtRecord: (row: ZrdtRecordRowType) => boolean;
+  insertZrdtRecords: (rows: ReadonlyArray<ZrdtRecordRowType>) => number;
+  deleteZrdtRecords: (
+    conversationId: string,
+    digests: ReadonlyArray<Uint8Array<ArrayBuffer>>
+  ) => number;
+  insertZrdtPending: (row: ZrdtPendingRowType) => void;
+  deleteZrdtPending: (
+    conversationId: string,
+    digests: ReadonlyArray<Uint8Array<ArrayBuffer>>
+  ) => number;
+  upsertZrdtProvenance: (
+    rows: ReadonlyArray<ZrdtProvenanceRowType>,
+    options?: UpsertZrdtProvenanceOptionsType
+  ) => void;
+  markZrdtDisowned: (
+    conversationId: string,
+    digests: ReadonlyArray<Uint8Array<ArrayBuffer>>,
+    disownedBy: string
+  ) => number;
+  deleteZrdtForConversation: (conversationId: string) => void;
+  setZrdtStoreMode: (conversationId: string, mode: ZrdtStoreModeType) => void;
+  insertZrdtBoundary: (rows: ReadonlyArray<ZrdtBoundaryRowType>) => number;
+  archiveZrdtConversation: (conversationId: string, archiveId: string) => void;
 
   getAndProtectExistingAttachmentPath: ({
     plaintextHash,

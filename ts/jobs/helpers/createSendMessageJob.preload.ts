@@ -16,6 +16,8 @@ import { handleMessageSend } from '../../util/handleMessageSend.preload.ts';
 import type { SharedMessageOptionsType } from '../../textsecure/SendMessage.preload.ts';
 import { strictAssert } from '../../util/assert.std.ts';
 import { wrapWithSyncMessageSend } from '../../util/wrapWithSyncMessageSend.preload.ts';
+import { getMessageById } from '../../messages/getMessageById.preload.ts';
+import { getZrdtEditRecipients } from '../../zrdt/quote.preload.ts';
 import {
   handleMultipleSendErrors,
   maybeExpandErrors,
@@ -30,6 +32,12 @@ export type SendMessageJobOptions<Data> = Readonly<{
     data: Data
   ) => Omit<SharedMessageOptionsType, 'recipients'>;
   getExpirationStartTimestamp: (data: Data) => number | null;
+  /**
+   * zrdt target rule (JOIN_PLAN §8.3): the message this one points at (a pin
+   * or unpin names its author and sent timestamp). If it has a committed
+   * audience, only its seats ∩ the current recipients get this message.
+   */
+  getTargetMessageId?: (data: Data) => string | null;
 }>;
 
 export function createSendMessageJob<Data>(
@@ -47,6 +55,7 @@ export function createSendMessageJob<Data>(
       getMessageId,
       getMessageOptions,
       getExpirationStartTimestamp,
+      getTargetMessageId,
     } = options;
 
     const logId = `${sendName}(${conversation.idForLogging()}/${job.timestamp})`;
@@ -57,17 +66,37 @@ export function createSendMessageJob<Data>(
       return;
     }
 
-    const {
-      allRecipientServiceIds,
-      recipientServiceIdsWithoutMe,
-      untrustedServiceIds,
-    } = getSendRecipientLists({
+    const lists = getSendRecipientLists({
       log,
       conversation,
       conversationIds: isSyncOnly(data)
         ? [window.ConversationController.getOurConversationIdOrThrow()]
         : Array.from(conversation.getMemberConversationIds()),
     });
+    const { untrustedServiceIds } = lists;
+    let { allRecipientServiceIds, recipientServiceIdsWithoutMe } = lists;
+    const targetId = getTargetMessageId?.(data);
+    const target =
+      targetId != null && isGroupV2(conversation.attributes)
+        ? await getMessageById(targetId)
+        : undefined;
+    if (target) {
+      const before = recipientServiceIdsWithoutMe.length;
+      allRecipientServiceIds = getZrdtEditRecipients(
+        target.attributes,
+        allRecipientServiceIds
+      );
+      recipientServiceIdsWithoutMe = getZrdtEditRecipients(
+        target.attributes,
+        recipientServiceIdsWithoutMe
+      );
+      if (recipientServiceIdsWithoutMe.length < before) {
+        log.info(
+          `zrdt target rule: ${before - recipientServiceIdsWithoutMe.length} ` +
+            "recipient(s) are not in the target's audience"
+        );
+      }
+    }
 
     if (untrustedServiceIds.length > 0) {
       window.reduxActions.conversations.conversationStoppedByMissingVerification(

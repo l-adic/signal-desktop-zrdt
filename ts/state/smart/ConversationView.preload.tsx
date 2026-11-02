@@ -8,6 +8,7 @@ import { ConversationView } from '../../components/conversation/ConversationView
 import { SmartCompositionArea } from './CompositionArea.preload.tsx';
 import { SmartConversationHeader } from './ConversationHeader.preload.tsx';
 import { SmartTimeline } from './Timeline.preload.tsx';
+import { SmartZrdtConversationBanners } from './ZrdtConversationBanners.preload.tsx';
 import { getSelectedMessageIds } from '../selectors/conversations.dom.ts';
 import { getActivePanel, getIsPanelAnimating } from '../selectors/nav.std.ts';
 import { useComposerActions } from '../ducks/composer.preload.ts';
@@ -19,7 +20,13 @@ function renderCompositionArea(conversationId: string) {
 }
 
 function renderConversationHeader(conversationId: string) {
-  return <SmartConversationHeader id={conversationId} />;
+  return (
+    <>
+      <SmartConversationHeader id={conversationId} />
+      {/* zrdt: rejected / unavailable / own-name banners, unconfirmed section */}
+      <SmartZrdtConversationBanners conversationId={conversationId} />
+    </>
+  );
 }
 
 function renderTimeline(conversationId: string) {

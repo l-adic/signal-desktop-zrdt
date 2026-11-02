@@ -1,0 +1,202 @@
+<!-- Copyright 2026 zrdt contributors -->
+<!-- SPDX-License-Identifier: AGPL-3.0-only -->
+
+# demo/: the villain, the launch harness, the doctor, the smoke test
+
+Everything here runs from the repository root with Node 24 and `tsx`. Build
+`zrdtd` first: `cd zrdt/core && lake build` (the harness finds
+`zrdt/core/.lake/build/bin/zrdtd`; set `ZRDT_DAEMON` to use another one).
+
+## Quick start
+
+```sh
+git clone --recurse-submodules -b zrdt https://github.com/l-adic/signal-desktop-zrdt.git
+cd signal-desktop-zrdt
+make install    # zrdtd (Lean), node_modules, Electron, generated files
+make run        # the live demo
+```
+
+Prerequisites: macOS on Apple silicon, git, Node v24.22.0 (`.nvmrc`), pnpm
+11.24.0 (`corepack enable`, or `npm install -g pnpm@11.24.0`), and elan
+(`lake`). `make install` checks them first and says what is missing.
+
+`make run` opens three Signal desktops (Alice, Bob, Carol) linked to a local
+mock server, sends the warm-up messages to group "Camping", and opens the
+villain's control panel in the browser (default http://127.0.0.1:7357/);
+then follow [DEMO.md](DEMO.md). Ctrl-C closes everything. Other targets:
+`make smoke` (the go/no-go test, exit 0 only if every check passes),
+`make stop`, `make proofs` (the Lean proofs in `zrdt/`: heavy, the Mathlib
+cache and a build of about 5 minutes on 32 cores, about 9 GB of disk; best
+on Linux; not needed for `make run`), `make comparator` (Linux only,
+memory-heavy: see `zrdt/README.md`, "Running Comparator"), `make kit` (the
+MacBook demo kit), `make help`. `make run` leaves nothing in `$TMPDIR`: the
+desktop profiles are removed after Ctrl-C or `make stop` too.
+
+| File         | What it does                                                                                                                                                                                 |
+| ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `rules.ts`   | the villain's rules as pure functions: `dropGroupMsg(from, to)` (once, sends to ≥ 2 accounts from the inferred sender), `blackhole(to)`, `hold(to)`, `holdCatchUp(joiner, offline)` (beat 5) |
+| `evil.ts`    | `EvilServer`: Signal's mock server with the rules in front of the linked desktops (`handleMessage` + `prepareMultiDeviceMessage`); `arm`, `release(to)`, `clear()`                           |
+| `panel.ts`   | the control panel: HTTP on 127.0.0.1 and a one-page HTML front end                                                                                                                           |
+| `harness.ts` | the demo world: four phones (Alice, Bob, Carol, Dave), group "Camping", link, tile, warm-up, restart, teardown                                                                               |
+| `launch.ts`  | the live demo: links Alice, Bob, Carol; warms up; starts the panel; links Dave on demand; `--beat5` plays and checks beat 5                                                                  |
+| `beat5.ts`   | the `--beat5` check: beat 5 the way the presenter plays it (panel, Settings → Internal clicks, typing), with Dave's window checked at each step                                              |
+| `doctor.ts`  | beats 4 and 5: edits an exported store                                                                                                                                                       |
+| `smoke.ts`   | the F2 go/no-go test: beats 1–5 through the harness and the panel, then beat 6 (a member added later catches up, JOIN_PLAN)                                                                  |
+
+## Live demo
+
+```sh
+node --import tsx demo/launch.ts          # add --link-dave to link Dave at once
+# open the panel URL it prints (default http://127.0.0.1:7357/)
+```
+
+It sets `SIGNAL_MOCK_TESTS_BACKGROUND=1`, `ZRDT_DAEMON`,
+`ZRDT_RESEND_DELAY_MS=4000` and `ZRDT_AUTHOR_FASTPATH_DELAY_MS=3000` (how long
+beat 2's copy reads "relayed by Bob" before "confirmed by Alice") for the
+desktops (an existing value wins). Startup to READY takes about 7 s on the Mac
+mini. Ctrl-C closes everything.
+
+`doctor.ts` runs by itself on the live exports (`--no-auto-doctor` turns it
+off): when Carol clicks Settings → Internal → Export store, one linked,
+non-head record is removed from her file in place (beat 4; the original is
+kept as `.orig`); when Bob exports for Dave (Export for: Dave) and Dave's
+desktop is linked, two fakes by Bob are appended in a section sealed to
+Dave's key and the result is written where Dave's Import file reads (beat 5).
+Bob's own export is left alone (only Bob's account could import it), with a
+hint in the terminal. The terminal prints what it did (`auto-doctor, beat 4
+(Carol's export): removed ·61b5 …`).
+
+Dave is a member from the group's creation, so his new desktop would catch
+up from Alice by itself about 1.5 s after it links (zrdt JOIN_PLAN §6.1), and
+the import would add only the two fakes. So the panel's **Link Dave's
+desktop** first arms beat 5's villain rule, `holdCatchUp` ("Alice, Bob and
+Carol offline: hold Dave's catch-up (1:1 messages to their desktops wait;
+clear drops them)"), listed on the panel and printed in the terminal. The
+server holds every 1:1 message to Alice's, Bob's and Carol's desktops (Dave's
+catch-up requests are sealed 1:1 messages it cannot read, so receipts wait
+too); group messages pass. Dave's chat stays empty, and the import brings all
+eleven messages, unconfirmed. **clear (villain off)** at the end drops what
+the rule held instead of delivering it: answered late, the catch-up would add
+the nine messages again under the live ones. `--link-dave` arms nothing.
+
+### Presenter clicks, beats 4 and 5
+
+- Beat 4: Carol: Settings → Internal → **Export store**; (auto-doctor); Carol:
+  **Import file** (back to the chat: red banner "This copy of the chat does not
+  verify: message ·xxxx is missing"); **Keep what verifies** ("Kept N messages
+  that verify. Dropped 1 message: ·yyyy."); **OK**.
+- Beat 5: panel **Link Dave's desktop** (arms "hold Dave's catch-up" first;
+  Dave's chat stays empty); Bob: Settings → Internal → **Export for: Dave** →
+  **Export store**, back to Camping; (auto-doctor); Dave: Settings → Internal
+  → **Import file** (back to Camping by itself); expand "11 messages not yet
+  confirmed by any member"; Alice writes (the nine genuine messages are
+  confirmed, the fakes stay unconfirmed); Bob writes (the fakes read "not
+  confirmed by Bob"); panel **clear (villain off)** (nothing changes on
+  screen).
+
+Panel routes (also usable with curl):
+
+```sh
+P=http://127.0.0.1:7357
+curl -X POST "$P/rules/dropGroupMsg?from=alice&to=carol"   # beat 2
+curl -X POST "$P/rules/blackhole?to=carol"                 # beat 3
+curl -X POST "$P/rules/hold?to=carol"; curl -X POST "$P/rules/release?to=carol"
+curl -X POST "$P/rules/holdCatchUp?to=dave"               # beat 5 (link-dave arms it)
+curl -X POST "$P/clear"                                    # villain off, held mail delivered
+                                                           # (holdCatchUp's is dropped)
+curl "$P/rules"; curl "$P/log?n=50"
+curl -X POST "$P/actions/link-dave"                        # just before beat 5
+curl -X POST "$P/actions/export" -d '{"member":"carol"}'    # rehearsal: the T3 export hook
+curl -X POST "$P/actions/doctor-remove"                    # beat 4, on Carol's export, in place
+curl -X POST "$P/actions/import" -d '{"member":"carol"}'
+curl -X POST "$P/actions/export" -d '{"member":"bob","for":"dave"}'  # Bob's export for Dave
+curl -X POST "$P/actions/doctor-append"                    # beat 5: Bob's export for Dave -> Dave's import path
+curl -X POST "$P/actions/import" -d '{"member":"dave"}'
+curl -X POST "$P/actions/send" -d '{"member":"alice","text":"hi"}'
+curl -X POST "$P/actions/restart" -d '{"member":"carol"}'  # app.close(); app.start()
+curl -X POST "$P/actions/quit"
+```
+
+Exports go to `<profile>/zrdt-export-<conversation id>.bin`, and Import reads
+the same path for the importing desktop. Two kinds, both JSON (zrdt
+JOIN_PLAN §4.5; layouts in `ts/state/ducks/zrdt.preload.ts`):
+
+- **Own export** (`{"zrdtDump": 1, "account", "blob", "content"}`): the store
+  blob, readable (structure only: digests, authors, links), and the content
+  (the openings SERVE gives the exporter's own account) sealed to that
+  account's identity key. Only that account imports it (MERGE, then each
+  opening checked with zrdtd's ACCEPT_RECORD); another account's own export
+  is refused.
+- **Export for a member X** (`{"zrdtExport": 2, "from", "to", "group", "key",
+"sections"}`): SERVE's reply for X (X's ACI and key, catch-up, the export
+  flag), sealed to X's key. X imports it with ACCEPT_VIEW in import mode;
+  it holds only what SERVE gives X.
+
+Import keeps an opening only if its own committed audience seats the
+importer under the tag of its key and it opens a record in the store; the
+unconfirmed section shows that text for records without a message row (in
+memory only for now). `doctor-remove` edits Carol's own export's blob in
+place (the original is kept as `.orig`), and `doctor-append` appends fakes to
+Bob's export for Dave, in a new section sealed to Dave's key, and writes
+Dave's import path (Dave must be linked first). Both take an explicit `file`
+instead (`~/` allowed).
+
+## Doctor
+
+```sh
+node --import tsx demo/doctor.ts show   Camping.zrdt
+node --import tsx demo/doctor.ts remove Camping.zrdt [out] [--digest 9ac1]   # beat 4
+node --import tsx demo/doctor.ts append Camping.zrdt [out] --author <Bob's ACI>   # beat 5
+```
+
+`remove` parses only the blob framing and records, drops one linked, non-head
+record (by default one a head links), and fixes the count; OPEN then fails
+with that digest in `missing`. `append` drives `zrdtd`: OPEN under a scratch
+chat key, ACCEPT two records by the author whose links are the current heads
+(random commits), ENCODE, and a check that the result passes OPEN.
+
+`doctor.ts` accepts the app's JSON dump (the blob as base64 plus a content
+section; `remove` drops the removed record's content entry too), a raw store
+blob, or a binary container holding it (a u32 length right before it is fixed
+up).
+
+## Tests
+
+```sh
+node --import tsx --test demo/*_test.ts          # rules, panel, doctor (+ zrdtd)
+node --import tsx demo/smoke.ts                  # launches up to five desktops
+node --import tsx demo/launch.ts --beat5 --port 7465   # beat 5 of the live demo, checked
+```
+
+`launch.ts --beat5` (or `run-demo.sh --beat5`) starts the live demo, types
+the script's lines of beats 1 to 3, then plays beat 5 as DEMO.md has it:
+the panel's link-dave route, Bob's Settings → Internal → Export for: Dave →
+Export store and the Chats tab, the auto-doctor, Dave's Import file, one
+click on the section, Alice and Bob typing, the panel's clear. It checks
+that the link arms "hold Dave's catch-up" and Dave's chat stays empty (his
+catch-up request held), that the file is an export for Dave with no text in
+the clear, that Dave's import is accepted and returns to the chat with all
+eleven messages unconfirmed, that Alice's message confirms the nine genuine
+ones and not the two fakes, that Bob's message turns the fakes "not confirmed
+by Bob", and that the clear empties the panel without changing Dave's
+window. It
+writes `beat5.json` (checks and step timings) and `beat5-*.png` to
+`demo/artifacts/demo/` and exits 0 only if every check passes.
+
+`smoke.ts` tags each check `harness` or `zrdt`, writes
+`demo/artifacts/smoke/run.json` (every check with `atMs`/`ms`, and
+`beatTimings`) and screenshots, and exits 0 only when every check passes (GO).
+`ZRDT_SMOKE_BEATS=1,2` runs a subset (beat 1 always runs). It drives beats 4
+and 5 through the zrdt hooks (export, import) and doctor.ts in-process, and
+clicks the banner's "Keep what verifies".
+
+The smoke's group differs from the live demo's: Erin, not Dave, is the fourth
+member from the start and imports in beat 5; Dave joins only in beat 6. There
+`addToGroup` (harness.ts) adds him the way Alice's phone would: the mock has
+no `addMembers` change of its own, so the harness applies one to the server's
+group (signed by the server) and sends the group update to every linked
+desktop. Dave then links a desktop with no store. It catches up from Alice
+(sealed SERVE replies into a relative store), and the beat checks that it
+holds every message sent after the add, a boundary row, no pre-join content in
+its messages table, zrdt tables or window, the same heads as Alice; and that a
+pre-join digest Dave asks for by itself comes back as a bare digest.

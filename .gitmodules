@@ -1,0 +1,4 @@
+[submodule "zrdt"]
+	path = zrdt
+	url = ../zrdt.git
+	branch = main

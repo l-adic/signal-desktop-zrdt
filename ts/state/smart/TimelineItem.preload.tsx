@@ -29,6 +29,7 @@ import {
 } from '../../util/timelineUtil.std.ts';
 
 import { SmartContactName } from './ContactName.preload.tsx';
+import { renderZrdtGap } from './ZrdtGapRow.preload.tsx';
 import { SmartUniversalTimerNotification } from './UniversalTimerNotification.dom.tsx';
 import { isSameDay } from '../../util/timestamp.std.ts';
 import { renderAudioAttachment } from './renderAudioAttachment.preload.tsx';
@@ -312,6 +313,7 @@ export const SmartTimelineItem = memo(function SmartTimelineItem(
       retryMessageSend={retryMessageSend}
       sendPollVote={sendPollVote}
       renderItem={renderItem}
+      renderZrdtGap={renderZrdtGap}
       returnToActiveCall={returnToActiveCall}
       saveAttachment={saveAttachment}
       saveAttachments={saveAttachments}

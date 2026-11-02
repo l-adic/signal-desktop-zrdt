@@ -146,6 +146,8 @@ export type OutgoingQuoteType = Readonly<{
   text?: string;
   attachments: ReadonlyArray<OutgoingQuoteAttachmentType>;
   bodyRanges?: ReadonlyArray<RawBodyRange>;
+  // zrdt: a stripped quote's target digest (ts/zrdt/quote.preload.ts)
+  zrdtRef?: Uint8Array<ArrayBuffer>;
 }>;
 
 export type OutgoingLinkPreviewType = Readonly<{
@@ -206,6 +208,17 @@ export type SendDeleteForEveryoneType = Readonly<{
   targetAuthorAci: AciString;
 }>;
 
+// zrdt: DataMessage.zrdt for an in-scope group message (zrdt APP.md §4),
+// and the audience, DataMessage.zrdtAudience (field 201, JOIN_PLAN §3.2).
+// Set only by ts/zrdt/send.preload.ts when it freezes a send.
+export type ZrdtMetaSendType = Readonly<{
+  links: ReadonlyArray<Uint8Array<ArrayBuffer>>;
+  nonce: Uint8Array<ArrayBuffer>;
+  version: number;
+  disown: ReadonlyArray<Uint8Array<ArrayBuffer>>;
+  audience: Uint8Array<ArrayBuffer>;
+}>;
+
 export type SharedMessageOptionsType = Readonly<{
   // required
   timestamp: number;
@@ -230,6 +243,7 @@ export type SharedMessageOptionsType = Readonly<{
   storyContext?: StoryContextType;
   targetTimestampForEdit?: number;
   unpinMessage?: SendUnpinMessageType;
+  zrdt?: ZrdtMetaSendType;
 }>;
 
 export type MessageOptionsType = Readonly<
@@ -318,6 +332,8 @@ class Message {
 
   pollVote?: OutgoingPollVote;
 
+  zrdt?: ZrdtMetaSendType;
+
   constructor(options: MessageOptionsType) {
     this.attachments = options.attachments || [];
     this.body = options.body;
@@ -335,6 +351,7 @@ class Message {
     this.sticker = options.sticker;
     this.reaction = options.reaction;
     this.pollCreate = options.pollCreate;
+    this.zrdt = options.zrdt;
     this.timestamp = options.timestamp;
     this.deleteForEveryone = options.deleteForEveryone;
     this.groupCallUpdate = options.groupCallUpdate;
@@ -539,6 +556,7 @@ class Message {
           };
         }),
         bodyRanges: this.quote.bodyRanges?.map(toBodyRange) ?? null,
+        zrdtRef: this.quote.zrdtRef ?? null,
       };
 
       if (quote?.bodyRanges?.length) {
@@ -714,6 +732,17 @@ class Message {
       pollCreate,
       pinMessage,
       unpinMessage,
+
+      // zrdt: present (even with no links) on in-scope group sends only
+      zrdt: this.zrdt
+        ? {
+            links: this.zrdt.links.slice(),
+            nonce: this.zrdt.nonce,
+            version: this.zrdt.version,
+            disown: this.zrdt.disown.slice(),
+          }
+        : null,
+      zrdtAudience: this.zrdt ? this.zrdt.audience : null,
 
       // Handled separately
       pollVote: null,
@@ -915,6 +944,8 @@ export class MessageSender {
       pinMessage: null,
       unpinMessage: null,
       adminDelete: null,
+      zrdt: null,
+      zrdtAudience: null,
     };
   }
 
@@ -1007,6 +1038,8 @@ export class MessageSender {
       pinMessage: null,
       unpinMessage: null,
       adminDelete: null,
+      zrdt: null,
+      zrdtAudience: null,
     };
   }
 
@@ -1205,6 +1238,7 @@ export class MessageSender {
       pinMessage,
       unpinMessage,
       pollCreate,
+      zrdt,
     } = options;
 
     if (!groupV2) {
@@ -1256,6 +1290,7 @@ export class MessageSender {
       pinMessage,
       unpinMessage,
       pollCreate,
+      zrdt,
     };
   }
 

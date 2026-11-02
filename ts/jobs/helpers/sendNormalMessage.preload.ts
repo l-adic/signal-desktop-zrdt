@@ -31,6 +31,7 @@ import type { CallbackResultType } from '../../textsecure/Types.d.ts';
 import { isSent } from '../../messages/MessageSendState.std.ts';
 import { isOutgoing, canReact } from '../../state/selectors/message.preload.ts';
 import type {
+  GroupMessageOptionsType,
   ReactionType,
   OutgoingQuoteType,
   OutgoingQuoteAttachmentType,
@@ -56,7 +57,18 @@ import type { QuotedMessageType } from '../../model-types.d.ts';
 
 import { handleMultipleSendErrors } from './handleMultipleSendErrors.std.ts';
 import { ourProfileKeyService } from '../../services/ourProfileKey.std.ts';
-import { sendToGroup } from '../../util/sendToGroup.preload.ts';
+import {
+  sendContentMessageToGroup,
+  sendToGroup,
+} from '../../util/sendToGroup.preload.ts';
+import {
+  getZrdtEnqueueRecipients,
+  getZrdtGroupSendContent,
+  isZrdtGroupSend,
+} from '../../zrdt/send.preload.ts';
+import { applyZrdtQuoteRule } from '../../zrdt/quote.preload.ts';
+import { splitRecipientsByAudience } from '../../zrdt/audiencePlan.std.ts';
+import { SendStatus } from '../../messages/MessageSendState.std.ts';
 import type { DurationInSeconds } from '../../util/durations/index.std.ts';
 import type { ServiceIdString } from '../../types/ServiceId.std.ts';
 import { normalizeAci } from '../../util/normalizeAci.std.ts';
@@ -229,7 +241,7 @@ export async function sendNormalMessage(
       isViewOnce,
       bodyRanges,
       preview,
-      quote,
+      quote: uploadedQuote,
       reaction,
       sticker,
       storyMessage,
@@ -239,6 +251,19 @@ export async function sendNormalMessage(
       log,
       message,
       targetTimestamp,
+    });
+
+    // zrdt (JOIN_PLAN §8.3): the quote rule, on the return value of
+    // uploadMessageQuote, on every attempt. A record (not an edit) can reach
+    // every recipient at enqueue, so all of them are checked.
+    const quote = await applyZrdtQuoteRule({
+      quote: uploadedQuote,
+      conversation,
+      recipients: recipientServiceIdsWithoutMe,
+      extraReceivers: editedMessageTimestamp
+        ? []
+        : getZrdtEnqueueRecipients(message),
+      log,
     });
 
     if (reaction) {
@@ -302,6 +327,9 @@ export async function sendNormalMessage(
       // or sending a story to a group where all other users don't have the stories
       // capabilities (effectively a 'lonely group' in the context of stories)
       log.info('sending sync message only');
+      // TODO(zrdt): for a frozen group message (message.zrdt), sync the frozen
+      // DataMessage bytes instead, so our other zrdt devices get the links.
+      // The demo has one zrdt device per account.
       const dataMessage = await messaging.getDataOrEditMessage({
         attachments,
         body,
@@ -353,29 +381,72 @@ export async function sendNormalMessage(
           'conversationQueue/sendNormalMessage/group',
           async abortSignal => {
             const sendOptions = await getSendOptions(conversation.attributes);
+            const groupSendOptions: GroupMessageOptionsType = {
+              attachments,
+              bodyRanges,
+              contact,
+              expireTimer,
+              groupV2: groupV2Info,
+              isViewOnce,
+              body,
+              preview,
+              profileKey,
+              quote,
+              sticker,
+              storyContext,
+              reaction,
+              pollCreate: poll,
+              targetTimestampForEdit: editedMessageTimestamp
+                ? targetOfThisEditTimestamp
+                : undefined,
+              timestamp: targetTimestamp,
+            };
+
+            // zrdt (APP.md §4): freeze once, then send the frozen Content on
+            // this attempt and every later one, only to recipients in its
+            // audience (JOIN_PLAN §3.2).
+            const zrdtSend = isZrdtGroupSend({
+              isGroupV2: isGroupV2(conversation.attributes),
+              editedMessageTimestamp,
+              groupSendOptions,
+            })
+              ? await getZrdtGroupSendContent({
+                  conversation,
+                  message,
+                  groupSendOptions,
+                  messaging,
+                  log,
+                })
+              : undefined;
+            if (zrdtSend) {
+              if (abortSignal?.aborted) {
+                throw new Error('sendToGroup was aborted');
+              }
+              const { inAudience, outside } = splitRecipientsByAudience(
+                groupV2Info.members,
+                zrdtSend.audienceAcis
+              );
+              if (outside.length > 0) {
+                markZrdtOutsideAudience(message, outside, log);
+              }
+              return sendContentMessageToGroup({
+                contentHint: ContentHint.Resendable,
+                contentMessage: zrdtSend.contentMessage,
+                messageId,
+                recipients: inAudience,
+                sendOptions,
+                sendTarget: conversation.toSenderKeyTarget(),
+                sendType: 'message',
+                story: false,
+                timestamp: targetTimestamp,
+                urgent: true,
+              });
+            }
+
             return sendToGroup({
               abortSignal,
               contentHint: ContentHint.Resendable,
-              groupSendOptions: {
-                attachments,
-                bodyRanges,
-                contact,
-                expireTimer,
-                groupV2: groupV2Info,
-                isViewOnce,
-                body,
-                preview,
-                profileKey,
-                quote,
-                sticker,
-                storyContext,
-                reaction,
-                pollCreate: poll,
-                targetTimestampForEdit: editedMessageTimestamp
-                  ? targetOfThisEditTimestamp
-                  : undefined,
-                timestamp: targetTimestamp,
-              },
+              groupSendOptions,
               messageId,
               sendOptions,
               sendTarget: conversation.toSenderKeyTarget(),
@@ -504,6 +575,28 @@ export async function sendNormalMessage(
       toThrow: originalError || thrownError,
     });
   }
+}
+
+// zrdt: recipients of this attempt outside the frozen audience (added again
+// after the freeze) are never sent the record: marked skipped, so the job
+// does not retry for them.
+function markZrdtOutsideAudience(
+  message: MessageModel,
+  outside: ReadonlyArray<ServiceIdString>,
+  log: LoggerType
+): void {
+  const sendState = { ...message.get('sendStateByConversationId') };
+  const now = Date.now();
+  for (const serviceId of outside) {
+    const id = window.ConversationController.get(serviceId)?.id;
+    if (id !== undefined && sendState[id] !== undefined) {
+      sendState[id] = { status: SendStatus.Skipped, updatedAt: now };
+    }
+  }
+  message.set({ sendStateByConversationId: sendState });
+  log.warn(
+    `zrdt: ${outside.length} recipient(s) outside the audience; skipped`
+  );
 }
 
 function getMessageRecipients({

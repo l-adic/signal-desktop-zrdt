@@ -41,6 +41,7 @@ import type { actions as toast } from './ducks/toast.preload.ts';
 import type { actions as updates } from './ducks/updates.preload.ts';
 import type { actions as user } from './ducks/user.preload.ts';
 import type { actions as username } from './ducks/username.preload.ts';
+import type { actions as zrdt } from './ducks/zrdt.preload.ts';
 
 export type ReduxActions = {
   app: typeof app;
@@ -79,6 +80,7 @@ export type ReduxActions = {
   updates: typeof updates;
   user: typeof user;
   username: typeof username;
+  zrdt: typeof zrdt;
 };
 
 export type StateSelector<T> = Selector<StateType, T>;

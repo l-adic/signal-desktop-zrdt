@@ -121,6 +121,10 @@ export type BootstrapOptions = Readonly<{
 
   // Optional. specify a server to use instead of creating and initializing one.
   server?: Server;
+
+  // Optional. Profile name of this bootstrap's own phone (default 'Myself').
+  // Lets several bootstraps that share one server be told apart.
+  phoneName?: string;
 }>;
 
 export type EphemeralBackupType = Readonly<
@@ -353,7 +357,7 @@ export class Bootstrap {
 
     if (!isStandalone) {
       this.#privPhone = await this.server.createPrimaryDevice({
-        profileName: 'Myself',
+        profileName: this.#options.phoneName ?? 'Myself',
         contacts: this.contacts,
         contactsWithoutProfileKey: this.contactsWithoutProfileKey,
         hasE164,

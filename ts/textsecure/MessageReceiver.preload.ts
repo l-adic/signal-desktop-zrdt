@@ -183,6 +183,14 @@ import {
   ServerTimestampMs,
 } from '@signalapp/types';
 import type { ConversationAttributesTypeType } from '../model-types.d.ts';
+// zrdt (APP.md §5): the receive hook and the resend control messages
+import { zrdtReceiveLive } from '../zrdt/receive.preload.ts';
+import type { ZrdtLiveStepResult } from '../zrdt/receive.preload.ts';
+import { handleZrdtControlMessage } from '../zrdt/resend.preload.ts';
+import {
+  getDataMessageBytes,
+  getSyncSentDataMessageBytes,
+} from '../zrdt/wire.std.ts';
 
 const { isBoolean, isNumber, isString, noop } = lodash;
 
@@ -2088,7 +2096,8 @@ export default class MessageReceiver
 
   async #handleSentMessage(
     envelope: ProcessedEnvelope,
-    sentContainer: ProcessedSent
+    sentContainer: ProcessedSent,
+    plaintext?: Uint8Array<ArrayBuffer>
   ) {
     const logId = `handleSentMessage/${getEnvelopeId(envelope)}`;
     log.info(logId);
@@ -2109,7 +2118,20 @@ export default class MessageReceiver
       throw new Error(`${logId}: message was falsey!`);
     }
 
-    const message = this.#processDecrypted(envelope, msg);
+    // zrdt: accept before the local-policy drops (APP.md §5). Our own
+    // message from another device: author = us, live.
+    const zrdt = await this.#zrdtStep(
+      logId,
+      envelope,
+      msg,
+      plaintext ? getSyncSentDataMessageBytes(plaintext) : undefined,
+      true
+    );
+
+    const message = {
+      ...this.#processDecrypted(envelope, msg),
+      zrdtReceive: zrdt?.info,
+    };
 
     if (message.body && isBodyTooLong(message.body)) {
       const length = Buffer.byteLength(message.body);
@@ -2131,8 +2153,12 @@ export default class MessageReceiver
         unidentifiedStatus,
         message,
         isRecipientUpdate,
-        receivedAtCounter: envelope.receivedAtCounter,
-        receivedAtDate: envelope.receivedAtDate,
+        receivedAtCounter:
+          zrdt?.receivedAtCounter ?? envelope.receivedAtCounter,
+        receivedAtDate:
+          zrdt != null
+            ? ReceivedTimestampMs.fromNumber(zrdt.receivedAtDate)
+            : envelope.receivedAtDate,
         expirationStartTimestamp: TimestampMs.fromBigInt(
           expirationStartTimestamp ?? 0n
         ),
@@ -2446,7 +2472,8 @@ export default class MessageReceiver
 
   async #handleDataMessage(
     envelope: UnsealedEnvelope,
-    msg: Proto.DataMessage
+    msg: Proto.DataMessage,
+    plaintext?: Uint8Array<ArrayBuffer>
   ): Promise<void> {
     const logId = `handleDataMessage/${getEnvelopeId(envelope)}`;
     log.info(logId);
@@ -2470,6 +2497,16 @@ export default class MessageReceiver
       this.#removeFromCache(envelope);
       return undefined;
     }
+
+    // zrdt: accept before the local-policy drops (APP.md §5), so that
+    // members' stores do not diverge over local settings.
+    const zrdt = await this.#zrdtStep(
+      logId,
+      envelope,
+      msg,
+      plaintext ? getDataMessageBytes(plaintext) : undefined,
+      false
+    );
 
     const { profileKey } = msg;
     const hasProfileKey = profileKey && profileKey.length > 0;
@@ -2520,7 +2557,10 @@ export default class MessageReceiver
 
     logUnexpectedUrgentValue(envelope, type);
 
-    const message = this.#processDecrypted(envelope, msg);
+    const message = {
+      ...this.#processDecrypted(envelope, msg),
+      zrdtReceive: zrdt?.info,
+    };
     const groupId = this.#getProcessedGroupId(message);
     const isBlocked = groupId ? this.#isGroupBlocked(groupId) : false;
 
@@ -2551,13 +2591,54 @@ export default class MessageReceiver
           envelope.unidentifiedDeliveryReceived
         ),
         message,
-        receivedAtCounter: envelope.receivedAtCounter,
-        receivedAtDate: envelope.receivedAtDate,
+        receivedAtCounter:
+          zrdt?.receivedAtCounter ?? envelope.receivedAtCounter,
+        receivedAtDate:
+          zrdt != null
+            ? ReceivedTimestampMs.fromNumber(zrdt.receivedAtDate)
+            : envelope.receivedAtDate,
       },
       this.#removeFromCache.bind(this, envelope)
     );
 
     return this.#dispatchAndWait(logId, ev);
+  }
+
+  // zrdt (APP.md §5 steps 1-5): only here are the bytes as sent and the
+  // authenticated sender available together. Never throws.
+  async #zrdtStep(
+    logId: string,
+    envelope: ProcessedEnvelope,
+    msg: Proto.DataMessage,
+    dataMessageBytes: Uint8Array<ArrayBuffer> | undefined,
+    isSync: boolean
+  ): Promise<ZrdtLiveStepResult | undefined> {
+    const { sourceServiceId } = envelope;
+    if (msg.zrdt == null || !msg.groupV2?.masterKey) {
+      return undefined;
+    }
+    if (!isAciString(sourceServiceId)) {
+      return undefined;
+    }
+    try {
+      const groupId = Bytes.fromBase64(
+        // oxlint-disable-next-line typescript/no-non-null-assertion
+        this.#getGroupId(msg)!
+      );
+      return await zrdtReceiveLive({
+        logId,
+        groupId,
+        senderAci: sourceServiceId,
+        isSync,
+        dataMessage: msg,
+        dataMessageBytes,
+        receivedAtCounter: envelope.receivedAtCounter,
+        receivedAtDate: envelope.receivedAtDate,
+      });
+    } catch (error) {
+      log.error(`${logId}: zrdt step failed`, Errors.toLogFormat(error));
+      return undefined;
+    }
   }
 
   async #maybeUpdateTimestamp(
@@ -2627,11 +2708,36 @@ export default class MessageReceiver
       return;
     }
     if (content.content?.syncMessage) {
-      await this.#handleSyncMessage(envelope, content.content.syncMessage);
+      await this.#handleSyncMessage(
+        envelope,
+        content.content.syncMessage,
+        plaintext
+      );
       return;
     }
     if (content.content?.dataMessage) {
-      await this.#handleDataMessage(envelope, content.content.dataMessage);
+      await this.#handleDataMessage(
+        envelope,
+        content.content.dataMessage,
+        plaintext
+      );
+      return;
+    }
+    // zrdt control messages (Content 202-204): SERVE requests, sealed
+    // replies, not-found (JOIN_PLAN §10.1)
+    if (
+      content.content?.zrdtServeRequest ||
+      content.content?.zrdtServed ||
+      content.content?.zrdtNotFound
+    ) {
+      try {
+        await handleZrdtControlMessage({
+          senderAci: envelope.sourceServiceId,
+          content: content.content,
+        });
+      } finally {
+        this.#removeFromCache(envelope);
+      }
       return;
     }
     if (content.content?.nullMessage) {
@@ -2982,7 +3088,8 @@ export default class MessageReceiver
 
   async #handleSyncMessage(
     envelope: UnsealedEnvelope,
-    syncMessage: Proto.SyncMessage
+    syncMessage: Proto.SyncMessage,
+    plaintext?: Uint8Array<ArrayBuffer>
   ): Promise<void> {
     const ourAci = this.#storage.user.getCheckedAci();
 
@@ -3060,7 +3167,11 @@ export default class MessageReceiver
         getEnvelopeId(envelope)
       );
 
-      return this.#handleSentMessage(envelope, sentMessage);
+      return this.#handleSentMessage(
+        envelope,
+        sentMessage,
+        syncMessage.content.sent.message ? plaintext : undefined
+      );
     }
     if (syncMessage.content?.contacts) {
       // Note: this method will download attachment and thus might block

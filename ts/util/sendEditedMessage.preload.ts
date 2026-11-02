@@ -41,6 +41,7 @@ import { timeAndLogIfTooLong } from './timeAndLogIfTooLong.std.ts';
 import { makeQuote } from './makeQuote.preload.ts';
 import { getMessageSentTimestamp } from './getMessageSentTimestamp.std.ts';
 import { itemStorage } from '../textsecure/Storage.preload.ts';
+import { getZrdtEditRecipients } from '../zrdt/quote.preload.ts';
 
 const log = createLogger('sendEditedMessage');
 
@@ -132,9 +133,13 @@ export async function sendEditedMessage(
     window.ConversationController.getOurConversationOrThrow();
   const fromId = ourConversation.id;
 
-  // Create the send state for later use
+  // Create the send state for later use. zrdt (JOIN_PLAN §8.3): an edit of a
+  // record goes only to its seats ∩ the current recipients.
   const recipientMaybeConversations = map(
-    conversation.getRecipients(),
+    getZrdtEditRecipients(
+      targetMessage.attributes,
+      conversation.getRecipients()
+    ),
     identifier => window.ConversationController.get(identifier)
   );
   const recipientConversations = filter(recipientMaybeConversations, isNotNil);

@@ -1,0 +1,1766 @@
+// Copyright 2026 Signal Messenger, LLC
+// SPDX-License-Identifier: AGPL-3.0-only
+// oxlint-disable max-classes-per-file
+
+// The zrdt TypeScript stub: the same semantics as zrdtd, in plain TypeScript.
+//
+// It serves two purposes. The host can be built against it before the Lean
+// daemon exists, and it is the independent reimplementation for the
+// differential test (zrdt PLAN.md section 6, rung 7). It is written from
+// PLAN.md sections 3.3 to 3.5 only, not from the Lean code, so that a test
+// that compares the two finds mistakes in either. Keep it small and plain.
+//
+// Protocol 4 (zrdt docs/JOIN_PLAN.md sections 3.2, 5, 6.2 and 10.2): ACCEPT
+// always takes the opening, and ACCEPT_RECORD may; with an opening, the
+// opening's audience (field 201) is recorded, and an opening without one is
+// refused; AUDIENCE, SERVE and ADDRESSED. A store is closed (NEW, a closed
+// blob) or relative (NEW_RELATIVE, a relative blob): a relative store holds a
+// boundary, digests with no record, each with the ACI that vouched for it;
+// its links resolve to stored records or boundary digests. ACCEPT_VIEW takes
+// a SERVE reply's entries and the host's pending records, in the request's
+// mode (per-digest: a new boundary digest no stored record links is dropped
+// again); LINKABLE gives a new record's links. The store blob is
+// `zrdtS3`: the mode, the boundary, the recorded audiences, then the records
+// as the `zrdtS2` blob of PLAN.md section 3.4.
+
+import { createHash } from 'node:crypto';
+
+import {
+  ACI_BYTES,
+  COMMIT_BYTES,
+  DIGEST_BYTES,
+  GROUP_ID_BYTES,
+  IDENTITY_KEY_BYTES,
+  KEY_TAG_BYTES,
+  MAX_AUDIENCE,
+  MAX_LINKS,
+  NONCE_BYTES,
+  PROTOCOL_VERSION,
+  RECORD_COUNT_LIMIT,
+  REQUEST_ID_BYTES,
+  ZrdtBackendError,
+} from '../ZrdtBackend.std.ts';
+import type {
+  AcceptRecordResult,
+  AcceptResult,
+  AudienceMember,
+  AudienceResult,
+  BackendKind,
+  Bytes,
+  ChatKey,
+  CommitResult,
+  Digest,
+  OpenInput,
+  OpenResult,
+  ProvenanceFact,
+  RecordParts,
+  RecordStatus,
+  Refused,
+  SalvageResult,
+  ServeEntry,
+  ServeMode,
+  ServeReply,
+  ServeRequest,
+  Status,
+  VersionInfo,
+  ViewResult,
+  ZrdtBackend,
+} from '../ZrdtBackend.std.ts';
+import {
+  audienceOfOpening,
+  isEphemeralOpening,
+  parseAudience,
+  seatsUnderTag,
+} from '../audience.std.ts';
+import type { Seat } from '../audience.std.ts';
+import { encodeServeEntries } from './codec.std.ts';
+
+// ---------------------------------------------------------------------------
+// Bytes
+// ---------------------------------------------------------------------------
+
+/** The bytes of an ASCII string. */
+function ascii(text: string): Bytes {
+  const out = new Uint8Array(text.length);
+  for (let i = 0; i < text.length; i += 1) {
+    out[i] = text.charCodeAt(i);
+  }
+  return out;
+}
+
+function concat(parts: ReadonlyArray<Bytes>): Bytes {
+  let length = 0;
+  for (const part of parts) {
+    length += part.length;
+  }
+  const out = new Uint8Array(length);
+  let offset = 0;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.length;
+  }
+  return out;
+}
+
+function equal(a: Bytes, b: Bytes): boolean {
+  if (a.length !== b.length) {
+    return false;
+  }
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i] !== b[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+/** Bytewise order; a proper prefix comes first. */
+export function compareBytes(a: Bytes, b: Bytes): number {
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i += 1) {
+    const x = a[i] ?? 0;
+    const y = b[i] ?? 0;
+    if (x !== y) {
+      return x - y;
+    }
+  }
+  return a.length - b.length;
+}
+
+/** A map key for a digest. */
+function key(digest: Bytes): string {
+  return Buffer.from(
+    digest.buffer,
+    digest.byteOffset,
+    digest.byteLength
+  ).toString('hex');
+}
+
+function u32(value: number): Bytes {
+  const out = new Uint8Array(4);
+  new DataView(out.buffer).setUint32(0, value, false);
+  return out;
+}
+
+function readU32(bytes: Bytes, offset: number): number {
+  return new DataView(
+    bytes.buffer,
+    bytes.byteOffset,
+    bytes.byteLength
+  ).getUint32(offset, false);
+}
+
+export function sha256(...parts: ReadonlyArray<Bytes>): Bytes {
+  const hash = createHash('sha256');
+  for (const part of parts) {
+    hash.update(part);
+  }
+  return new Uint8Array(hash.digest());
+}
+
+function checkSize(name: string, value: Bytes, size: number): void {
+  if (value.length !== size) {
+    throw new ZrdtBackendError(
+      'badInput',
+      `${name} must be ${size} bytes, got ${value.length}`
+    );
+  }
+}
+
+/** Sorted copies of the given digests, each once. */
+function sortedUnique(digests: Iterable<Bytes>): Array<Digest> {
+  const byKey = new Map<string, Bytes>();
+  for (const digest of digests) {
+    byKey.set(key(digest), digest);
+  }
+  return [...byKey.values()]
+    .sort(compareBytes)
+    .map(digest => new Uint8Array(digest));
+}
+
+// ---------------------------------------------------------------------------
+// Records (PLAN.md section 3.4)
+// ---------------------------------------------------------------------------
+
+/** A record in canonical form: its links are strictly sorted. */
+export type StubRecord = Readonly<{
+  group: Bytes;
+  commit: Bytes;
+  links: ReadonlyArray<Digest>;
+  author: Bytes;
+}>;
+
+const RECORD_MAGIC = ascii('zrdt2');
+
+/** Bytes of a record with no links: magic, group, commit, count, author. */
+const RECORD_FIXED_BYTES =
+  RECORD_MAGIC.length + GROUP_ID_BYTES + COMMIT_BYTES + 4 + ACI_BYTES;
+
+/**
+ * The one record constructor: checks the field sizes, copies the bytes,
+ * sorts the links and drops duplicate links.
+ */
+export function makeRecord(parts: RecordParts): StubRecord {
+  checkSize('group', parts.group, GROUP_ID_BYTES);
+  checkSize('commit', parts.commit, COMMIT_BYTES);
+  checkSize('author', parts.author, ACI_BYTES);
+  for (const link of parts.links) {
+    checkSize('link', link, DIGEST_BYTES);
+  }
+  return {
+    group: new Uint8Array(parts.group),
+    commit: new Uint8Array(parts.commit),
+    links: sortedUnique(parts.links),
+    author: new Uint8Array(parts.author),
+  };
+}
+
+/** `"zrdt2" ‖ group(32) ‖ commit(32) ‖ u32 nlinks ‖ links ‖ author(16)` */
+export function encodeRecord(record: StubRecord): Bytes {
+  return concat([
+    RECORD_MAGIC,
+    record.group,
+    record.commit,
+    u32(record.links.length),
+    ...record.links,
+    record.author,
+  ]);
+}
+
+/**
+ * Strict decode: right magic, exact length, links strictly sorted. Returns
+ * undefined for anything else. It does not check the link limit.
+ */
+export function decodeRecord(bytes: Bytes): StubRecord | undefined {
+  if (bytes.length < RECORD_FIXED_BYTES) {
+    return undefined;
+  }
+  if (!equal(bytes.subarray(0, RECORD_MAGIC.length), RECORD_MAGIC)) {
+    return undefined;
+  }
+  let offset = RECORD_MAGIC.length;
+  const group = bytes.slice(offset, offset + GROUP_ID_BYTES);
+  offset += GROUP_ID_BYTES;
+  const commit = bytes.slice(offset, offset + COMMIT_BYTES);
+  offset += COMMIT_BYTES;
+  const count = readU32(bytes, offset);
+  offset += 4;
+  if (bytes.length !== RECORD_FIXED_BYTES + count * DIGEST_BYTES) {
+    return undefined;
+  }
+  const links = new Array<Digest>();
+  for (let i = 0; i < count; i += 1) {
+    const link = bytes.slice(offset, offset + DIGEST_BYTES);
+    const previous = links.at(-1);
+    if (previous !== undefined && compareBytes(previous, link) >= 0) {
+      return undefined;
+    }
+    links.push(link);
+    offset += DIGEST_BYTES;
+  }
+  const author = bytes.slice(offset, offset + ACI_BYTES);
+  return { group, commit, links, author };
+}
+
+/**
+ * How record digests are computed from record encodings. Always SHA-256,
+ * except in tests that need collisions or cycles on purpose.
+ */
+export type RecordHash = (encoded: Bytes) => Digest;
+
+/** The digest of a record: SHA-256 of its encoding. */
+export function hashRecord(
+  record: StubRecord,
+  hash: RecordHash = sha256
+): Digest {
+  return hash(encodeRecord(record));
+}
+
+function toParts(record: StubRecord): RecordParts {
+  return {
+    group: new Uint8Array(record.group),
+    commit: new Uint8Array(record.commit),
+    links: record.links.map(link => new Uint8Array(link)),
+    author: new Uint8Array(record.author),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Commitment (PLAN.md section 3.4)
+// ---------------------------------------------------------------------------
+
+const COMMIT_MAGIC = ascii('zrdtP1');
+
+/** DataMessage.groupV2: holds the group master key. */
+const FIELD_GROUP_V2 = 15;
+/** DataMessage.zrdt: the links themselves. */
+const FIELD_ZRDT = 200;
+
+/** A protobuf varint at `offset`: its value and where the next field starts. */
+function readVarint(
+  bytes: Bytes,
+  offset: number
+): { value: number; next: number } | undefined {
+  let value = 0;
+  let scale = 1;
+  // A varint has at most 10 bytes. Values past 2^53 lose precision, which
+  // is harmless: they only ever serve as lengths, and such a length is
+  // always past the end of the message.
+  for (let i = 0; i < 10; i += 1) {
+    const byte = bytes[offset + i];
+    if (byte === undefined) {
+      return undefined;
+    }
+    value += (byte % 128) * scale;
+    scale *= 128;
+    if (byte < 128) {
+      return { value, next: offset + i + 1 };
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The protobuf message with every top-level field whose number is in `drop`
+ * removed; all other fields are kept byte for byte, in order. Returns
+ * undefined if the bytes are not a sequence of well-formed fields (wire
+ * types 0, 1, 2 and 5 only; field number at least 1).
+ */
+export function removeTopLevelFields(
+  message: Bytes,
+  drop: ReadonlySet<number>
+): Bytes | undefined {
+  const kept = new Array<Bytes>();
+  let offset = 0;
+  while (offset < message.length) {
+    const start = offset;
+    const tag = readVarint(message, offset);
+    if (tag === undefined || tag.value > 0xffffffff) {
+      return undefined;
+    }
+    const field = Math.floor(tag.value / 8);
+    const wireType = tag.value % 8;
+    if (field === 0) {
+      return undefined;
+    }
+    offset = tag.next;
+    if (wireType === 0) {
+      const varint = readVarint(message, offset);
+      if (varint === undefined) {
+        return undefined;
+      }
+      offset = varint.next;
+    } else if (wireType === 1) {
+      offset += 8;
+    } else if (wireType === 2) {
+      const length = readVarint(message, offset);
+      if (length === undefined) {
+        return undefined;
+      }
+      offset = length.next + length.value;
+    } else if (wireType === 5) {
+      offset += 4;
+    } else {
+      return undefined;
+    }
+    if (offset > message.length) {
+      return undefined;
+    }
+    if (!drop.has(field)) {
+      kept.push(message.subarray(start, offset));
+    }
+  }
+  return concat(kept);
+}
+
+/**
+ * `SHA-256("zrdtP1" ‖ group ‖ author ‖ nonce ‖ DataMessage without fields
+ * 15 and 200)`. Throws `badInput` on wrong sizes or bytes that are not
+ * protobuf.
+ * @testexport
+ */
+export function commitment(
+  group: Bytes,
+  author: Bytes,
+  nonce: Bytes,
+  dataMessage: Bytes
+): Bytes {
+  const result = commitWithOpening(group, author, nonce, dataMessage);
+  if (result.kind !== 'ok') {
+    throw new ZrdtBackendError('badInput', 'DataMessage is not protobuf');
+  }
+  return result.commit;
+}
+
+/**
+ * COMMIT: the commitment and the opening (`nonce ‖ DataMessage without fields
+ * 15 and 200`), or `malformed` for bytes that are not protobuf. Throws
+ * `badInput` on wrong sizes.
+ */
+export function commitWithOpening(
+  group: Bytes,
+  author: Bytes,
+  nonce: Bytes,
+  dataMessage: Bytes
+): CommitResult {
+  checkSize('group', group, GROUP_ID_BYTES);
+  checkSize('author', author, ACI_BYTES);
+  checkSize('nonce', nonce, NONCE_BYTES);
+  const committed = removeTopLevelFields(
+    dataMessage,
+    new Set([FIELD_GROUP_V2, FIELD_ZRDT])
+  );
+  if (committed === undefined) {
+    return { kind: 'malformed' };
+  }
+  const opening = concat([nonce, committed]);
+  return {
+    kind: 'ok',
+    commit: sha256(COMMIT_MAGIC, group, author, opening),
+    opening,
+  };
+}
+
+/**
+ * Whether `opening` opens the record's commitment (Lean `openingMatches`):
+ * a 32-byte nonce, then well-formed protobuf bytes with no top-level field
+ * 15 or 200, whose commitment under the record's group and author is the
+ * record's commit.
+ */
+function opens(record: StubRecord, opening: Bytes): boolean {
+  if (opening.length < NONCE_BYTES) {
+    return false;
+  }
+  const committed = opening.subarray(NONCE_BYTES);
+  const stripped = removeTopLevelFields(
+    committed,
+    new Set([FIELD_GROUP_V2, FIELD_ZRDT])
+  );
+  if (stripped === undefined || !equal(stripped, committed)) {
+    return false;
+  }
+  return equal(
+    sha256(COMMIT_MAGIC, record.group, record.author, opening),
+    record.commit
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Audiences (JOIN_PLAN section 3.2)
+// ---------------------------------------------------------------------------
+
+const KEY_TAG_MAGIC = ascii('zrdtK1');
+
+/** The tag of a serialized identity key: SHA-256("zrdtK1" ‖ key)[0..16]. */
+export function stubKeyTag(identityKey: Bytes): Bytes {
+  checkSize('key', identityKey, IDENTITY_KEY_BYTES);
+  return sha256(KEY_TAG_MAGIC, identityKey).slice(0, KEY_TAG_BYTES);
+}
+
+/** AUDIENCE: field-201 bytes for these members, sorted by ACI. */
+export function buildAudience(
+  members: ReadonlyArray<AudienceMember>
+): AudienceResult {
+  if (members.length > MAX_AUDIENCE) {
+    return { kind: 'tooLarge' };
+  }
+  if (members.length === 0) {
+    return { kind: 'malformed' };
+  }
+  const entries = members.map(member => {
+    checkSize('aci', member.aci, ACI_BYTES);
+    const tag =
+      member.key === undefined
+        ? new Uint8Array(KEY_TAG_BYTES)
+        : stubKeyTag(member.key);
+    return concat([member.aci, tag]);
+  });
+  entries.sort(compareBytes);
+  for (let i = 1; i < entries.length; i += 1) {
+    const a = entries[i - 1];
+    const b = entries[i];
+    if (
+      a !== undefined &&
+      b !== undefined &&
+      equal(a.subarray(0, ACI_BYTES), b.subarray(0, ACI_BYTES))
+    ) {
+      return { kind: 'malformed' };
+    }
+  }
+  return { kind: 'ok', audience: concat(entries) };
+}
+
+// ---------------------------------------------------------------------------
+// The store
+// ---------------------------------------------------------------------------
+
+type Entry = Readonly<{ record: StubRecord; encoded: Bytes; digest: Digest }>;
+
+/**
+ * One chat's records, keyed by digest. Records enter only through
+ * `accept`, so every link of a stored record is stored too, and the head
+ * set is the stored digests that no stored record links.
+ */
+export class StubStore {
+  readonly group: Bytes;
+  readonly hash: RecordHash;
+  /** A relative store takes boundary digests; a closed one never does. */
+  readonly relative: boolean;
+  readonly #entries = new Map<string, Entry>();
+  /** Stored digests and boundary digests that no stored record links. */
+  readonly #heads = new Set<string>();
+  /** The audience table: digests whose opening this store checked. */
+  readonly #audiences = new Map<string, ReadonlyArray<Seat>>();
+  /** The boundary: every digest taken, with its voucher. It only grows. */
+  readonly #boundary = new Map<string, { digest: Digest; voucher: Bytes }>();
+
+  constructor(group: Bytes, hash: RecordHash = sha256, relative = false) {
+    checkSize('group', group, GROUP_ID_BYTES);
+    this.group = new Uint8Array(group);
+    this.hash = hash;
+    this.relative = relative;
+  }
+
+  get size(): number {
+    return this.#entries.size;
+  }
+
+  clone(): StubStore {
+    const copy = new StubStore(this.group, this.hash, this.relative);
+    for (const [k, entry] of this.#entries) {
+      copy.#entries.set(k, entry);
+    }
+    for (const k of this.#heads) {
+      copy.#heads.add(k);
+    }
+    for (const [k, seats] of this.#audiences) {
+      copy.#audiences.set(k, seats);
+    }
+    for (const [k, b] of this.#boundary) {
+      copy.#boundary.set(k, b);
+    }
+    return copy;
+  }
+
+  /** Whether `digest` was taken into the boundary (it may be stored since). */
+  inBoundary(digest: Bytes): boolean {
+    return this.#boundary.has(key(digest));
+  }
+
+  /**
+   * Adds `digest` to the boundary with its voucher. Nothing changes if it is
+   * stored or already in the boundary (the first voucher stays). False if
+   * the boundary is full. Never call it on a closed store.
+   */
+  addBoundary(digest: Bytes, voucher: Bytes): boolean {
+    const k = key(digest);
+    if (this.#entries.has(k) || this.#boundary.has(k)) {
+      return true;
+    }
+    if (this.#boundary.size + 1 >= RECORD_COUNT_LIMIT) {
+      return false;
+    }
+    this.#boundary.set(k, {
+      digest: new Uint8Array(digest),
+      voucher: new Uint8Array(voucher),
+    });
+    this.#heads.add(k);
+    return true;
+  }
+
+  /** The keys of the boundary digests taken so far. */
+  boundaryKeys(): Set<string> {
+    return new Set(this.#boundary.keys());
+  }
+
+  /**
+   * Per-digest ACCEPT_VIEW (protocol 4, Lean `RelStore.prune`): drops the
+   * boundary digests not in `old` that are stored nowhere and linked by no
+   * stored record, so the view adds no head that is not a stored record.
+   */
+  prune(old: ReadonlySet<string>): void {
+    const linked = new Set<string>();
+    for (const entry of this.#entries.values()) {
+      for (const link of entry.record.links) {
+        linked.add(key(link));
+      }
+    }
+    for (const k of [...this.#boundary.keys()]) {
+      if (!old.has(k) && !this.#entries.has(k) && !linked.has(k)) {
+        this.#boundary.delete(k);
+        this.#heads.delete(k);
+      }
+    }
+  }
+
+  /** The boundary, sorted by digest. */
+  boundary(): Array<{ digest: Digest; voucher: Bytes }> {
+    return [...this.#boundary.values()].sort((a, b) =>
+      compareBytes(a.digest, b.digest)
+    );
+  }
+
+  /** The boundary digests with no stored record, sorted. */
+  boundaryDigests(): Array<Digest> {
+    return sortedUnique(
+      [...this.#boundary.entries()]
+        .filter(([k]) => !this.#entries.has(k))
+        .map(([, b]) => b.digest)
+    );
+  }
+
+  /** The recorded audiences of stored records, sorted by digest. */
+  audiences(): Array<{ digest: Digest; seats: ReadonlyArray<Seat> }> {
+    return this.entries().flatMap(({ digest }) => {
+      const seats = this.#audiences.get(key(digest));
+      return seats === undefined ? [] : [{ digest, seats }];
+    });
+  }
+
+  /**
+   * What `accept` would reply for `record` now, without changing the store
+   * (ACCEPT_VIEW's result for a record entry).
+   */
+  probe(record: StubRecord): AcceptResult {
+    return this.clone().accept(record);
+  }
+
+  /**
+   * LINKABLE: a closed store's heads; a relative store's heads that are
+   * stored records in `live`. Sorted.
+   */
+  linkable(live: ReadonlySet<string>): Array<Digest> {
+    if (!this.relative) {
+      return this.heads();
+    }
+    return this.heads().filter(d => this.has(d) && live.has(key(d)));
+  }
+
+  /** Records the audience of a checked opening of a stored record. */
+  recordAudience(digest: Bytes, seats: ReadonlyArray<Seat>): void {
+    if (this.has(digest)) {
+      this.#audiences.set(key(digest), seats);
+    }
+  }
+
+  audienceOf(digest: Bytes): ReadonlyArray<Seat> | undefined {
+    return this.#audiences.get(key(digest));
+  }
+
+  /** The stored digests whose recorded audience seats `aci` under `tag`. */
+  addressed(aci: Bytes, tag: Bytes): Array<Digest> {
+    return this.digestsOf(
+      [...this.#audiences.entries()]
+        .filter(([, seats]) => seatsUnderTag(seats, aci, tag))
+        .map(([k]) => k)
+    );
+  }
+
+  has(digest: Bytes): boolean {
+    return this.#entries.has(key(digest));
+  }
+
+  entry(digest: Bytes): Entry | undefined {
+    return this.#entries.get(key(digest));
+  }
+
+  /** Every entry, sorted by digest. */
+  entries(): Array<Entry> {
+    return [...this.#entries.values()].sort((a, b) =>
+      compareBytes(a.digest, b.digest)
+    );
+  }
+
+  heads(): Array<Digest> {
+    return sortedUnique(
+      [...this.#heads].map(k => {
+        const digest =
+          this.#entries.get(k)?.digest ?? this.#boundary.get(k)?.digest;
+        if (digest === undefined) {
+          throw new Error('zrdt stub: head is neither stored nor boundary');
+        }
+        return digest;
+      })
+    );
+  }
+
+  /** Add a record if its group is right and every link is stored. */
+  accept(record: StubRecord): AcceptResult {
+    if (!equal(record.group, this.group)) {
+      return { kind: 'wrongChat' };
+    }
+    if (record.links.length > MAX_LINKS) {
+      return { kind: 'tooLarge' };
+    }
+    const encoded = encodeRecord(record);
+    const digest = this.hash(encoded);
+    const k = key(digest);
+    const existing = this.#entries.get(k);
+    if (existing !== undefined) {
+      return equal(existing.encoded, encoded)
+        ? { kind: 'accepted', digest, record: new Uint8Array(encoded) }
+        : { kind: 'collision', digest };
+    }
+    if (this.#entries.size + 1 >= RECORD_COUNT_LIMIT) {
+      return { kind: 'tooLarge' };
+    }
+    const missing = record.links.filter(
+      link => !this.has(link) && !this.inBoundary(link)
+    );
+    if (missing.length > 0) {
+      return { kind: 'missing', digests: sortedUnique(missing) };
+    }
+    // A promoted boundary digest stays a head only if nothing links it yet.
+    const isHead =
+      !record.links.some(link => equal(link, digest)) &&
+      (!this.#boundary.has(k) || this.#heads.has(k));
+    this.#entries.set(k, { record, encoded, digest });
+    for (const link of record.links) {
+      this.#heads.delete(key(link));
+    }
+    if (isHead) {
+      this.#heads.add(k);
+    }
+    return {
+      kind: 'accepted',
+      digest: new Uint8Array(digest),
+      record: new Uint8Array(encoded),
+    };
+  }
+
+  /**
+   * The keys of the stored records reachable from `from` by following
+   * links. A stored digest in `from` reaches itself.
+   */
+  reach(from: Iterable<Bytes>): Set<string> {
+    const seen = new Set<string>();
+    const todo = [...from];
+    for (let digest = todo.pop(); digest !== undefined; digest = todo.pop()) {
+      const k = key(digest);
+      const entry = this.#entries.get(k);
+      if (entry === undefined || seen.has(k)) {
+        continue;
+      }
+      seen.add(k);
+      todo.push(...entry.record.links);
+    }
+    return seen;
+  }
+
+  reachSet(from: Iterable<Bytes>): Array<Digest> {
+    return this.digestsOf(this.reach(from));
+  }
+
+  digestsOf(keys: Iterable<string>): Array<Digest> {
+    const digests = new Array<Digest>();
+    for (const k of keys) {
+      const entry = this.#entries.get(k);
+      if (entry !== undefined) {
+        digests.push(entry.digest);
+      }
+    }
+    return sortedUnique(digests);
+  }
+}
+
+/**
+ * Accept every record whose links are present, until no more can be (Kahn's
+ * algorithm: each record waits for its absent links; inserting a record
+ * wakes the records waiting for it). Records go in only through
+ * `store.accept`. Returns the records that were not accepted.
+ */
+function acceptAll(
+  store: StubStore,
+  records: ReadonlyArray<StubRecord>
+): Array<StubRecord> {
+  const waiting = new Map<string, Array<number>>();
+  const absentCount = new Array<number>(records.length).fill(0);
+  const accepted = new Array<boolean>(records.length).fill(false);
+  const ready = new Array<number>();
+
+  records.forEach((record, i) => {
+    const absent = record.links.filter(
+      link => !store.has(link) && !store.inBoundary(link)
+    );
+    absentCount[i] = absent.length;
+    for (const link of absent) {
+      const k = key(link);
+      const list = waiting.get(k) ?? [];
+      list.push(i);
+      waiting.set(k, list);
+    }
+    if (absent.length === 0) {
+      ready.push(i);
+    }
+  });
+
+  for (let i = ready.pop(); i !== undefined; i = ready.pop()) {
+    const record = records[i];
+    if (record === undefined) {
+      continue;
+    }
+    const result = store.accept(record);
+    if (result.kind !== 'accepted') {
+      continue;
+    }
+    accepted[i] = true;
+    const k = key(result.digest);
+    for (const j of waiting.get(k) ?? []) {
+      const left = (absentCount[j] ?? 0) - 1;
+      absentCount[j] = left;
+      if (left === 0) {
+        ready.push(j);
+      }
+    }
+    waiting.delete(k);
+  }
+
+  return records.filter((_record, i) => !accepted[i]);
+}
+
+// ---------------------------------------------------------------------------
+// Blobs (PLAN.md section 3.4; JOIN_PLAN section 3.3)
+// ---------------------------------------------------------------------------
+
+const BLOB_MAGIC = ascii('zrdtS2');
+const BLOB_HEADER_BYTES = BLOB_MAGIC.length + GROUP_ID_BYTES + 4;
+const BLOB3_MAGIC = ascii('zrdtS3');
+
+/** `"zrdtS2" ‖ group(32) ‖ u32 count ‖ (u32 len ‖ record)*`, sorted by digest. */
+function encodeRecordsBlob(store: StubStore): Bytes {
+  const entries = store.entries();
+  const parts: Array<Bytes> = [BLOB_MAGIC, store.group, u32(entries.length)];
+  for (const { encoded } of entries) {
+    parts.push(u32(encoded.length), encoded);
+  }
+  return concat(parts);
+}
+
+/** The field-201 value of an audience: its entries, `aci ‖ tag`, in order. */
+function writeAudience(seats: ReadonlyArray<Seat>): Bytes {
+  return concat(seats.flatMap(seat => [seat.aci, seat.tag]));
+}
+
+/**
+ * `"zrdtS3" ‖ mode u8 (0 closed, 1 relative) ‖ u32 n ‖ n × (digest ‖ voucher
+ * aci) ‖ u32 m ‖ m × (digest ‖ u32 len ‖ field-201 value) ‖ the zrdtS2 blob`.
+ * The boundary and the audiences (of stored records only) are sorted by
+ * digest; a closed store has no boundary.
+ */
+function encodeBlob(store: StubStore): Bytes {
+  const boundary = store.boundary();
+  const audiences = store.audiences();
+  const parts: Array<Bytes> = [
+    BLOB3_MAGIC,
+    Uint8Array.of(store.relative ? 1 : 0),
+    u32(boundary.length),
+  ];
+  for (const { digest, voucher } of boundary) {
+    parts.push(digest, voucher);
+  }
+  parts.push(u32(audiences.length));
+  for (const { digest, seats } of audiences) {
+    const value = writeAudience(seats);
+    parts.push(digest, u32(value.length), value);
+  }
+  parts.push(encodeRecordsBlob(store));
+  return concat(parts);
+}
+
+/** What a `zrdtS3` blob holds before any record is read. */
+type Blob3 = Readonly<{
+  relative: boolean;
+  boundary: Array<{ digest: Digest; voucher: Bytes }>;
+  audiences: Array<{ digest: Digest; seats: Array<Seat> }>;
+  records: Bytes;
+}>;
+
+/**
+ * The framing of a `zrdtS3` blob; undefined for a wrong tag or mode, a count
+ * the input cannot hold, a closed blob with a boundary, an entry cut short,
+ * or an audience that does not parse.
+ */
+function decodeBlob3(bytes: Bytes): Blob3 | undefined {
+  if (
+    bytes.length < 11 ||
+    !equal(bytes.subarray(0, BLOB3_MAGIC.length), BLOB3_MAGIC)
+  ) {
+    return undefined;
+  }
+  const mode = bytes[6];
+  if (mode !== 0 && mode !== 1) {
+    return undefined;
+  }
+  const relative = mode === 1;
+  const n = readU32(bytes, 7);
+  if (
+    n >= RECORD_COUNT_LIMIT ||
+    11 + 48 * n > bytes.length ||
+    (!relative && n !== 0)
+  ) {
+    return undefined;
+  }
+  const boundary = new Array<{ digest: Digest; voucher: Bytes }>();
+  for (let i = 0; i < n; i += 1) {
+    const at = 11 + 48 * i;
+    boundary.push({
+      digest: bytes.slice(at, at + 32),
+      voucher: bytes.slice(at + 32, at + 48),
+    });
+  }
+  const p = 11 + 48 * n;
+  if (p + 4 > bytes.length) {
+    return undefined;
+  }
+  const m = readU32(bytes, p);
+  if (p + 4 + 36 * m > bytes.length) {
+    return undefined;
+  }
+  const audiences = new Array<{ digest: Digest; seats: Array<Seat> }>();
+  let at = p + 4;
+  for (let i = 0; i < m; i += 1) {
+    if (at + 36 > bytes.length) {
+      return undefined;
+    }
+    const digest = bytes.slice(at, at + 32);
+    const len = readU32(bytes, at + 32);
+    if (at + 36 + len > bytes.length) {
+      return undefined;
+    }
+    const seats = parseAudience(bytes.slice(at + 36, at + 36 + len));
+    if (seats === undefined) {
+      return undefined;
+    }
+    audiences.push({ digest, seats });
+    at += 36 + len;
+  }
+  return { relative, boundary, audiences, records: bytes.slice(at) };
+}
+
+/** The records part's count field is 2^24 or more (Lean `blobTooLarge`). */
+function recordsBlobTooLarge(bytes: Bytes): boolean {
+  return (
+    bytes.length >= BLOB_HEADER_BYTES &&
+    equal(bytes.subarray(0, BLOB_MAGIC.length), BLOB_MAGIC) &&
+    readU32(bytes, BLOB_MAGIC.length + GROUP_ID_BYTES) >= RECORD_COUNT_LIMIT
+  );
+}
+
+type Decoded =
+  | { kind: 'ok'; group: Bytes | undefined; records: Array<StubRecord> }
+  | { kind: 'malformed' }
+  | { kind: 'tooLarge' };
+
+/**
+ * Strict decode of a records blob (`zrdtS2`). A count of 2^24 or more is
+ * `tooLarge` before anything else is read; nothing is allocated from the
+ * count. Records may come in any order.
+ */
+export function decodeBlob(bytes: Bytes): Decoded {
+  if (
+    bytes.length < BLOB_HEADER_BYTES ||
+    !equal(bytes.subarray(0, BLOB_MAGIC.length), BLOB_MAGIC)
+  ) {
+    return { kind: 'malformed' };
+  }
+  const group = bytes.slice(
+    BLOB_MAGIC.length,
+    BLOB_MAGIC.length + GROUP_ID_BYTES
+  );
+  const count = readU32(bytes, BLOB_MAGIC.length + GROUP_ID_BYTES);
+  if (count >= RECORD_COUNT_LIMIT) {
+    return { kind: 'tooLarge' };
+  }
+  const records = new Array<StubRecord>();
+  let offset = BLOB_HEADER_BYTES;
+  for (let i = 0; i < count; i += 1) {
+    if (offset + 4 > bytes.length) {
+      return { kind: 'malformed' };
+    }
+    const length = readU32(bytes, offset);
+    offset += 4;
+    if (offset + length > bytes.length) {
+      return { kind: 'malformed' };
+    }
+    const record = decodeRecord(bytes.subarray(offset, offset + length));
+    if (record === undefined) {
+      return { kind: 'malformed' };
+    }
+    records.push(record);
+    offset += length;
+  }
+  if (offset !== bytes.length) {
+    return { kind: 'malformed' };
+  }
+  return { kind: 'ok', group, records };
+}
+
+function decodeList(list: ReadonlyArray<Bytes>): Decoded {
+  if (list.length >= RECORD_COUNT_LIMIT) {
+    return { kind: 'tooLarge' };
+  }
+  const records = new Array<StubRecord>();
+  for (const bytes of list) {
+    const record = decodeRecord(bytes);
+    if (record === undefined) {
+      return { kind: 'malformed' };
+    }
+    records.push(record);
+  }
+  return { kind: 'ok', group: undefined, records };
+}
+
+function isRecordList(input: OpenInput): input is ReadonlyArray<Bytes> {
+  return Array.isArray(input);
+}
+
+type Opened =
+  | { kind: 'ok'; store: StubStore; leftovers: Array<StubRecord> }
+  | Refused;
+
+/**
+ * Decode a records blob or list and accept what can be accepted into a new
+ * store for `group`, over `boundary` if the store is relative. The checks run
+ * in this order: malformed, tooLarge (count, then links), wrongChat (the
+ * blob's group, then each record's), collision.
+ */
+function openRecords(
+  group: Bytes,
+  decoded: Decoded,
+  hash: RecordHash,
+  relative: boolean,
+  boundary: ReadonlyArray<{ digest: Digest; voucher: Bytes }>
+): Opened {
+  if (decoded.kind !== 'ok') {
+    return decoded;
+  }
+  const { records } = decoded;
+  if (records.some(record => record.links.length > MAX_LINKS)) {
+    return { kind: 'tooLarge' };
+  }
+  if (decoded.group !== undefined && !equal(decoded.group, group)) {
+    return { kind: 'wrongChat' };
+  }
+  if (records.some(record => !equal(record.group, group))) {
+    return { kind: 'wrongChat' };
+  }
+  const collision = firstCollision(
+    records.map(record => {
+      const encoded = encodeRecord(record);
+      return { digest: hash(encoded), encoded };
+    })
+  );
+  if (collision !== undefined) {
+    return { kind: 'collision', digest: collision };
+  }
+  const store = new StubStore(group, hash, relative);
+  for (const { digest, voucher } of boundary) {
+    if (!store.addBoundary(digest, voucher)) {
+      return { kind: 'tooLarge' };
+    }
+  }
+  const leftovers = acceptAll(store, records);
+  return { kind: 'ok', store, leftovers };
+}
+
+/**
+ * OPEN's and SALVAGE's input as a new store for `group`: a `zrdtS3` blob
+ * (closed or relative, with its audiences of stored records), or a list of
+ * encoded records (a closed store).
+ */
+function openInput(group: Bytes, input: OpenInput, hash: RecordHash): Opened {
+  checkSize('group', group, GROUP_ID_BYTES);
+  if (isRecordList(input)) {
+    return openRecords(group, decodeList(input), hash, false, []);
+  }
+  const blob = decodeBlob3(input);
+  if (blob === undefined) {
+    return { kind: 'malformed' };
+  }
+  if (recordsBlobTooLarge(blob.records)) {
+    return { kind: 'tooLarge' };
+  }
+  const opened = openRecords(
+    group,
+    decodeBlob(blob.records),
+    hash,
+    blob.relative,
+    blob.boundary
+  );
+  if (opened.kind === 'ok') {
+    // Last entry wins, as Lean's `ofList`; only stored records keep theirs.
+    for (const { digest, seats } of blob.audiences) {
+      opened.store.recordAudience(digest, seats);
+    }
+  }
+  return opened;
+}
+
+/** The smallest digest shared by two different encodings, if any. */
+function firstCollision(
+  items: ReadonlyArray<{ digest: Bytes; encoded: Bytes }>
+): Digest | undefined {
+  const seen = new Map<string, Bytes>();
+  const clashes = new Array<Bytes>();
+  for (const { digest, encoded } of items) {
+    const k = key(digest);
+    const other = seen.get(k);
+    if (other === undefined) {
+      seen.set(k, encoded);
+    } else if (!equal(other, encoded)) {
+      clashes.push(digest);
+    }
+  }
+  return sortedUnique(clashes)[0];
+}
+
+/**
+ * The digests of `leftovers`, and their links that point to no stored
+ * record, no boundary digest and no leftover.
+ */
+function report(
+  store: StubStore,
+  leftovers: ReadonlyArray<StubRecord>
+): { left: Array<Digest>; missing: Array<Digest> } {
+  const left = leftovers.map(record => hashRecord(record, store.hash));
+  const known = new Set<string>(
+    [...store.entries().map(({ digest }) => digest), ...left].map(key)
+  );
+  const missing = new Array<Bytes>();
+  for (const record of leftovers) {
+    for (const link of record.links) {
+      if (!known.has(key(link)) && !store.inBoundary(link)) {
+        missing.push(link);
+      }
+    }
+  }
+  return { left: sortedUnique(left), missing: sortedUnique(missing) };
+}
+
+// ---------------------------------------------------------------------------
+// Provenance (PLAN.md section 3.5)
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether one of `others` is concurrent with the stored record `digest`:
+ * neither reaches the other. Call it only when no record of `others` reaches
+ * `digest`; then it is enough that `digest` does not reach one of them.
+ */
+function hasConcurrent(
+  store: StubStore,
+  digest: Bytes,
+  others: ReadonlyArray<{ k: string }>
+): boolean {
+  if (others.length === 0) {
+    return false;
+  }
+  const reached = store.reach([digest]);
+  return others.some(other => !reached.has(other.k));
+}
+
+/**
+ * A status for every stored record, sorted by digest. Only live facts
+ * count: a record is live if any fact for it says so, and its disown list
+ * is the union of the disown lists of its live facts.
+ */
+function classifyStore(
+  store: StubStore,
+  facts: ReadonlyArray<ProvenanceFact>
+): Array<RecordStatus> {
+  const liveByKey = new Map<string, { entry: Entry; disowns: Set<string> }>();
+  for (const fact of facts) {
+    if (fact.provenance.kind !== 'live') {
+      continue;
+    }
+    const entry = store.entry(fact.digest);
+    if (entry === undefined) {
+      continue;
+    }
+    const k = key(entry.digest);
+    const item = liveByKey.get(k) ?? { entry, disowns: new Set<string>() };
+    for (const digest of fact.disown) {
+      item.disowns.add(key(digest));
+    }
+    liveByKey.set(k, item);
+  }
+
+  const live = [...liveByKey.entries()].map(([k, { entry, disowns }]) => ({
+    k,
+    author: entry.record.author,
+    disowns,
+    reaches: store.reach([entry.digest]),
+  }));
+
+  return store.entries().map(({ record, digest }) => {
+    const k = key(digest);
+    const own = live.filter(l => equal(l.author, record.author));
+    const reachedByAuthor = own.some(l => l.reaches.has(k));
+    const disowned = own.some(l => l.disowns.has(k));
+
+    let status: Status;
+    if (reachedByAuthor && !disowned) {
+      status = { kind: 'confirmedByAuthor' };
+    } else if (
+      disowned ||
+      (!reachedByAuthor && hasConcurrent(store, digest, own))
+    ) {
+      status = { kind: 'notConfirmedByAuthor' };
+    } else {
+      const holders = live
+        .filter(l => !equal(l.author, record.author) && l.reaches.has(k))
+        .map(l => l.author)
+        .sort(compareBytes);
+      const holder = holders[0];
+      status =
+        holder === undefined
+          ? { kind: 'unconfirmed' }
+          : { kind: 'heldBy', aci: new Uint8Array(holder) };
+    }
+    return { digest: new Uint8Array(digest), status };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// The backend
+// ---------------------------------------------------------------------------
+
+export type StubBackendOptions = Readonly<{
+  /** Where to read ZRDT_REQUIRE_LEAN; defaults to process.env. */
+  env?: Readonly<Record<string, string | undefined>>;
+  /** Tests only: replaces SHA-256 for record digests (not for commit()). */
+  recordHashForTesting?: RecordHash;
+}>;
+
+/**
+ * The stub backend: a table of stores in memory. `ZRDT_REQUIRE_LEAN=1`
+ * refuses it.
+ */
+export class StubBackend implements ZrdtBackend {
+  readonly kind: BackendKind = 'stub';
+  readonly #stores = new Map<ChatKey, StubStore>();
+  readonly #hash: RecordHash;
+
+  constructor({
+    env = process.env,
+    recordHashForTesting = sha256,
+  }: StubBackendOptions = {}) {
+    this.#hash = recordHashForTesting;
+    if (env.ZRDT_REQUIRE_LEAN === '1') {
+      throw new ZrdtBackendError(
+        'unavailable',
+        'ZRDT_REQUIRE_LEAN=1 refuses the TypeScript stub'
+      );
+    }
+  }
+
+  isAvailable(): boolean {
+    return true;
+  }
+
+  onUnavailable(): () => void {
+    // The stub never fails.
+    return () => undefined;
+  }
+
+  #store(chat: ChatKey): StubStore {
+    const store = this.#stores.get(chat);
+    if (store === undefined) {
+      throw new ZrdtBackendError('unknownChat', `no store for ${chat}`);
+    }
+    return store;
+  }
+
+  async version(): Promise<VersionInfo> {
+    return { protocol: PROTOCOL_VERSION, build: 'stub' };
+  }
+
+  #notOpen(chat: ChatKey): void {
+    if (this.#stores.has(chat)) {
+      throw new ZrdtBackendError('chatOpen', `a store is open for ${chat}`);
+    }
+  }
+
+  async create(chat: ChatKey, group: Bytes): Promise<void> {
+    this.#notOpen(chat);
+    this.#stores.set(chat, new StubStore(group, this.#hash));
+  }
+
+  async createRelative(chat: ChatKey, group: Bytes): Promise<void> {
+    this.#notOpen(chat);
+    this.#stores.set(chat, new StubStore(group, this.#hash, true));
+  }
+
+  async open(
+    chat: ChatKey,
+    group: Bytes,
+    input: OpenInput
+  ): Promise<OpenResult> {
+    this.#notOpen(chat);
+    const opened = openInput(group, input, this.#hash);
+    if (opened.kind !== 'ok') {
+      return opened;
+    }
+    if (opened.leftovers.length > 0) {
+      const { left, missing } = report(opened.store, opened.leftovers);
+      return { kind: 'unverifiable', unverifiable: left, missing };
+    }
+    this.#stores.set(chat, opened.store);
+    return { kind: 'ok' };
+  }
+
+  async salvage(
+    chat: ChatKey,
+    group: Bytes,
+    input: OpenInput
+  ): Promise<SalvageResult> {
+    this.#notOpen(chat);
+    const opened = openInput(group, input, this.#hash);
+    if (opened.kind !== 'ok') {
+      return opened;
+    }
+    const { left, missing } = report(opened.store, opened.leftovers);
+    this.#stores.set(chat, opened.store);
+    return { kind: 'ok', dropped: left, missing };
+  }
+
+  async commit(
+    group: Bytes,
+    author: Bytes,
+    nonce: Bytes,
+    dataMessage: Bytes
+  ): Promise<CommitResult> {
+    return commitWithOpening(group, author, nonce, dataMessage);
+  }
+
+  async hash(record: RecordParts): Promise<Digest> {
+    return hashRecord(makeRecord(record), this.#hash);
+  }
+
+  /**
+   * ACCEPT, always with the opening (protocol 4). The checks run in this
+   * order: the chat is open, the opening matches the commitment, it holds an
+   * audience, then ACCEPT's checks; an accepted record's audience is
+   * recorded.
+   */
+  async accept(
+    chat: ChatKey,
+    record: RecordParts,
+    opening: Bytes
+  ): Promise<AcceptRecordResult> {
+    return acceptWithOpening(this.#store(chat), makeRecord(record), opening);
+  }
+
+  /**
+   * ACCEPT_RECORD. The checks run in this order: the chat is open, the bytes
+   * decode, the opening matches the commitment, it holds an audience, then
+   * ACCEPT's checks.
+   */
+  async acceptRecord(
+    chat: ChatKey,
+    record: Bytes,
+    opening?: Bytes
+  ): Promise<AcceptRecordResult> {
+    const store = this.#store(chat);
+    const decoded = decodeRecord(record);
+    if (decoded === undefined) {
+      return { kind: 'malformed' };
+    }
+    return acceptWithOpening(store, decoded, opening);
+  }
+
+  /**
+   * ACCEPT_VIEW (JOIN_PLAN §4.4): the reply's entries, then the host's
+   * pending records, each checked as ACCEPT_RECORD would (and, for an
+   * import, refused if ephemeral); a relative store then takes the boundary
+   * entries, vouched by `voucher`; the records that passed are accepted as
+   * one batch; in per-digest mode the new boundary digests no stored record
+   * links are dropped again (`prune`); the audiences of the checked openings
+   * are recorded for the stored ones. One result per entry and pending
+   * record: for a record, what ACCEPT replies for it in the final store.
+   */
+  async acceptView(
+    chat: ChatKey,
+    voucher: Bytes,
+    forImport: boolean,
+    mode: ServeMode,
+    replyEntries: ReadonlyArray<ServeEntry>,
+    pending: ReadonlyArray<ServeEntry>
+  ): Promise<Array<ViewResult>> {
+    const store = this.#store(chat);
+    checkSize('voucher', voucher, ACI_BYTES);
+    const entries = [...replyEntries, ...pending];
+    type Item =
+      | { kind: 'record'; record: StubRecord; seats?: ReadonlyArray<Seat> }
+      | { kind: 'boundary'; digest: Digest }
+      | { kind: 'refused'; result: ViewResult };
+    const items: Array<Item> = entries.map(entry => {
+      if (entry.kind === 'boundary') {
+        return { kind: 'boundary', digest: entry.digest };
+      }
+      const record = decodeRecord(entry.record);
+      if (record === undefined) {
+        return { kind: 'refused', result: { kind: 'malformed' } };
+      }
+      const opening = entry.kind === 'addressed' ? entry.opening : undefined;
+      if (opening === undefined) {
+        return { kind: 'record', record };
+      }
+      if (!opens(record, opening)) {
+        return { kind: 'refused', result: { kind: 'badOpening' } };
+      }
+      const seats = audienceOfOpening(opening);
+      if (seats === undefined) {
+        return { kind: 'refused', result: { kind: 'noAudience' } };
+      }
+      if (forImport && isEphemeralOpening(opening)) {
+        return { kind: 'refused', result: { kind: 'ephemeral' } };
+      }
+      return { kind: 'record', record, seats };
+    });
+    const next = store.clone();
+    if (next.relative) {
+      for (const item of items) {
+        if (item.kind === 'boundary') {
+          next.addBoundary(item.digest, voucher);
+        }
+      }
+    }
+    acceptAll(
+      next,
+      items.flatMap(item => (item.kind === 'record' ? [item.record] : []))
+    );
+    // Before the prune: the boundary the view took (Lean `viewAccepted`).
+    const taken = next.boundaryKeys();
+    if (mode === 'perDigest' && next.relative) {
+      next.prune(store.boundaryKeys());
+    }
+    const results = items.map((item): ViewResult => {
+      if (item.kind === 'refused') {
+        return item.result;
+      }
+      if (item.kind === 'boundary') {
+        if (next.has(item.digest) || next.inBoundary(item.digest)) {
+          return { kind: 'ok', digest: new Uint8Array(item.digest) };
+        }
+        return taken.has(key(item.digest)) || !next.relative
+          ? { kind: 'ignored' }
+          : { kind: 'tooLarge' };
+      }
+      const result = next.probe(item.record);
+      if (result.kind === 'accepted') {
+        if (item.seats !== undefined) {
+          next.recordAudience(result.digest, item.seats);
+        }
+        return { kind: 'ok', digest: result.digest };
+      }
+      return result;
+    });
+    this.#stores.set(chat, next);
+    return results;
+  }
+
+  async linkable(
+    chat: ChatKey,
+    live: ReadonlyArray<Digest>
+  ): Promise<Array<Digest>> {
+    const store = this.#store(chat);
+    return store.linkable(new Set(live.map(key)));
+  }
+
+  async heads(chat: ChatKey): Promise<Array<Digest>> {
+    return this.#store(chat).heads();
+  }
+
+  async has(chat: ChatKey, digest: Digest): Promise<boolean> {
+    return this.#store(chat).has(digest);
+  }
+
+  async get(chat: ChatKey, digest: Digest): Promise<RecordParts | undefined> {
+    const entry = this.#store(chat).entry(digest);
+    return entry === undefined ? undefined : toParts(entry.record);
+  }
+
+  async reachSet(
+    chat: ChatKey,
+    from: ReadonlyArray<Digest>
+  ): Promise<Array<Digest>> {
+    return this.#store(chat).reachSet(from);
+  }
+
+  /**
+   * MERGE a `zrdtS3` blob. Into a closed store: the blob's records part, as
+   * a closed store (a relative blob's records that link its boundary are
+   * unverifiable). Into a relative store: the blob as a store of this chat,
+   * its boundary, then its records. Then the blob's audience of each record
+   * stored in the merged store that has none recorded is recorded; a
+   * recorded audience stays (Lean `mergeAudiences`, `run_merge_audiences`).
+   * The blob's audiences are those of Lean `mergeChat`: into a closed store,
+   * every audience entry of the blob (the last of a digest wins); into a
+   * relative store, those of the records the blob itself stores.
+   */
+  async merge(chat: ChatKey, blob: Bytes): Promise<OpenResult> {
+    const store = this.#store(chat);
+    let opened: Opened;
+    let blobAudiences: ReadonlyArray<{
+      digest: Digest;
+      seats: ReadonlyArray<Seat>;
+    }>;
+    if (store.relative) {
+      opened = openInput(store.group, blob, this.#hash);
+      blobAudiences = opened.kind === 'ok' ? opened.store.audiences() : [];
+    } else {
+      const framed = decodeBlob3(blob);
+      if (framed === undefined) {
+        return { kind: 'malformed' };
+      }
+      if (recordsBlobTooLarge(framed.records)) {
+        return { kind: 'tooLarge' };
+      }
+      opened = openRecords(
+        store.group,
+        decodeBlob(framed.records),
+        this.#hash,
+        false,
+        []
+      );
+      blobAudiences = framed.audiences;
+    }
+    if (opened.kind !== 'ok') {
+      return opened;
+    }
+    if (opened.leftovers.length > 0) {
+      const { left, missing } = report(opened.store, opened.leftovers);
+      return { kind: 'unverifiable', unverifiable: left, missing };
+    }
+    const incoming = opened.store.entries();
+    const collision = firstCollision([...store.entries(), ...incoming]);
+    if (collision !== undefined) {
+      return { kind: 'collision', digest: collision };
+    }
+    const next = store.clone();
+    for (const { digest, voucher } of opened.store.boundary()) {
+      if (!next.addBoundary(digest, voucher)) {
+        return { kind: 'tooLarge' };
+      }
+    }
+    const leftovers = acceptAll(
+      next,
+      incoming.map(({ record }) => record)
+    );
+    if (leftovers.length > 0) {
+      // Both stores are closed and do not collide, so only the record
+      // count limit can stop an accept here.
+      return { kind: 'tooLarge' };
+    }
+    // The last entry of a digest wins (Lean `ofList`); a recorded one stays.
+    const fromBlob = new Map<string, ReadonlyArray<Seat>>();
+    for (const { digest, seats } of blobAudiences) {
+      fromBlob.set(key(digest), seats);
+    }
+    for (const { digest } of next.entries()) {
+      const seats = fromBlob.get(key(digest));
+      if (seats !== undefined && next.audienceOf(digest) === undefined) {
+        next.recordAudience(digest, seats);
+      }
+    }
+    this.#stores.set(chat, next);
+    return { kind: 'ok' };
+  }
+
+  async classify(
+    chat: ChatKey,
+    facts: ReadonlyArray<ProvenanceFact>
+  ): Promise<Array<RecordStatus>> {
+    return classifyStore(this.#store(chat), facts);
+  }
+
+  async encode(chat: ChatKey): Promise<Bytes> {
+    return encodeBlob(this.#store(chat));
+  }
+
+  async close(chat: ChatKey): Promise<void> {
+    this.#stores.delete(chat);
+  }
+
+  async audience(
+    members: ReadonlyArray<AudienceMember>
+  ): Promise<AudienceResult> {
+    return buildAudience(members);
+  }
+
+  async serve(request: ServeRequest): Promise<ServeReply> {
+    return serveStore(this.#store(request.chat), request);
+  }
+
+  async addressed(
+    chat: ChatKey,
+    aci: Bytes,
+    identityKey: Bytes
+  ): Promise<Array<Digest>> {
+    const store = this.#store(chat);
+    checkSize('aci', aci, ACI_BYTES);
+    return store.addressed(aci, stubKeyTag(identityKey));
+  }
+}
+
+function acceptWithOpening(
+  store: StubStore,
+  record: StubRecord,
+  opening: Bytes | undefined
+): AcceptRecordResult {
+  if (opening === undefined) {
+    return store.accept(record);
+  }
+  if (!opens(record, opening)) {
+    return { kind: 'badOpening' };
+  }
+  const seats = audienceOfOpening(opening);
+  if (seats === undefined) {
+    return { kind: 'noAudience' };
+  }
+  const result = store.accept(record);
+  if (result.kind === 'accepted') {
+    store.recordAudience(result.digest, seats);
+  }
+  return result;
+}
+
+// ---------------------------------------------------------------------------
+// SERVE (JOIN_PLAN section 5; Lean Zrdt.Serve.serve)
+// ---------------------------------------------------------------------------
+
+/**
+ * The reply to one SERVE request. Each stored record gives at most one entry,
+ * in digest order, then each boundary digest of a relative responder:
+ *
+ * - `addressed`: its audience (from a matching held opening, else the
+ *   recorded one) seats the requester, and it is wanted (per-digest) or not
+ *   reachable from `since` (catch-up). The opening goes along only if it
+ *   matches, its OWN audience seats the requester under the checked key, it
+ *   is not ephemeral in an export, and (strict mode) the entry is an author
+ *   copy.
+ * - `after`: it reaches an addressed-in-catch-up record (the walk back).
+ * - `boundary`: per-digest, any other wanted record; catch-up, a record
+ *   linked by an `after`/addressed record, or a head.
+ */
+function serveStore(store: StubStore, q: ServeRequest): ServeReply {
+  checkSize('own aci', q.ownAci, ACI_BYTES);
+  checkSize('requester aci', q.requesterAci, ACI_BYTES);
+  checkSize('request id', q.requestId, REQUEST_ID_BYTES);
+  const tag = stubKeyTag(q.key);
+  const seats = (aud: ReadonlyArray<Seat> | undefined): boolean =>
+    aud !== undefined && seatsUnderTag(aud, q.requesterAci, tag);
+  const live = new Set(q.live.map(key));
+  const disown = new Set(q.disown.map(key));
+  const held = new Map<string, Bytes>();
+  for (const item of q.held) {
+    held.set(key(item.digest), item.opening);
+  }
+  const perDigest = q.mode === 'perDigest';
+  const wanted = new Set(q.wanted.map(key));
+  const entries = store.entries();
+
+  const authorCopy = (k: string, r: StubRecord): boolean =>
+    equal(r.author, q.ownAci) && live.has(k) && !disown.has(k);
+  const audienceFor = (
+    k: string,
+    digest: Bytes,
+    r: StubRecord
+  ): ReadonlyArray<Seat> | undefined => {
+    const opening = held.get(k);
+    if (opening !== undefined && opens(r, opening)) {
+      return audienceOfOpening(opening);
+    }
+    return store.audienceOf(digest);
+  };
+  const serveOpening = (k: string, r: StubRecord, o: Bytes): boolean =>
+    opens(r, o) &&
+    seats(audienceOfOpening(o)) &&
+    !(q.forExport && isEphemeralOpening(o)) &&
+    (!q.strict || authorCopy(k, r));
+
+  const sinceReach = store.reach([...q.since, ...q.ownSince]);
+  const entitled = new Set<string>();
+  const linkedBy = new Map<string, Array<string>>();
+  const linkedAny = new Set<string>();
+  for (const e of entries) {
+    const k = key(e.digest);
+    if (seats(audienceFor(k, e.digest, e.record))) {
+      entitled.add(k);
+    }
+    for (const link of e.record.links) {
+      const l = key(link);
+      linkedAny.add(l);
+      const list = linkedBy.get(l) ?? [];
+      list.push(k);
+      linkedBy.set(l, list);
+    }
+  }
+  // up: the walk back from the records the requester is seated in that
+  // `since` does not reach.
+  const up = new Set<string>();
+  const todo = [...entitled].filter(k => !sinceReach.has(k));
+  for (let k = todo.pop(); k !== undefined; k = todo.pop()) {
+    if (up.has(k)) {
+      continue;
+    }
+    up.add(k);
+    todo.push(...(linkedBy.get(k) ?? []));
+  }
+  const linkedByUp = new Set<string>();
+  for (const e of entries) {
+    if (up.has(key(e.digest))) {
+      for (const link of e.record.links) {
+        linkedByUp.add(key(link));
+      }
+    }
+  }
+
+  const out = new Array<ServeEntry>();
+  for (const e of entries) {
+    const k = key(e.digest);
+    if (perDigest && !wanted.has(k)) {
+      continue;
+    }
+    if (entitled.has(k) && (perDigest || !sinceReach.has(k))) {
+      const opening = held.get(k);
+      const record = new Uint8Array(e.encoded);
+      const ac = authorCopy(k, e.record);
+      out.push(
+        opening !== undefined && serveOpening(k, e.record, opening)
+          ? {
+              kind: 'addressed',
+              record,
+              opening: new Uint8Array(opening),
+              authorCopy: ac,
+            }
+          : { kind: 'addressed', record, authorCopy: ac }
+      );
+    } else if (up.has(k)) {
+      out.push({ kind: 'after', record: new Uint8Array(e.encoded) });
+    } else if (perDigest || linkedByUp.has(k) || !linkedAny.has(k)) {
+      out.push({ kind: 'boundary', digest: new Uint8Array(e.digest) });
+    }
+  }
+  // Then the responder's own boundary digests (a relative store), sorted.
+  for (const digest of store.boundaryDigests()) {
+    const k = key(digest);
+    if (
+      (!perDigest || wanted.has(k)) &&
+      (perDigest || linkedByUp.has(k) || !linkedAny.has(k))
+    ) {
+      out.push({ kind: 'boundary', digest: new Uint8Array(digest) });
+    }
+  }
+  const headerBytes = concat([q.requesterAci, tag, q.requestId]);
+  return {
+    header: {
+      requesterAci: new Uint8Array(q.requesterAci),
+      keyTag: tag,
+      requestId: new Uint8Array(q.requestId),
+    },
+    headerBytes,
+    entries: out,
+    entriesBytes: encodeServeEntries(out),
+  };
+}

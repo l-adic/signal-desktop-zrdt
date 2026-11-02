@@ -195,6 +195,7 @@ import {
   onInvalidPlaintextMessage,
   onSuccessfulDecrypt,
 } from './util/handleRetry.preload.ts';
+import { initZrdtReceive } from './zrdt/receive.preload.ts';
 import { themeChanged } from './shims/themeChanged.dom.ts';
 import { createIPCEvents } from './util/createIPCEvents.preload.ts';
 import type { ServiceIdString } from './types/ServiceId.std.ts';
@@ -215,6 +216,9 @@ import { MessageSender } from './textsecure/SendMessage.preload.ts';
 import { onStoryRecipientUpdate } from './util/onStoryRecipientUpdate.preload.ts';
 import { flushAttachmentDownloadQueue } from './util/attachmentDownloadQueue.preload.ts';
 import { initializeRedux } from './state/initializeRedux.preload.ts';
+import { zrdtService } from './zrdt/service.preload.ts';
+import { reacceptZrdtOutgoingAtStartup } from './zrdt/send.preload.ts';
+import { zrdtCatchUpAtStartup } from './zrdt/resend.preload.ts';
 import { StartupQueue } from './util/StartupQueue.std.ts';
 import { showConfirmationDialog } from './util/showConfirmationDialog.dom.tsx';
 import { onCallEventSync } from './util/onCallEventSync.preload.ts';
@@ -687,6 +691,10 @@ async function startApp(): Promise<void> {
         drop(onRetryRequestQueue.add(() => onRetryRequest(event)));
       })
     );
+    // zrdt: the resend control messages (Content 200-202) are dispatched by
+    // MessageReceiver itself; this subscribes the receive path to the
+    // service events (accepted, classify).
+    initZrdtReceive();
     messageReceiver.addEventListener(
       'empty',
       queuedEventListener(() => onEmpty({ isFromMessageReceiver: true }))
@@ -1232,6 +1240,12 @@ async function startApp(): Promise<void> {
       // This needs to load before we prime the data because we expect
       // ConversationController to be loaded and ready to use by then.
       await window.ConversationController.load();
+      // zrdt: pick the backend and re-OPEN every conversation from its rows,
+      // then re-accept our sent records the store lacks (APP.md §4 step 8).
+      drop(zrdtService.init());
+      drop(reacceptZrdtOutgoingAtStartup());
+      // zrdt (JOIN_PLAN §6.1): catch up groups we joined but hold no store for.
+      drop(zrdtCatchUpAtStartup());
 
       await Promise.all([
         window.ConversationController.getOrCreateSignalConversation(),

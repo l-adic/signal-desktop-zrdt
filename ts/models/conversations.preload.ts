@@ -4447,11 +4447,21 @@ export class ConversationModel {
 
     const storyReplyContext = story ? getStoryReplyContext(story) : undefined;
 
-    const recipientMaybeConversations = map(
-      this.getRecipients({
-        isStoryReply: storyId !== undefined,
-      }),
-      identifier => window.ConversationController.get(identifier)
+    const recipients = this.getRecipients({
+      isStoryReply: storyId !== undefined,
+    });
+    // zrdt (JOIN_PLAN §3.2, §4.1): the audience snapshot, in the same
+    // synchronous block that reads the recipients: the raw membersV2 ACIs and
+    // the recipient set. The freeze builds field 201 from it.
+    const zrdtAudience =
+      isGroupV2(this.attributes) && storyId === undefined
+        ? {
+            members: (this.get('membersV2') ?? []).map(member => member.aci),
+            recipients: [...recipients],
+          }
+        : undefined;
+    const recipientMaybeConversations = map(recipients, identifier =>
+      window.ConversationController.get(identifier)
     );
     const recipientConversations = filter(
       recipientMaybeConversations,
@@ -4531,6 +4541,7 @@ export class ConversationModel {
       storyId,
       storyReplyContext,
       poll,
+      zrdtAudience,
     });
 
     const model = window.MessageCache.register(new MessageModel(attributes));

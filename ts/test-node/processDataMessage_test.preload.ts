@@ -58,6 +58,8 @@ const EMPTY_DATA_MESSAGE: Proto.DataMessage.Params = {
   pinMessage: null,
   unpinMessage: null,
   adminDelete: null,
+  zrdt: null,
+  zrdtAudience: null,
 };
 
 const UNPROCESSED_ATTACHMENT: Proto.AttachmentPointer.Params = {
@@ -395,6 +397,7 @@ describe('processDataMessage', () => {
         text: 'text',
         bodyRanges: null,
         type: null,
+        zrdtRef: null,
         attachments: [
           {
             contentType: 'image/jpeg',

@@ -25,6 +25,7 @@ import { drop } from '../util/drop.std.ts';
 import { maybeNotify } from '../messages/maybeNotify.preload.ts';
 import type { DurationInSeconds } from '../util/durations/duration-in-seconds.std.ts';
 import { isValidSenderAciForConversation } from './helpers/isValidSenderAciForConversation.preload.ts';
+import { splitZrdtTargetConversationIds } from '../zrdt/quote.preload.ts';
 
 const log = createLogger('Polls');
 
@@ -411,10 +412,16 @@ export async function handlePollVote(
     optionIndexes: vote.optionIndexes,
     voteCount: vote.voteCount,
     timestamp: vote.timestamp,
+    // zrdt target rule (JOIN_PLAN §8.3): a vote names the poll's author and
+    // sent timestamp. A poll is not a record (no committed audience), so
+    // this allows every member until polls become records.
     sendStateByConversationId: isFromThisDevice
       ? Object.fromEntries(
-          Array.from(conversationContainingThisPoll.getMemberConversationIds())
-            .filter(id => id !== ourConversationId)
+          splitZrdtTargetConversationIds(
+            message.attributes,
+            conversationContainingThisPoll.getMemberConversationIds()
+          )
+            .allowed.filter(id => id !== ourConversationId)
             .map(id => [
               id,
               { status: SendStatus.Pending, updatedAt: Date.now() },

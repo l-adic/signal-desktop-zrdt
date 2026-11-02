@@ -114,7 +114,13 @@ message Content {
     bytes /* DecryptionErrorMessage */ decryptionErrorMessage = 8;
     StoryMessage storyMessage = 9;
     EditMessage editMessage = 11;
+    // zrdt control messages (zrdt docs/JOIN_PLAN.md section 10.1). 200 and
+    // 201 (the unsealed ZrdtResendRequest and ZrdtResend) are retired.
+    ZrdtNotFound zrdtNotFound = 202;
+    ZrdtServed zrdtServed = 203;
+    ZrdtServeRequest zrdtServeRequest = 204;
   }
+  reserved 200, 201;
 
   optional bytes /* SenderKeyDistributionMessage */ senderKeyDistributionMessage = 7;
   optional PniSignatureMessage pniSignatureMessage = 10;
@@ -257,6 +263,10 @@ message DataMessage {
     repeated BodyRange bodyRanges = 6;
     optional Type type = 7;
     optional bytes authorAciBinary = 8; // 16-byte UUID
+    // zrdt: a stripped quote's target, by record digest (32 bytes); such a
+    // quote carries no id, author, text, ranges or attachments
+    // (zrdt docs/JOIN_PLAN.md section 8.3)
+    optional bytes zrdtRef = 201;
   }
   
  message Contact {
@@ -452,6 +462,44 @@ message DataMessage {
   optional UnpinMessage unpinMessage = 28;
   optional AdminDelete adminDelete = 29;
   // NEXT ID: 30
+  // zrdt: if present (even empty), the message is a zrdt record when in scope
+  optional ZrdtMeta zrdt = 200;
+  // zrdt: the author's audience, n entries of aci(16) || keyTag(16), strictly
+  // increasing by aci (zrdt docs/JOIN_PLAN.md section 3.2). Inside the
+  // commitment; required on every record.
+  optional bytes zrdtAudience = 201;
+}
+
+// zrdt: the hash links that a group message carries
+message ZrdtMeta {
+  repeated bytes links = 1; // 32-byte digests: the sender's heads at send time
+  optional bytes nonce = 2; // 32 bytes, the commitment salt
+  optional uint32 version = 3;
+  repeated bytes disown = 4; // digests of records in the sender's name it did not create
+}
+
+// zrdt: ask a member to SERVE records (zrdt docs/JOIN_PLAN.md section 10.1)
+message ZrdtServeRequest {
+  optional bytes groupId = 1;
+  optional bytes requestId = 2; // 16 random bytes
+  repeated bytes digests = 3; // per-digest repair: the wanted digests
+  repeated bytes since = 4;
+  optional bool catchup = 5;
+}
+
+// zrdt: a SERVE reply, sealed to the identity key SERVE checked
+// (zrdt docs/JOIN_PLAN.md section 4.3). Built only by ts/zrdt/served.preload.ts.
+message ZrdtServed {
+  optional bytes groupId = 1;
+  optional bytes header = 2; // requester aci(16) || key tag(16) || request id(16)
+  optional bytes ephemeralKey = 3; // 33-byte serialized public key
+  optional bytes sealed = 4; // SERVE's entries, AES-256-GCM-SIV
+}
+
+// zrdt: the responder does not hold these records
+message ZrdtNotFound {
+  optional bytes groupId = 1;
+  repeated bytes digests = 2;
 }
 
 message NullMessage {
