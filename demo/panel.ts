@@ -10,9 +10,13 @@
 //                            dropGroupMsg?from=alice&to=carol
 //                            blackhole?to=carol
 //                            hold?to=carol
+//                            holdCatchUp?to=dave (beat 5: every 1:1
+//                                                message to the other
+//                                                members' desktops waits)
 //                            release?to=carol   (not a rule: delivers what
 //                                                hold(carol) kept)
 //   POST /clear            remove every rule and deliver everything held
+//                          (but drop what holdCatchUp held)
 //   GET  /log[?n=200]      the villain's decisions, one per line
 //                          (?format=json for JSON)
 //   POST /actions/<name>   a harness action (e.g. link-dave), parameters as
@@ -26,7 +30,7 @@
 import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 
-import { blackhole, dropGroupMsg, hold } from './rules.ts';
+import { blackhole, dropGroupMsg, hold, holdCatchUp } from './rules.ts';
 import type { Name, Rule } from './rules.ts';
 import type { EvilLogEntry } from './evil.ts';
 import { formatEntry } from './evil.ts';
@@ -176,6 +180,13 @@ export async function applyRule(
       villain.arm(rule);
       return `armed ${rule.id}`;
     }
+    case 'holdCatchUp': {
+      const rule = holdCatchUp(member(villain, params, 'to'), villain.members);
+      if (!villain.rules.some(r => r.id === rule.id)) {
+        villain.arm(rule);
+      }
+      return `armed ${rule.id}`;
+    }
     case 'release': {
       const to = member(villain, params, 'to');
       const n = await villain.release(to);
@@ -275,10 +286,20 @@ export async function startPanel({
     }
     if (method === 'POST' && url.pathname === '/clear') {
       await readBody(req);
+      const before = Object.values(villain.heldCounts()).reduce(
+        (a, b) => a + b,
+        0
+      );
       const n = await villain.clear();
+      const dropped =
+        before > n
+          ? `; dropped ${before - n} (held by a rule that drops on clear)`
+          : '';
       json(res, 200, {
         ok: true,
-        result: changed(`clear: no rules; delivered ${n} held envelope(s)`),
+        result: changed(
+          `clear: no rules; delivered ${n} held envelope(s)${dropped}`
+        ),
       });
       return;
     }
@@ -367,6 +388,8 @@ const PAGE = `<!doctype html>
   <button class="bad" data-rule="blackhole" data-to="carol">blackhole(carol)</button>
   <button class="bad" data-rule="hold" data-to="carol">hold(carol)</button>
   <button data-rule="release" data-to="carol">release(carol)</button>
+  <button class="bad" data-rule="holdCatchUp" data-to="dave">
+    hold Dave's catch-up</button>
   <button id="clear">clear (villain off)</button>
 </div>
 <div style="margin-top:6px">

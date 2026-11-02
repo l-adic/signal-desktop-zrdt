@@ -27,10 +27,17 @@ import type {
   ServiceIdKind,
 } from '@signalapp/mock-server';
 
-import { decide, inferSender, hold, blackhole, dropGroupMsg } from './rules.ts';
+import {
+  decide,
+  inferSender,
+  hold,
+  holdCatchUp,
+  blackhole,
+  dropGroupMsg,
+} from './rules.ts';
 import type { Name, Rule, Seen, Verdict } from './rules.ts';
 
-export { hold, blackhole, dropGroupMsg };
+export { hold, holdCatchUp, blackhole, dropGroupMsg };
 
 /** One line of the villain's log: what it saw and what it did. */
 export type EvilLogEntry = Readonly<{
@@ -70,7 +77,13 @@ export class EvilServer extends Server {
   readonly #names = new Map<string, Name>();
   readonly #group = new Set<Name>();
   #rules: ReadonlyArray<Rule> = [];
-  readonly #held: Array<{ to: Name; deliver: () => Promise<void> }> = [];
+  readonly #held: Array<{
+    to: Name;
+    ruleId: string | undefined;
+    // Dropped, not delivered, when the villain is cleared.
+    dropOnClear: boolean;
+    deliver: () => Promise<void>;
+  }> = [];
   readonly #sendIdByKey = new Map<string, string>();
   readonly #sends = new Map<string, SendRecord>();
   #nextSend = 0;
@@ -118,12 +131,14 @@ export class EvilServer extends Server {
 
   /**
    * Turns the villain off: removes every rule and delivers everything still
-   * held. Returns the number of envelopes delivered. Dropped (blackholed)
-   * envelopes are gone for good; the app has to ask for them again.
+   * held, except what a rule with `dropHeldOnClear` (holdCatchUp) held: that
+   * is dropped. Returns the number of envelopes delivered. Dropped
+   * (blackholed) envelopes are gone for good; the app has to ask for them
+   * again.
    */
   public async clear(): Promise<number> {
     this.#rules = [];
-    const all = this.#held.splice(0);
+    const all = this.#held.splice(0).filter(h => !h.dropOnClear);
     for (const h of all) {
       // oxlint-disable-next-line no-await-in-loop
       await h.deliver();
@@ -158,8 +173,9 @@ export class EvilServer extends Server {
 
   /** Removes `to`'s hold rule and delivers what was held for `to`. */
   public async release(to: Name): Promise<number> {
-    this.#rules = this.#rules.filter(r => r.id !== hold(to).id);
-    const mine = this.#held.filter(h => h.to === to);
+    const { id } = hold(to);
+    this.#rules = this.#rules.filter(r => r.id !== id);
+    const mine = this.#held.filter(h => h.ruleId === id);
     for (const h of mine) {
       this.#held.splice(this.#held.indexOf(h), 1);
     }
@@ -262,6 +278,8 @@ export class EvilServer extends Server {
     };
 
     const decision = decide(this.#rules, seen);
+    const dropOnClear =
+      this.#rules.find(r => r.id === decision.ruleId)?.dropHeldOnClear === true;
     this.#rules = decision.rules;
     const entry: EvilLogEntry = {
       at: Date.now(),
@@ -279,7 +297,7 @@ export class EvilServer extends Server {
       return;
     }
     if (decision.verdict === 'hold') {
-      this.#held.push({ to, deliver });
+      this.#held.push({ to, ruleId: decision.ruleId, dropOnClear, deliver });
       return;
     }
     return deliver();

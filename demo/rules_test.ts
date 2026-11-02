@@ -7,7 +7,14 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { blackhole, decide, dropGroupMsg, hold, inferSender } from './rules.ts';
+import {
+  blackhole,
+  decide,
+  dropGroupMsg,
+  hold,
+  holdCatchUp,
+  inferSender,
+} from './rules.ts';
 import type { Seen } from './rules.ts';
 
 const group = new Set(['alice', 'bob', 'carol']);
@@ -84,4 +91,46 @@ void test('the first matching rule wins', () => {
   const d = decide([hold('carol'), blackhole('carol')], seen({}));
   assert.equal(d.verdict, 'hold');
   assert.equal(d.ruleId, 'hold(carol)');
+});
+
+void test("holdCatchUp holds 1:1 to the others' desktops, passes group sends", () => {
+  const rule = holdCatchUp('dave', ['alice', 'bob', 'carol', 'dave']);
+  assert.equal(
+    rule.id,
+    "Alice, Bob and Carol offline: hold Dave's catch-up " +
+      '(1:1 messages to their desktops wait; clear drops them)'
+  );
+  assert.equal(rule.dropHeldOnClear, true);
+  assert.equal(hold('carol').dropHeldOnClear, undefined);
+  const rules = [rule];
+  const oneToOne = (to: string) =>
+    seen({ to, recipients: new Set([to]), from: undefined });
+
+  // Dave's catch-up requests to Alice, Bob and Carol (sealed 1:1): held.
+  for (const to of ['alice', 'bob', 'carol']) {
+    const d = decide(rules, oneToOne(to));
+    assert.equal(d.verdict, 'hold', to);
+    assert.equal(d.ruleId, rule.id);
+  }
+  // Not a once rule: the next request is held too.
+  assert.equal(
+    decide(rules, { ...oneToOne('alice'), sendId: '2000#2' }).verdict,
+    'hold'
+  );
+  // Replies and sender keys to Dave's desktop: pass.
+  assert.equal(decide(rules, oneToOne('dave')).verdict, 'pass');
+  // Group messages to anyone: pass.
+  assert.equal(
+    decide(rules, seen({ to: 'alice', from: 'bob' })).verdict,
+    'pass'
+  );
+  assert.equal(decide(rules, seen({ to: 'dave' })).verdict, 'pass');
+  // Alice's own sync to her desktop: pass.
+  assert.equal(
+    decide(
+      rules,
+      seen({ to: 'alice', recipients: new Set(['alice']), from: 'alice' })
+    ).verdict,
+    'pass'
+  );
 });

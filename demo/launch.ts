@@ -7,10 +7,17 @@
 // "Camping", links Alice's, Bob's and Carol's desktops, tiles them, sends one
 // warm-up message from each (sender keys), and starts the villain's panel.
 // No rule is armed. Dave's desktop is linked on demand, just before beat 5:
-// the panel's "Link Dave's desktop" button, `POST /actions/link-dave`, or
+// the panel's "Link Dave's desktop" button (`POST /actions/link-dave`), or
 // `--link-dave` (link right after the warm-up, for rehearsals). Dave is a
 // member from the group's creation, so his new desktop, which has no store,
-// catches up from Alice by itself (zrdt JOIN_PLAN §6.1) within seconds.
+// would catch up from Alice by itself (zrdt JOIN_PLAN §6.1) within seconds.
+// So the button first arms beat 5's villain rule, "Alice, Bob and Carol
+// offline: hold Dave's catch-up" (demo/rules.ts holdCatchUp: every 1:1
+// message to their desktops waits; group messages pass), shown on the panel
+// and in the terminal: Dave's chat stays empty until he imports Bob's export
+// for him. The panel's "clear (villain off)" releases it at the end of the
+// beat and drops what it held (delivered late, the catch-up would add the
+// history again). `--link-dave` arms nothing: Dave catches up from Alice.
 //
 // doctor.ts runs on the live exports by itself (RESTORE_PLAN.md §6): when
 // Carol exports (Settings → Internal → Export store), one linked, non-head
@@ -48,7 +55,7 @@ import path from 'node:path';
 import { getTimelineMessageWithText } from '../ts/test-mock/helpers.node.ts';
 import { checkBeat5 } from './beat5.ts';
 import type { DoctorEvent } from './beat5.ts';
-import { formatEntry } from './evil.ts';
+import { formatEntry, holdCatchUp } from './evil.ts';
 import { startPanel } from './panel.ts';
 import type { PanelAction } from './panel.ts';
 import {
@@ -285,16 +292,36 @@ async function bobHeads(demo: Demo): Promise<Array<string>> {
   return r.missing ? [] : r.value;
 }
 
+/**
+ * Beat 5's villain, armed before Dave's desktop links: "Alice, Bob and Carol
+ * offline: hold Dave's catch-up" (demo/rules.ts). Says so in the terminal;
+ * the panel lists it. Returns the rule's id.
+ */
+function armHoldCatchUp(demo: Demo): string {
+  const rule = holdCatchUp('dave', demo.server.members);
+  if (!demo.server.rules.some(r => r.id === rule.id)) {
+    demo.server.arm(rule);
+  }
+  say(
+    `villain: armed "${rule.id}" before Dave links; ` +
+      'the panel\'s "clear (villain off)" releases it'
+  );
+  return rule.id;
+}
+
 function actions(demo: Demo, quit: () => void): Record<string, PanelAction> {
   const { byName } = demo;
   return {
     'link-dave': {
-      label: "Link Dave's desktop (before beat 5)",
+      label:
+        "Link Dave's desktop (before beat 5; first arms \"hold Dave's " +
+        'catch-up")',
       run: async () => {
+        const rule = armHoldCatchUp(demo);
         const dave = await linkDesktop(demo, 'dave');
         await tile(linked(demo));
         await openGroup(dave, demo.group);
-        return "Dave's desktop is linked and shows Camping";
+        return `armed ${rule}; Dave's desktop is linked and shows Camping`;
       },
     },
     export: {

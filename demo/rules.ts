@@ -54,6 +54,9 @@ export type Rule = Readonly<{
   match: (seen: Seen) => boolean;
   // Set when a `once` rule has fired: the send it is bound to.
   boundTo?: string;
+  // A hold rule whose envelopes the villain drops, not delivers, when it is
+  // cleared (holdCatchUp).
+  dropHeldOnClear?: boolean;
 }>;
 
 /** True when the envelope is part of a send to two or more accounts. */
@@ -102,6 +105,48 @@ export function hold(to: Name): Rule {
     verdict: 'hold',
     once: false,
     match: seen => seen.to === to,
+  };
+}
+
+/** "alice" -> "Alice". */
+function title(name: Name): string {
+  return name.charAt(0).toUpperCase() + name.slice(1);
+}
+
+/** ['alice', 'bob', 'carol'] -> "Alice, Bob and Carol". */
+function titles(names: ReadonlyArray<Name>): string {
+  const t = names.map(title);
+  return t.length < 2
+    ? (t[0] ?? 'nobody')
+    : `${t.slice(0, -1).join(', ')} and ${t[t.length - 1]}`;
+}
+
+/**
+ * Beat 5's villain: "Alice, Bob and Carol offline: hold Dave's catch-up".
+ * Queues every 1:1 envelope to the linked desktops of `offline` until the
+ * villain is cleared. A new desktop's catch-up request (JOIN_PLAN §6.1) is
+ * such an envelope: a sealed 1:1 message the server cannot read, so it holds
+ * them all, receipts too. Nobody answers `joiner`'s catch-up meanwhile, and
+ * `joiner`'s new desktop stays empty. Group sends pass, and so does a
+ * member's own sync (`from` is `to`): the chat goes on, and live messages
+ * reach everyone. Clearing the villain (POST /clear) drops what this rule
+ * held instead of delivering it: delivered late, the catch-up's answers
+ * would add the restored history again, as new messages under the live
+ * ones.
+ *
+ * Example: `holdCatchUp('dave', ['alice', 'bob', 'carol'])`.
+ */
+export function holdCatchUp(joiner: Name, offline: ReadonlyArray<Name>): Rule {
+  const them = offline.filter(n => n !== joiner);
+  return {
+    id:
+      `${titles(them)} offline: hold ${title(joiner)}'s catch-up ` +
+      '(1:1 messages to their desktops wait; clear drops them)',
+    verdict: 'hold',
+    once: false,
+    dropHeldOnClear: true,
+    match: seen =>
+      them.includes(seen.to) && !isGroupSend(seen) && seen.from !== seen.to,
   };
 }
 

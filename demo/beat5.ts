@@ -10,18 +10,26 @@
 // beats 1 to 3 (no villain: they only make the history), then:
 //
 //   1. the panel's "Link Dave's desktop" (POST /actions/link-dave, what the
-//      button sends); Dave is a member from the group's creation, so his new
-//      desktop catches up from Alice by itself (zrdt JOIN_PLAN §6.1);
+//      button sends): it first arms the villain's "Alice, Bob and Carol
+//      offline: hold Dave's catch-up" (demo/rules.ts holdCatchUp), then
+//      links. Dave is a member from the group's creation, so his new desktop
+//      asks for the chat by itself (zrdt JOIN_PLAN §6.1); the villain holds
+//      the request, and Dave's chat stays empty;
 //   2. Bob: Settings → Internal → Export for: Dave → Export store, then the
 //      Chats tab (SERVE for Dave, sealed to Dave's key, JOIN_PLAN §4.5);
 //   3. the auto-doctor appends two fakes by Bob, sealed to Dave's key, and
 //      writes Dave's import path;
 //   4. Dave: Settings → Internal → Import file (the app goes back to the chat
-//      by itself): accepted, not refused; the two fakes wait, unconfirmed,
-//      in the collapsed section; the genuine history is confirmed;
+//      by itself): accepted, not refused; all eleven imported messages (nine
+//      genuine, two fakes by Bob) wait, unconfirmed, in the collapsed
+//      section;
 //   5. Dave: one click opens the section;
-//   6. Alice types: it reaches Dave; the fakes stay unconfirmed;
-//   7. Bob types: the fakes read "not confirmed by Bob".
+//   6. Alice types: it reaches Dave; the nine genuine messages are confirmed
+//      (Alice holds them); the fakes stay unconfirmed;
+//   7. Bob types: the fakes read "not confirmed by Bob";
+//   8. the panel's "clear (villain off)" (POST /clear) releases the rule; it
+//      drops what the rule held (the catch-up requests), so Dave's window
+//      does not change: the fakes still read "not confirmed by Bob".
 //
 // Writes beat5.json (checks and step timings) and screenshots (beat5-*.png)
 // to the run's artifacts folder. Returns true only if every check passes.
@@ -73,8 +81,10 @@ const FAKES = 2;
 const UI_MS = 5_000;
 // Settings → Internal's result line after Export or Import.
 const RESULT_MS = 15_000;
-// Dave's catch-up: the first member asked has 15 s, then two more.
-const CATCH_UP_MS = 45_000;
+// Dave's new desktop asks for the chat within seconds of the link.
+const CATCH_UP_MS = 20_000;
+// After the release: time for anything delivered to show on Dave's screen.
+const RELEASE_MS = 3_000;
 // The auto-doctor polls once a second.
 const DOCTOR_MS = 10_000;
 // CLASSIFY after an import or a live message, reaching the UI.
@@ -151,6 +161,20 @@ async function visible(
   } catch {
     return false;
   }
+}
+
+type PanelRules = {
+  rules: Array<{ id: string }>;
+  held: Record<string, number>;
+};
+
+async function panelRules(panelUrl: string): Promise<PanelRules> {
+  const res = await fetch(`${panelUrl}rules`);
+  return (await res.json()) as PanelRules;
+}
+
+function heldTotal(held: Record<string, number>): number {
+  return Object.values(held).reduce((a, b) => a + b, 0);
 }
 
 async function post(panelUrl: string, route: string): Promise<string> {
@@ -281,10 +305,6 @@ export async function checkBeat5({
         await conversationId(demo, dave)
       )
     ).filter(m => m.zrdtDigest);
-  const sortedHeads = async (m: Member) =>
-    [...(await value<Array<string>>(m, 'heads', await conversationId(demo, m)))]
-      .sort()
-      .join(',');
 
   // The chat as it stands before beat 5: the warm-ups and the typed lines of
   // beats 1 to 3.
@@ -317,50 +337,74 @@ export async function checkBeat5({
   // Three warm-ups and the typed lines.
   const genuineCount = trio.length + HISTORY.length;
 
-  // 1. The panel's "Link Dave's desktop" button; Dave catches up by himself.
+  // 1. The panel's "Link Dave's desktop" button: it arms "hold Dave's
+  // catch-up" first.
   const linkStart = Date.now();
-  const linkedOk = await run("panel: Link Dave's desktop", async () => {
-    const result = await post(panelUrl, 'actions/link-dave');
-    return { ok: dave.app !== undefined, detail: result };
-  });
+  let ruleId = '';
+  const linkedOk = await run(
+    'panel: Link Dave\'s desktop, after arming "hold Dave\'s catch-up"',
+    async () => {
+      const result = await post(panelUrl, 'actions/link-dave');
+      const { rules } = await panelRules(panelUrl);
+      ruleId = rules.find(r => r.id.includes("hold Dave's catch-up"))?.id ?? '';
+      return {
+        ok: dave.app !== undefined && ruleId !== '' && rules.length === 1,
+        detail: `${result}; panel rules: ${rules.map(r => `"${r.id}"`).join(', ') || 'none'}`,
+      };
+    }
+  );
   step("link Dave's desktop", linkStart);
   if (!historyOk || !linkedOk) {
     return finish();
   }
   await run(
-    `Dave's new desktop catches up from Alice by itself: ${genuineCount} messages, Alice's heads`,
+    "Dave's new desktop asks for the chat; the villain holds it: Dave's chat stays empty",
     async () => {
       const res = await until(CATCH_UP_MS, async () => {
         const conv = await conversationId(demo, dave);
-        const cu = await value<CatchUpView>(dave, 'catchUpState', conv);
-        const [a, d, rows] = await Promise.all([
-          sortedHeads(alice),
-          sortedHeads(dave),
+        const cu = await value<CatchUpView | undefined>(
+          dave,
+          'catchUpState',
+          conv
+        );
+        const [{ held }, rows] = await Promise.all([
+          panelRules(panelUrl),
           daveRows(),
         ]);
+        const n = heldTotal(held);
         return {
           ok:
-            cu.hasStore &&
-            !cu.relative &&
-            cu.replies > 0 &&
-            a.length > 0 &&
-            a === d &&
-            rows.length === genuineCount,
+            cu !== undefined &&
+            cu.asked.length > 0 &&
+            cu.replies === 0 &&
+            n > 0 &&
+            rows.length === 0,
           detail:
-            `answered by ${cu.answeredBy === aciOf(alice) ? 'Alice' : cu.answeredBy} ` +
-            `(${cu.replies} replies), ${rows.length} messages, ` +
-            `heads ${a === d ? 'equal to' : 'NOT equal to'} Alice's`,
+            `asked ${cu?.asked.length ?? 0} member(s), ${cu?.replies ?? 0} replies; ` +
+            `the villain holds ${n} envelope(s) (${JSON.stringify(held)}); ` +
+            `Dave has ${rows.length} messages`,
         };
       });
-      step('Dave caught up (since the link click)', linkStart);
-      const onScreen = await visible(page(dave), FIRST_LINE);
+      step("Dave's catch-up held (since the link click)", linkStart);
+      const onScreen = await visible(page(dave), FIRST_LINE, 500);
       return {
-        ok: res.ok && onScreen,
-        detail: `${res.detail}; "${FIRST_LINE}" ${onScreen ? 'shown' : 'NOT shown'}`,
+        ok: res.ok && !onScreen,
+        detail: `${res.detail}; "${FIRST_LINE}" ${onScreen ? 'SHOWN' : 'not shown'}`,
       };
     }
   );
-  const genuine = new Set((await daveRows()).map(m => m.zrdtDigest ?? ''));
+  // The genuine history: what Alice holds (warm-ups and typed lines).
+  const genuine = new Set(
+    (
+      await value<Array<MessageView>>(
+        alice,
+        'getMessages',
+        await conversationId(demo, alice)
+      )
+    )
+      .map(m => m.zrdtDigest ?? '')
+      .filter(d => d !== '')
+  );
   await screenshots(demo, linked(demo), 'beat5-linked');
 
   // 2. Bob: Settings → Internal → Export for: Dave → Export store → Chats.
@@ -475,8 +519,9 @@ export async function checkBeat5({
 
   let fakes: Array<string> = [];
   const section = page(dave).locator('.ZrdtUnconfirmed');
+  const importedCount = genuineCount + FAKES;
   await run(
-    'after the import: the two fakes by Bob are unconfirmed, in the collapsed section; the genuine history is confirmed',
+    `after the import: all ${importedCount} messages unconfirmed in the collapsed section (${genuineCount} genuine with text, two fakes by Bob without)`,
     async () => {
       if (!imported) {
         return { ok: false, detail: 'skipped: the import failed' };
@@ -484,31 +529,38 @@ export async function checkBeat5({
       const res = await until(CLASSIFY_MS, async () => {
         const state = await daveState();
         const items = state?.unconfirmed ?? [];
-        fakes = items.map(i => i.digest);
+        const fakeItems = items.filter(i => !genuine.has(i.digest));
+        fakes = fakeItems.map(i => i.digest);
         const fakeOk =
-          items.length === FAKES &&
-          items.every(
+          fakeItems.length === FAKES &&
+          fakeItems.every(
             i =>
-              i.status.kind === 'unconfirmed' &&
               i.attributedToAci?.toLowerCase() === aciOf(bob) &&
               !i.hasMessage &&
-              i.text === undefined &&
-              !genuine.has(i.digest)
+              i.text === undefined
           );
-        const notVouched = [...genuine].filter(
-          d => !VOUCHED.has(state?.statuses[d]?.kind ?? '')
+        const genuineItems = items.filter(i => genuine.has(i.digest));
+        const genuineOk =
+          genuine.size === genuineCount &&
+          genuineItems.length === genuineCount &&
+          genuineItems.every(i => i.text !== undefined);
+        const allUnconfirmed = items.every(
+          i => i.status.kind === 'unconfirmed'
         );
         return {
-          ok: fakeOk && notVouched.length === 0,
-          detail: `section: ${items.length} (${items
-            .map(i => `${tag(i.digest)} ${i.status.kind}`)
-            .join(
-              ', '
-            )}); genuine confirmed ${genuine.size - notVouched.length}/${genuine.size}`,
+          ok:
+            items.length === importedCount &&
+            fakeOk &&
+            genuineOk &&
+            allUnconfirmed,
+          detail:
+            `section: ${items.length} (${genuineItems.length} genuine, ` +
+            `${fakeItems.length} fakes ${fakeItems.map(i => tag(i.digest)).join(' ')}); ` +
+            `statuses ${[...new Set(items.map(i => i.status.kind))].join(', ')}`,
         };
       });
       step('import classified (since the Import click)', importStart);
-      const title = unconfirmedSectionTitle(FAKES);
+      const title = unconfirmedSectionTitle(importedCount);
       const titled = await visible(page(dave), title);
       const collapsed =
         (await section
@@ -523,7 +575,7 @@ export async function checkBeat5({
 
   // 5. Dave: one click opens the section.
   await run(
-    "Dave: one click opens the section: two entries attributed to Bob, '(content unavailable)'",
+    "Dave: one click opens the section: the history, and two entries attributed to Bob, '(content unavailable)'",
     async () => {
       if (!imported) {
         return { ok: false, detail: 'skipped: the import failed' };
@@ -534,16 +586,17 @@ export async function checkBeat5({
       const items = section.locator('.ZrdtUnconfirmed__item');
       await items.first().waitFor({ timeout: UI_MS });
       const texts = await items.allInnerTexts();
+      const fakeTexts = texts.filter(t => t.includes('(content unavailable)'));
       const ok =
-        texts.length === FAKES &&
-        texts.every(
-          t =>
-            t.includes(`attributed to ${bob.display}`) &&
-            t.includes('(content unavailable)')
-        );
+        texts.length === importedCount &&
+        fakeTexts.length === FAKES &&
+        fakeTexts.every(t => t.includes(`attributed to ${bob.display}`)) &&
+        texts.some(t => t.includes(FIRST_LINE));
       return {
         ok,
-        detail: texts.map(t => t.replace(/\s+/g, ' ').trim()).join(' | '),
+        detail:
+          `${texts.length} entries; ` +
+          fakeTexts.map(t => t.replace(/\s+/g, ' ').trim()).join(' | '),
       };
     }
   );
@@ -552,7 +605,7 @@ export async function checkBeat5({
   // 6. Alice types.
   const aliceStart = Date.now();
   await run(
-    `Alice types "${ALICE_LINE}": it reaches Dave, confirmed; the fakes stay unconfirmed`,
+    `Alice types "${ALICE_LINE}": it reaches Dave, confirmed; the genuine history is confirmed; the fakes stay unconfirmed`,
     async () => {
       if (!imported) {
         return { ok: false, detail: 'skipped: the import failed' };
@@ -626,7 +679,7 @@ export async function checkBeat5({
           await sleep(200);
         }
       }
-      const title = `Imported history: ${FAKES} messages`;
+      const title = `Imported history: ${importedCount} messages`;
       const titled = await visible(page(dave), title);
       return {
         ok: got && res.ok && shownPills === FAKES && titled,
@@ -637,6 +690,58 @@ export async function checkBeat5({
     }
   );
   await screenshots(demo, linked(demo), 'beat5-bob');
+
+  // 8. The panel's "clear (villain off)": the rule is released, and what it
+  // held is dropped.
+  const releaseStart = Date.now();
+  await run(
+    `panel: clear (villain off) releases "${ruleId}"; Dave's window does not change`,
+    async () => {
+      const rowsBefore = (await daveRows()).length;
+      const result = await post(panelUrl, 'clear');
+      const after = await panelRules(panelUrl);
+      await sleep(RELEASE_MS);
+      const conv = await conversationId(demo, dave);
+      const cu = await value<CatchUpView | undefined>(
+        dave,
+        'catchUpState',
+        conv
+      );
+      const rowsAfter = (await daveRows()).length;
+      const state = await daveState();
+      const fakeKinds = fakes.map(f => state?.statuses[f]?.kind);
+      const notVouched = [...genuine].filter(
+        d => !VOUCHED.has(state?.statuses[d]?.kind ?? '')
+      );
+      const pills = await section
+        .getByText(`not confirmed by ${bob.display}`)
+        .count();
+      const title = `Imported history: ${importedCount} messages`;
+      const titled = await visible(page(dave), title);
+      step('release (since the click)', releaseStart);
+      return {
+        ok:
+          after.rules.length === 0 &&
+          heldTotal(after.held) === 0 &&
+          (cu?.replies ?? 0) === 0 &&
+          rowsAfter === rowsBefore &&
+          fakes.length === FAKES &&
+          fakeKinds.every(k => k === 'notConfirmedByAuthor') &&
+          notVouched.length === 0 &&
+          pills === FAKES &&
+          titled,
+        detail:
+          `"${result}"; panel: ${after.rules.length} rules, ` +
+          `${heldTotal(after.held)} held; Dave: ${cu?.replies ?? 0} catch-up ` +
+          `replies, ${rowsBefore} -> ${rowsAfter} messages in the timeline; ` +
+          `fakes ${fakeKinds.join(', ')}; genuine confirmed ` +
+          `${genuine.size - notVouched.length}/${genuine.size}; ` +
+          `${pills} "not confirmed by ${bob.display}"; "${title}" ` +
+          (titled ? 'shown' : 'NOT shown'),
+      };
+    }
+  );
+  await screenshots(demo, linked(demo), 'beat5-released');
 
   return finish();
 }

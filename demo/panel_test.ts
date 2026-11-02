@@ -122,6 +122,22 @@ void test('the panel arms, lists, releases and clears rules', async () => {
     assert.equal(villain.rules.length, 0);
     assert.match(String(r.json.result), /delivered 3/);
 
+    // Beat 5's rule: armed once, however often it is asked for.
+    const catchUp =
+      "Alice, Bob and Carol offline: hold Dave's catch-up " +
+      '(1:1 messages to their desktops wait; clear drops them)';
+    r = await call(`${panel.url}rules/holdCatchUp?to=dave`, 'POST');
+    assert.equal(r.json.result, `armed ${catchUp}`);
+    r = await call(`${panel.url}rules/holdCatchUp`, 'POST', { to: 'Dave' });
+    r = await call(`${panel.url}rules`);
+    assert.deepEqual(
+      (r.json.rules as Array<{ id: string }>).map(x => x.id),
+      [catchUp]
+    );
+    r = await call(`${panel.url}clear`, 'POST');
+    assert.equal(villain.rules.length, 0);
+    assert.match(String(r.json.result), /delivered 3/);
+
     r = await call(`${panel.url}actions/link-dave`, 'POST');
     assert.equal(linked, 'dave');
     assert.equal(r.json.result, 'link-dave: linked');
@@ -133,7 +149,26 @@ void test('the panel arms, lists, releases and clears rules', async () => {
       (logJson.json as unknown as Array<{ seen: { ts: string } }>)[0]?.seen.ts,
       '1000'
     );
-    assert.equal(changes.length, 5);
+    assert.equal(changes.length, 8);
+  } finally {
+    await panel.close();
+  }
+});
+
+void test('clear reports what a drop-on-clear rule held and dropped', async () => {
+  const villain: Villain = {
+    ...fakeVillain(),
+    clear: async () => 0,
+    heldCounts: () => ({ alice: 3, bob: 1 }),
+  };
+  const panel = await startPanel({ villain });
+  try {
+    const r = await call(`${panel.url}clear`, 'POST');
+    assert.equal(
+      r.json.result,
+      'clear: no rules; delivered 0 held envelope(s); dropped 4 ' +
+        '(held by a rule that drops on clear)'
+    );
   } finally {
     await panel.close();
   }

@@ -32,16 +32,16 @@ memory-heavy: see `zrdt/README.md`, "Running Comparator"), `make kit` (the
 MacBook demo kit), `make help`. `make run` leaves nothing in `$TMPDIR`: the
 desktop profiles are removed after Ctrl-C or `make stop` too.
 
-| File         | What it does                                                                                                                                                       |
-| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `rules.ts`   | the villain's rules as pure functions: `dropGroupMsg(from, to)` (once, sends to ≥ 2 accounts from the inferred sender), `blackhole(to)`, `hold(to)`                |
-| `evil.ts`    | `EvilServer`: Signal's mock server with the rules in front of the linked desktops (`handleMessage` + `prepareMultiDeviceMessage`); `arm`, `release(to)`, `clear()` |
-| `panel.ts`   | the control panel: HTTP on 127.0.0.1 and a one-page HTML front end                                                                                                 |
-| `harness.ts` | the demo world: four phones (Alice, Bob, Carol, Dave), group "Camping", link, tile, warm-up, restart, teardown                                                     |
-| `launch.ts`  | the live demo: links Alice, Bob, Carol; warms up; starts the panel; links Dave on demand; `--beat5` plays and checks beat 5                                        |
-| `beat5.ts`   | the `--beat5` check: beat 5 the way the presenter plays it (panel, Settings → Internal clicks, typing), with Dave's window checked at each step                    |
-| `doctor.ts`  | beats 4 and 5: edits an exported store                                                                                                                             |
-| `smoke.ts`   | the F2 go/no-go test: beats 1–5 through the harness and the panel, then beat 6 (a member added later catches up, JOIN_PLAN)                                        |
+| File         | What it does                                                                                                                                                                                 |
+| ------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `rules.ts`   | the villain's rules as pure functions: `dropGroupMsg(from, to)` (once, sends to ≥ 2 accounts from the inferred sender), `blackhole(to)`, `hold(to)`, `holdCatchUp(joiner, offline)` (beat 5) |
+| `evil.ts`    | `EvilServer`: Signal's mock server with the rules in front of the linked desktops (`handleMessage` + `prepareMultiDeviceMessage`); `arm`, `release(to)`, `clear()`                           |
+| `panel.ts`   | the control panel: HTTP on 127.0.0.1 and a one-page HTML front end                                                                                                                           |
+| `harness.ts` | the demo world: four phones (Alice, Bob, Carol, Dave), group "Camping", link, tile, warm-up, restart, teardown                                                                               |
+| `launch.ts`  | the live demo: links Alice, Bob, Carol; warms up; starts the panel; links Dave on demand; `--beat5` plays and checks beat 5                                                                  |
+| `beat5.ts`   | the `--beat5` check: beat 5 the way the presenter plays it (panel, Settings → Internal clicks, typing), with Dave's window checked at each step                                              |
+| `doctor.ts`  | beats 4 and 5: edits an exported store                                                                                                                                                       |
+| `smoke.ts`   | the F2 go/no-go test: beats 1–5 through the harness and the panel, then beat 6 (a member added later catches up, JOIN_PLAN)                                                                  |
 
 ## Live demo
 
@@ -66,9 +66,18 @@ Bob's own export is left alone (only Bob's account could import it), with a
 hint in the terminal. The terminal prints what it did (`auto-doctor, beat 4
 (Carol's export): removed ·61b5 …`).
 
-Dave is a member from the group's creation, so his new desktop catches up
-from Alice by itself when it links (zrdt JOIN_PLAN §6.1): his chat holds the
-nine messages before beat 5 starts, and the import adds only the two fakes.
+Dave is a member from the group's creation, so his new desktop would catch
+up from Alice by itself about 1.5 s after it links (zrdt JOIN_PLAN §6.1), and
+the import would add only the two fakes. So the panel's **Link Dave's
+desktop** first arms beat 5's villain rule, `holdCatchUp` ("Alice, Bob and
+Carol offline: hold Dave's catch-up (1:1 messages to their desktops wait;
+clear drops them)"), listed on the panel and printed in the terminal. The
+server holds every 1:1 message to Alice's, Bob's and Carol's desktops (Dave's
+catch-up requests are sealed 1:1 messages it cannot read, so receipts wait
+too); group messages pass. Dave's chat stays empty, and the import brings all
+eleven messages, unconfirmed. **clear (villain off)** at the end drops what
+the rule held instead of delivering it: answered late, the catch-up would add
+the nine messages again under the live ones. `--link-dave` arms nothing.
 
 ### Presenter clicks, beats 4 and 5
 
@@ -76,12 +85,14 @@ nine messages before beat 5 starts, and the import adds only the two fakes.
   **Import file** (back to the chat: red banner "This copy of the chat does not
   verify: message ·xxxx is missing"); **Keep what verifies** ("Kept N messages
   that verify. Dropped 1 message: ·yyyy."); **OK**.
-- Beat 5: panel **Link Dave's desktop** (Dave catches up from Alice); Bob:
-  Settings → Internal → **Export for: Dave** → **Export store**, back to
-  Camping; (auto-doctor); Dave: Settings → Internal → **Import file** (back to
-  Camping by itself); expand "2 messages not yet confirmed by any member";
-  Alice writes (the fakes stay unconfirmed); Bob writes (the fakes read "not
-  confirmed by Bob").
+- Beat 5: panel **Link Dave's desktop** (arms "hold Dave's catch-up" first;
+  Dave's chat stays empty); Bob: Settings → Internal → **Export for: Dave** →
+  **Export store**, back to Camping; (auto-doctor); Dave: Settings → Internal
+  → **Import file** (back to Camping by itself); expand "11 messages not yet
+  confirmed by any member"; Alice writes (the nine genuine messages are
+  confirmed, the fakes stay unconfirmed); Bob writes (the fakes read "not
+  confirmed by Bob"); panel **clear (villain off)** (nothing changes on
+  screen).
 
 Panel routes (also usable with curl):
 
@@ -90,7 +101,9 @@ P=http://127.0.0.1:7357
 curl -X POST "$P/rules/dropGroupMsg?from=alice&to=carol"   # beat 2
 curl -X POST "$P/rules/blackhole?to=carol"                 # beat 3
 curl -X POST "$P/rules/hold?to=carol"; curl -X POST "$P/rules/release?to=carol"
+curl -X POST "$P/rules/holdCatchUp?to=dave"               # beat 5 (link-dave arms it)
 curl -X POST "$P/clear"                                    # villain off, held mail delivered
+                                                           # (holdCatchUp's is dropped)
 curl "$P/rules"; curl "$P/log?n=50"
 curl -X POST "$P/actions/link-dave"                        # just before beat 5
 curl -X POST "$P/actions/export" -d '{"member":"carol"}'    # rehearsal: the T3 export hook
@@ -159,11 +172,14 @@ node --import tsx demo/launch.ts --beat5 --port 7465   # beat 5 of the live demo
 the script's lines of beats 1 to 3, then plays beat 5 as DEMO.md has it:
 the panel's link-dave route, Bob's Settings → Internal → Export for: Dave →
 Export store and the Chats tab, the auto-doctor, Dave's Import file, one
-click on the section, Alice and Bob typing. It checks that Dave caught up
-from Alice, that the file is an export for Dave with no text in the clear,
-that Dave's import is accepted and returns to the chat, that the two fakes
-wait unconfirmed (also after Alice writes) while the genuine history is
-confirmed, and that Bob's message turns them "not confirmed by Bob". It
+click on the section, Alice and Bob typing, the panel's clear. It checks
+that the link arms "hold Dave's catch-up" and Dave's chat stays empty (his
+catch-up request held), that the file is an export for Dave with no text in
+the clear, that Dave's import is accepted and returns to the chat with all
+eleven messages unconfirmed, that Alice's message confirms the nine genuine
+ones and not the two fakes, that Bob's message turns the fakes "not confirmed
+by Bob", and that the clear empties the panel without changing Dave's
+window. It
 writes `beat5.json` (checks and step timings) and `beat5-*.png` to
 `demo/artifacts/demo/` and exits 0 only if every check passes.
 
